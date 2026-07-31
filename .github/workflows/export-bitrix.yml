@@ -1,0 +1,46 @@
+name: Export Bitrix24 to JSON and Excel
+
+on:
+  workflow_dispatch:
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Export Bitrix24
+        env:
+          BITRIX_WEBHOOK_URL: ${{ secrets.BITRIX_WEBHOOK_URL }}
+          EXPORT_ACTIVITIES: "true"
+          EXPORT_RELATIONS: "true"
+          EXPORT_PRODUCT_ROWS: "true"
+          EXPORT_TIMELINE_COMMENTS: "true"
+          EXPORT_SMART_PROCESSES: "true"
+          EXPORT_TASK_STAGES: "true"
+          OUTPUT_DIR: output
+        run: python bitrix_export.py
+
+      - name: Upload dump
+        uses: actions/upload-artifact@v4
+        with:
+          name: bitrix24-dump
+          path: |
+            output/**/*.zip
+            output/**/manifest.json
+            output/**/bitrix24_export.xlsx
+            output/**/json/**/*.json
+          if-no-files-found: error
+          retention-days: 14
