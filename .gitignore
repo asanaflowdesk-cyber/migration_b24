@@ -1,0 +1,6 @@
+.env
+output/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.xlsx
