@@ -3,6 +3,9 @@ name: 04 - Сверить результат миграции
 on:
   workflow_dispatch:
 
+env:
+  NODE_USE_SYSTEM_CA: "1"
+
 jobs:
   verify:
     runs-on: [self-hosted, Windows, X64]

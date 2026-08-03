@@ -25,6 +25,9 @@ on:
         default: ""
         type: string
 
+env:
+  NODE_USE_SYSTEM_CA: "1"
+
 jobs:
   import:
     runs-on: [self-hosted, Windows, X64]

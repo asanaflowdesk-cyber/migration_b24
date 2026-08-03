@@ -3,6 +3,9 @@ name: 01 - Проверить план миграции
 on:
   workflow_dispatch:
 
+env:
+  NODE_USE_SYSTEM_CA: "1"
+
 jobs:
   plan:
     runs-on: [self-hosted, Windows, X64]
