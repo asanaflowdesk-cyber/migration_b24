@@ -34,7 +34,7 @@ jobs:
     timeout-minutes: 240
     defaults:
       run:
-        shell: powershell
+        shell: cmd
     steps:
       - uses: actions/checkout@v5
 
@@ -53,7 +53,9 @@ jobs:
 
       - name: Confirmation guard
         if: ${{ inputs.mode == 'apply' && inputs.confirm != 'IMPORT_TO_BOX' }}
-        run: throw "Для реального переноса введите IMPORT_TO_BOX"
+        run: |
+          echo Для реального переноса введите IMPORT_TO_BOX
+          exit /b 1
 
       - name: Import CRM
         env:
@@ -64,24 +66,16 @@ jobs:
           MAX_RETRIES: "7"
           REQUEST_DELAY_SECONDS: "0.05"
         run: |
-          $argsList = @('migrate.py', 'import', '--max-items', '${{ inputs.max_items }}')
-          if ('${{ inputs.mode }}' -eq 'dry_run') {
-            $argsList += '--dry-run'
-          }
-          if ('${{ inputs.allow_user_fallback }}' -eq 'true') {
-            $argsList += '--allow-user-fallback'
-          }
-          & python -u @argsList
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          setlocal EnableExtensions EnableDelayedExpansion
+          set "ARGS=migrate.py import --max-items ${{ inputs.max_items }}"
+          if /I "${{ inputs.mode }}"=="dry_run" set "ARGS=!ARGS! --dry-run"
+          if /I "${{ inputs.allow_user_fallback }}"=="true" set "ARGS=!ARGS! --allow-user-fallback"
+          python -u !ARGS!
+          exit /b !ERRORLEVEL!
 
       - name: Show results
         if: always()
-        run: |
-          if (Test-Path output) {
-            Get-ChildItem output -Recurse -File |
-              Sort-Object FullName |
-              ForEach-Object { "{0} {1:N1} KB" -f $_.FullName, ($_.Length / 1KB) }
-          }
+        run: dir output /s
 
       - name: Upload report and ID maps
         if: always()

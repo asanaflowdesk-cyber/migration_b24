@@ -29,7 +29,7 @@ jobs:
     timeout-minutes: 30
     defaults:
       run:
-        shell: powershell
+        shell: cmd
     steps:
       - uses: actions/checkout@v5
 
@@ -48,7 +48,9 @@ jobs:
 
       - name: Confirmation guard
         if: ${{ inputs.mode == 'apply' && inputs.confirm != 'INVITE_USERS' }}
-        run: throw "Для реального приглашения введите INVITE_USERS"
+        run: |
+          echo Для реального приглашения введите INVITE_USERS
+          exit /b 1
 
       - name: Invite or check users
         env:
@@ -56,15 +58,12 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}
           TARGET_BITRIX_WEBHOOK_URL: ${{ secrets.TARGET_BITRIX_WEBHOOK_URL }}
         run: |
-          $argsList = @('migrate.py', 'invite-users')
-          if ('${{ inputs.mode }}' -eq 'dry_run') {
-            $argsList += '--dry-run'
-          }
-          if ('${{ inputs.default_department_id }}') {
-            $argsList += @('--default-department-id', '${{ inputs.default_department_id }}')
-          }
-          & python -u @argsList
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          setlocal EnableExtensions EnableDelayedExpansion
+          set "ARGS=migrate.py invite-users"
+          if /I "${{ inputs.mode }}"=="dry_run" set "ARGS=!ARGS! --dry-run"
+          if not "${{ inputs.default_department_id }}"=="" set "ARGS=!ARGS! --default-department-id ${{ inputs.default_department_id }}"
+          python -u !ARGS!
+          exit /b !ERRORLEVEL!
 
       - name: Upload report
         if: always()
