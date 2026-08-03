@@ -5,24 +5,37 @@ on:
 
 jobs:
   verify:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Windows, X64]
     timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: pip
-      - run: pip install -r requirements.txt
-      - run: pytest -q
+      - uses: actions/checkout@v5
+
+      - name: Проверить Python
+        run: |
+          python --version
+          python -m pip --version
+
+      - name: Установить зависимости
+        run: python -m pip install -r requirements.txt
+
+      - name: Tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: python -m pytest -q tests/test_migration.py
+
       - name: Verify migration markers and counts
         env:
           PYTHONUNBUFFERED: "1"
+          PYTHONPATH: ${{ github.workspace }}
           TARGET_BITRIX_WEBHOOK_URL: ${{ secrets.TARGET_BITRIX_WEBHOOK_URL }}
         run: python -u migrate.py verify
+
       - name: Upload verification
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: 04-verify-${{ github.run_number }}
           path: output/
