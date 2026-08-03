@@ -1,0 +1,56 @@
+name: 02 - Зарегистрировать нужных пользователей
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "dry_run — только проверить; apply — отправить приглашения"
+        required: true
+        default: dry_run
+        type: choice
+        options: [dry_run, apply]
+      default_department_id:
+        description: "ID подразделения коробки для пользователей, чьё подразделение не найдено по названию"
+        required: false
+        default: ""
+        type: string
+      confirm:
+        description: "Для apply введите INVITE_USERS"
+        required: false
+        default: ""
+        type: string
+
+jobs:
+  invite:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: pytest -q
+      - name: Confirmation guard
+        if: ${{ inputs.mode == 'apply' && inputs.confirm != 'INVITE_USERS' }}
+        run: |
+          echo "Для реального приглашения введите INVITE_USERS" >&2
+          exit 1
+      - name: Invite or check users
+        env:
+          PYTHONUNBUFFERED: "1"
+          TARGET_BITRIX_WEBHOOK_URL: ${{ secrets.TARGET_BITRIX_WEBHOOK_URL }}
+        run: |
+          ARGS=""
+          if [ "${{ inputs.mode }}" = "dry_run" ]; then ARGS="$ARGS --dry-run"; fi
+          if [ -n "${{ inputs.default_department_id }}" ]; then ARGS="$ARGS --default-department-id ${{ inputs.default_department_id }}"; fi
+          python -u migrate.py invite-users $ARGS
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: 02-users-${{ github.run_number }}
+          path: output/
+          if-no-files-found: warn
+          retention-days: 30

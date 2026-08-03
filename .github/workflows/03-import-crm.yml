@@ -1,0 +1,67 @@
+name: 03 - Перенести CRM в коробку
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "dry_run — расчёт без записи; apply — реальный перенос"
+        required: true
+        default: dry_run
+        type: choice
+        options: [dry_run, apply]
+      max_items:
+        description: "Ограничение на каждый тип сущности для теста. 0 = всё"
+        required: true
+        default: "0"
+        type: string
+      allow_user_fallback:
+        description: "Разрешить назначить карточки текущему администратору, если ответственный не найден"
+        required: true
+        default: false
+        type: boolean
+      confirm:
+        description: "Для apply введите IMPORT_TO_BOX"
+        required: false
+        default: ""
+        type: string
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: pytest -q
+      - name: Confirmation guard
+        if: ${{ inputs.mode == 'apply' && inputs.confirm != 'IMPORT_TO_BOX' }}
+        run: |
+          echo "Для реального переноса введите IMPORT_TO_BOX" >&2
+          exit 1
+      - name: Import CRM
+        env:
+          PYTHONUNBUFFERED: "1"
+          TARGET_BITRIX_WEBHOOK_URL: ${{ secrets.TARGET_BITRIX_WEBHOOK_URL }}
+          HTTP_TIMEOUT_SECONDS: "60"
+          MAX_RETRIES: "7"
+          REQUEST_DELAY_SECONDS: "0.05"
+        run: |
+          ARGS="--max-items ${{ inputs.max_items }}"
+          if [ "${{ inputs.mode }}" = "dry_run" ]; then ARGS="$ARGS --dry-run"; fi
+          if [ "${{ inputs.allow_user_fallback }}" = "true" ]; then ARGS="$ARGS --allow-user-fallback"; fi
+          python -u migrate.py import $ARGS
+      - name: Show results
+        if: always()
+        run: find output -maxdepth 2 -type f -printf '%p %k KB\n' | sort || true
+      - name: Upload report and ID maps
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: 03-import-${{ github.run_number }}
+          path: output/
+          if-no-files-found: warn
+          retention-days: 30
