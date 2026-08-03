@@ -16,25 +16,23 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Проверить Python
-        run: |
-          python --version
-          python -m pip --version
+      - name: Найти Python и создать локальное окружение
+        run: call scripts\prepare-python.cmd
 
-      - name: Установить зависимости
-        run: python -m pip install -r requirements.txt
+      - name: Установить зависимости локально
+        run: ".venv\Scripts\python.exe" -m pip install -r requirements.txt
 
       - name: Tests
         env:
           PYTHONPATH: ${{ github.workspace }}
-        run: python -m pytest -q tests/test_migration.py
+        run: ".venv\Scripts\python.exe" -m pytest -q tests/test_migration.py
 
       - name: Verify migration markers and counts
         env:
           PYTHONUNBUFFERED: "1"
           PYTHONPATH: ${{ github.workspace }}
           TARGET_BITRIX_WEBHOOK_URL: ${{ secrets.TARGET_BITRIX_WEBHOOK_URL }}
-        run: python -u migrate.py verify
+        run: ".venv\Scripts\python.exe" -u migrate.py verify
 
       - name: Upload verification
         if: always()
