@@ -32,6 +32,8 @@ EXCEL_MAX_ROWS = 1_048_576
 EXCEL_MAX_TEXT = 32_767
 PAGE_SIZE = 50
 BATCH_SIZE = 50
+DEFAULT_MAX_PAGES = 20_000
+DEFAULT_PROGRESS_EVERY_PAGES = 10
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -95,6 +97,59 @@ def flatten_field_catalog(payload: Any) -> list[dict[str, Any]]:
     elif isinstance(payload, list):
         for item in payload:
             rows.append(dict(item) if isinstance(item, dict) else {"VALUE": item})
+    return rows
+
+
+def extract_field_enum_values(payload: Any, field_code: str) -> list[dict[str, Any]]:
+    """Извлекает значения перечисления из метаданных поля Bitrix24.
+
+    tasks.task.getFields, например, возвращает STATUS.values как словарь
+    {"2": "Ждёт выполнения", ...}. Некоторые методы используют список
+    объектов. Сохраняем оба варианта в едином формате.
+    """
+    source = payload
+    if isinstance(source, dict) and isinstance(source.get("fields"), dict):
+        source = source["fields"]
+    if not isinstance(source, dict):
+        return []
+
+    field_meta = source.get(field_code)
+    if not isinstance(field_meta, dict):
+        return []
+    values = field_meta.get("values", field_meta.get("VALUES", {}))
+
+    rows: list[dict[str, Any]] = []
+    if isinstance(values, dict):
+        for value_id, value_name in values.items():
+            if isinstance(value_name, dict):
+                row = {"FIELD_CODE": field_code, "VALUE_ID": str(value_id)}
+                row.update(value_name)
+                row.setdefault("VALUE_NAME", scalar(getv(value_name, "NAME", "name", "VALUE", "value")))
+            else:
+                row = {
+                    "FIELD_CODE": field_code,
+                    "VALUE_ID": str(value_id),
+                    "VALUE_NAME": scalar(value_name),
+                }
+            rows.append(row)
+    elif isinstance(values, list):
+        for position, item in enumerate(values, start=1):
+            if isinstance(item, dict):
+                value_id = getv(item, "ID", "id", "VALUE_ID", "valueId", default=position)
+                value_name = getv(item, "NAME", "name", "VALUE", "value", default="")
+                row = {
+                    "FIELD_CODE": field_code,
+                    "VALUE_ID": str(value_id),
+                    "VALUE_NAME": scalar(value_name),
+                }
+                row.update(item)
+            else:
+                row = {
+                    "FIELD_CODE": field_code,
+                    "VALUE_ID": str(position),
+                    "VALUE_NAME": scalar(item),
+                }
+            rows.append(row)
     return rows
 
 
@@ -189,7 +244,7 @@ class RawRecorder:
             "response": dict(response),
         }
         path = self.directory / filename
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+        path.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str), encoding="utf-8")
         self.index.append(
             {
                 "sequence": self.counter,
@@ -203,7 +258,7 @@ class RawRecorder:
 
     def close(self) -> None:
         (self.directory / "index.json").write_text(
-            json.dumps(self.index, ensure_ascii=False, indent=2, default=str),
+            json.dumps(self.index, ensure_ascii=False, separators=(",", ":"), default=str),
             encoding="utf-8",
         )
 
@@ -239,6 +294,8 @@ class BitrixClient:
         delay: float = 0.10,
         max_retries: int = 8,
         recorder: RawRecorder | None = None,
+        max_pages: int = DEFAULT_MAX_PAGES,
+        progress_every_pages: int = DEFAULT_PROGRESS_EVERY_PAGES,
     ) -> None:
         webhook_url = webhook_url.strip()
         if not webhook_url:
@@ -253,12 +310,14 @@ class BitrixClient:
         self.delay = max(0.0, delay)
         self.max_retries = max(1, max_retries)
         self.recorder = recorder
+        self.max_pages = max(1, max_pages)
+        self.progress_every_pages = max(1, progress_every_pages)
         self.session = requests.Session()
         self.session.headers.update(
             {
                 "Accept": "application/json",
                 "Content-Type": "application/json",
-                "User-Agent": "bitrix24-migration-export/2.0",
+                "User-Agent": "bitrix24-migration-export/3.0",
             }
         )
 
@@ -270,7 +329,12 @@ class BitrixClient:
             try:
                 response = self.session.post(url, json=payload, timeout=self.timeout)
                 if response.status_code == 429 or response.status_code >= 500:
-                    raise requests.HTTPError(f"HTTP {response.status_code}", response=response)
+                    retry_after = response.headers.get("Retry-After")
+                    wait = float(retry_after) if retry_after and retry_after.isdigit() else min(2**attempt, 30)
+                    raise requests.HTTPError(
+                        f"HTTP {response.status_code}; повтор через {wait:.0f} сек.",
+                        response=response,
+                    )
                 response.raise_for_status()
                 data = response.json()
                 if self.recorder is not None:
@@ -280,7 +344,12 @@ class BitrixClient:
                     description = str(data.get("error_description", ""))
                     last_error = f"{code}: {description}".strip()
                     if code in self.RETRYABLE_ERRORS and attempt < self.max_retries:
-                        time.sleep(min(2**attempt, 30))
+                        wait = min(2**attempt, 30)
+                        logging.warning(
+                            "%s: временная ошибка %s, попытка %s/%s, пауза %s сек.",
+                            method, code, attempt, self.max_retries, wait,
+                        )
+                        time.sleep(wait)
                         continue
                     raise BitrixAPIError(last_error)
                 if self.delay:
@@ -290,7 +359,12 @@ class BitrixClient:
                 last_error = str(exc)
                 if attempt >= self.max_retries:
                     break
-                time.sleep(min(2**attempt, 30))
+                wait = min(2**attempt, 30)
+                logging.warning(
+                    "%s: ошибка запроса, попытка %s/%s, пауза %s сек.: %s",
+                    method, attempt, self.max_retries, wait, exc,
+                )
+                time.sleep(wait)
         raise BitrixAPIError(f"{method}: {last_error}")
 
     def list_all(
@@ -301,13 +375,22 @@ class BitrixClient:
         result_path: Sequence[str] = (),
         start_key: str = "start",
         page_size: int = PAGE_SIZE,
+        label: str | None = None,
     ) -> list[dict[str, Any]]:
+        """Получает все страницы и защищается от методов, игнорирующих start.
+
+        Некоторые REST-методы возвращают больше 50 строк одним ответом и не
+        поддерживают пагинацию. Старая версия повторяла такой ответ бесконечно.
+        Здесь повтор страницы определяется до добавления строк.
+        """
         base_params = dict(params or {})
         start = 0
         all_rows: list[dict[str, Any]] = []
         seen_starts: set[int] = set()
+        seen_pages: set[str] = set()
+        dataset_label = label or method
 
-        while True:
+        for page_number in range(1, self.max_pages + 1):
             request_params = dict(base_params)
             request_params[start_key] = start
             data = self.call(method, request_params)
@@ -315,7 +398,37 @@ class BitrixClient:
             if result_path:
                 result = deep_get(result, result_path)
             page = normalize_records(result)
+
+            # Не даём методу, который игнорирует start, зациклить экспорт.
+            page_signature = hashlib.sha256(
+                json.dumps(page, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            if page and page_signature in seen_pages:
+                logging.warning(
+                    "%s: сервер повторил ту же страницу при start=%s; пагинация остановлена без дублей",
+                    dataset_label, start,
+                )
+                break
+            seen_pages.add(page_signature)
             all_rows.extend(page)
+
+            total_value = data.get("total")
+            if total_value is None and isinstance(data.get("result"), dict):
+                total_value = data["result"].get("total")
+            try:
+                total = int(total_value) if total_value not in (None, "") else None
+            except (TypeError, ValueError):
+                total = None
+
+            if page_number == 1 or page_number % self.progress_every_pages == 0 or not page:
+                total_text = f"/{total}" if total is not None else ""
+                logging.info(
+                    "%s: страница %s, получено %s, всего %s%s",
+                    dataset_label, page_number, len(page), len(all_rows), total_text,
+                )
+
+            if total is not None and len(all_rows) >= total:
+                break
 
             next_value = data.get("next")
             if next_value is None and isinstance(data.get("result"), dict):
@@ -327,16 +440,24 @@ class BitrixClient:
                 except (TypeError, ValueError):
                     next_start = start + page_size
                 if next_start in seen_starts or next_start <= start:
+                    logging.warning(
+                        "%s: некорректный next=%s при start=%s; пагинация остановлена",
+                        dataset_label, next_value, start,
+                    )
                     break
                 seen_starts.add(start)
                 start = next_start
                 continue
 
-            if len(page) < page_size:
+            if not page or len(page) < page_size:
                 break
-            if not page:
-                break
+            seen_starts.add(start)
             start += page_size
+        else:
+            raise BitrixAPIError(
+                f"{method}: превышён защитный лимит {self.max_pages} страниц; "
+                "проверьте параметры пагинации"
+            )
 
         return all_rows
 
@@ -375,7 +496,13 @@ def export_batch_relations(
     output: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
     ids = [str(getv(row, "ID", "id")) for row in source_rows if str(getv(row, "ID", "id"))]
-    for part in chunks(ids, BATCH_SIZE):
+    total_parts = max(1, (len(ids) + BATCH_SIZE - 1) // BATCH_SIZE)
+    for part_number, part in enumerate(chunks(ids, BATCH_SIZE), start=1):
+        if part_number == 1 or part_number % 10 == 0 or part_number == total_parts:
+            logging.info(
+                "%s: пакет связей %s/%s, объектов %s/%s",
+                source_label, part_number, total_parts, min(part_number * BATCH_SIZE, len(ids)), len(ids),
+            )
         calls = [(f"item_{item_id}", method, {"id": item_id}) for item_id in part]
         results, batch_errors = client.batch(calls)
         for alias, payload in results.items():
@@ -436,7 +563,11 @@ def enrich_records(
     group_map = {str(getv(g, "ID", "id")): str(getv(g, "NAME", "name")) for g in groups}
     categories = datasets.get("Deal_Categories", [])
     category_map = {str(getv(c, "ID", "id")): str(getv(c, "NAME", "name")) for c in categories}
-    statuses = datasets.get("CRM_Statuses", [])
+    statuses = [*datasets.get("CRM_Statuses", []), *datasets.get("CRM_Status_Items", [])]
+    task_status_map = {
+        str(getv(row, "VALUE_ID", "ID", "id")): str(getv(row, "VALUE_NAME", "NAME", "name"))
+        for row in datasets.get("Task_Statuses", [])
+    }
     status_map: dict[tuple[str, str], str] = {}
     loose_status_map: dict[str, str] = {}
     for status in statuses:
@@ -487,6 +618,8 @@ def enrich_records(
         add_user(row, ("CHANGED_BY", "changedBy", "CHANGED_BY_ID", "changedById"), "CHANGED_BY")
         group_id = str(getv(row, "GROUP_ID", "groupId"))
         row["GROUP_NAME"] = group_map.get(group_id, "")
+        task_status_id = str(getv(row, "STATUS", "status"))
+        row["STATUS_NAME"] = task_status_map.get(task_status_id, "")
 
     for row in datasets.get("Workgroups", []):
         add_user(row, ("OWNER_ID", "ownerId"), "OWNER")
@@ -559,9 +692,19 @@ SHEET_DESCRIPTIONS = {
     "Groups": "Только рабочие группы",
     "Scrum": "Только скрам-команды",
     "Collabs": "Только коллабы",
-    "Tasks": "Все доступные задачи и участники",
+    "Tasks": "Все доступные задачи и участники с расшифровкой статуса",
+    "Task_Statuses": "Полный справочник статусов задач из tasks.task.getFields",
     "Task_Stages": "Стадии канбана задач по проектам и группам",
+    "CRM_Status_Types": "Все типы CRM-справочников ENTITY_ID",
     "CRM_Statuses": "Все CRM-справочники статусов, стадий, источников и типов",
+    "CRM_UserField_Config": "Полные настройки пользовательских полей CRM для восстановления",
+    "Lead_UserFields": "Настройки пользовательских полей лидов",
+    "Deal_UserFields": "Настройки пользовательских полей сделок",
+    "Contact_UserFields": "Настройки пользовательских полей контактов",
+    "Company_UserFields": "Настройки пользовательских полей компаний",
+    "Requisite_UserFields": "Настройки пользовательских полей реквизитов",
+    "Task_UserFields": "Настройки пользовательских полей задач",
+    "User_CustomFields": "Настройки пользовательских полей пользователей",
     "Deal_Categories": "Воронки сделок",
     "Lead_Fields": "Справочник полей лидов",
     "Deal_Fields": "Справочник полей сделок",
@@ -768,16 +911,49 @@ def safe_fetch_list(
     result_path: Sequence[str] = (),
     start_key: str = "start",
 ) -> list[dict[str, Any]]:
+    logging.info("[%s] начало: %s", dataset, method)
+    started = time.monotonic()
     try:
         rows = client.list_all(
             method,
             params,
             result_path=result_path,
             start_key=start_key,
+            label=dataset,
         )
+        elapsed = time.monotonic() - started
+        logging.info("[%s] готово: %s строк за %.1f сек.", dataset, len(rows), elapsed)
         log.add(dataset, method, "OK", len(rows))
         return rows
     except Exception as exc:  # noqa: BLE001 — ошибки должны попасть в Excel, а не оборвать экспорт
+        logging.exception("Не удалось выгрузить %s", dataset)
+        log.add(dataset, method, "ERROR", 0, str(exc))
+        return []
+
+
+def safe_fetch_single(
+    client: BitrixClient,
+    log: ExportLog,
+    dataset: str,
+    method: str,
+    params: Mapping[str, Any] | None = None,
+    *,
+    result_path: Sequence[str] = (),
+) -> list[dict[str, Any]]:
+    """Один вызов без пагинации — для methods и других несоставных методов."""
+    logging.info("[%s] начало: %s (один запрос)", dataset, method)
+    started = time.monotonic()
+    try:
+        data = client.call(method, params or {})
+        result = data.get("result")
+        if result_path:
+            result = deep_get(result, result_path)
+        rows = normalize_records(result)
+        elapsed = time.monotonic() - started
+        logging.info("[%s] готово: %s строк за %.1f сек.", dataset, len(rows), elapsed)
+        log.add(dataset, method, "OK", len(rows))
+        return rows
+    except Exception as exc:  # noqa: BLE001
         logging.exception("Не удалось выгрузить %s", dataset)
         log.add(dataset, method, "ERROR", 0, str(exc))
         return []
@@ -789,10 +965,13 @@ def safe_fetch_fields(
     dataset: str,
     method: str,
 ) -> tuple[list[dict[str, Any]], Any]:
+    logging.info("[%s] начало: %s", dataset, method)
+    started = time.monotonic()
     try:
         data = client.call(method, {})
         payload = data.get("result", {})
         rows = flatten_field_catalog(payload)
+        logging.info("[%s] готово: %s полей за %.1f сек.", dataset, len(rows), time.monotonic() - started)
         log.add(dataset, method, "OK", len(rows))
         return rows, payload
     except Exception as exc:  # noqa: BLE001
@@ -810,8 +989,11 @@ def safe_fetch_crm_entity(
     fallback_select: Sequence[str],
 ) -> list[dict[str, Any]]:
     params = {"order": {"ID": "ASC"}, "filter": {}, "select": list(select)}
+    logging.info("[%s] начало: %s", dataset, method)
+    started = time.monotonic()
     try:
-        rows = client.list_all(method, params)
+        rows = client.list_all(method, params, label=dataset)
+        logging.info("[%s] готово: %s строк за %.1f сек.", dataset, len(rows), time.monotonic() - started)
         log.add(dataset, method, "OK", len(rows))
         return rows
     except Exception as exc:  # noqa: BLE001
@@ -820,6 +1002,7 @@ def safe_fetch_crm_entity(
             rows = client.list_all(
                 method,
                 {"order": {"ID": "ASC"}, "filter": {}, "select": list(fallback_select)},
+                label=f"{dataset}_fallback",
             )
             log.add(dataset, method, "PARTIAL", len(rows), f"Полный select не принят: {exc}")
             return rows
@@ -844,7 +1027,7 @@ def write_json_bundle(
     for name, rows in datasets.items():
         filename = re.sub(r"[^A-Za-z0-9_.-]+", "_", name) + ".json"
         path = datasets_dir / filename
-        path.write_text(json.dumps(list(rows), ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+        path.write_text(json.dumps(list(rows), ensure_ascii=False, separators=(",", ":"), default=str), encoding="utf-8")
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
         files.append({"dataset": name, "rows": len(rows), "file": str(path.relative_to(dump_dir)), "sha256": digest})
 
@@ -858,7 +1041,7 @@ def write_json_bundle(
         "datasets": files,
         "notes": [
             "Исходные ID сохранены; при импорте в другой портал ID пользователей, стадий и сущностей потребуется сопоставить.",
-            "json/raw_api содержит необработанные ответы REST API по каждому запросу.",
+            ("json/raw_api содержит необработанные ответы REST API." if config.get("save_raw_api") else "Сырые дубли ответов REST отключены для ускорения; все нормализованные данные находятся в json/datasets."),
             "Excel предназначен для проверки и сопоставления, JSON — основной источник данных для миграции.",
         ],
     }
@@ -882,7 +1065,7 @@ def export_all(client: BitrixClient, config: Mapping[str, Any]) -> tuple[Ordered
     errors: list[dict[str, Any]] = []
 
     # Сначала справочники и поля — они нужны для расшифровки основных сущностей.
-    methods = safe_fetch_list(client, log, "Methods", "methods", {})
+    methods = safe_fetch_single(client, log, "Methods", "methods", {})
     datasets["Methods"] = methods
 
     lead_fields, lead_fields_payload = safe_fetch_fields(client, log, "Lead_Fields", "crm.lead.fields")
@@ -902,6 +1085,14 @@ def export_all(client: BitrixClient, config: Mapping[str, Any]) -> tuple[Ordered
     datasets["Contact_Fields"] = contact_fields
     datasets["Company_Fields"] = company_fields
     datasets["Task_Fields"] = task_fields
+    datasets["Task_Statuses"] = extract_field_enum_values(task_fields_payload, "STATUS")
+    log.add(
+        "Task_Statuses",
+        "tasks.task.getFields:STATUS.values",
+        "OK" if datasets["Task_Statuses"] else "PARTIAL",
+        len(datasets["Task_Statuses"]),
+        "" if datasets["Task_Statuses"] else "Справочник STATUS.values не найден в ответе",
+    )
     datasets["User_Fields"] = user_fields
     datasets["Department_Fields"] = department_fields
     datasets["Activity_Fields"] = activity_fields
@@ -909,6 +1100,47 @@ def export_all(client: BitrixClient, config: Mapping[str, Any]) -> tuple[Ordered
     datasets["Address_Fields"] = address_fields
     datasets["BankDetail_Fields"] = bank_fields
 
+    # Полные настройки пользовательских полей: XML_ID, обязательность,
+    # множественность, настройки и значения списков. *.fields нужен для select,
+    # а userfieldconfig/list — для точного восстановления конфигурации.
+    datasets["CRM_UserField_Config"] = safe_fetch_list(
+        client,
+        log,
+        "CRM_UserField_Config",
+        "userfieldconfig.list",
+        {
+            "moduleId": "crm",
+            "select": {"0": "*", "language": "ru"},
+            "order": {"sort": "ASC", "id": "ASC"},
+            "filter": {},
+        },
+        result_path=("fields",),
+    )
+
+    legacy_userfield_specs = [
+        ("Lead_UserFields", "crm.lead.userfield.list"),
+        ("Deal_UserFields", "crm.deal.userfield.list"),
+        ("Contact_UserFields", "crm.contact.userfield.list"),
+        ("Company_UserFields", "crm.company.userfield.list"),
+        ("Requisite_UserFields", "crm.requisite.userfield.list"),
+    ]
+    for dataset_name, method_name in legacy_userfield_specs:
+        datasets[dataset_name] = safe_fetch_list(
+            client, log, dataset_name, method_name,
+            {"order": {"SORT": "ASC", "ID": "ASC"}, "filter": {"LANG": "ru"}},
+        )
+    datasets["Task_UserFields"] = safe_fetch_list(
+        client, log, "Task_UserFields", "task.item.userfield.getlist",
+        {"ORDER": {"SORT": "ASC"}},
+    )
+    datasets["User_CustomFields"] = safe_fetch_list(
+        client, log, "User_CustomFields", "user.userfield.list",
+        {"order": {"SORT": "ASC", "ID": "ASC"}, "filter": {}},
+    )
+
+    datasets["CRM_Status_Types"] = safe_fetch_single(
+        client, log, "CRM_Status_Types", "crm.status.entity.types", {}
+    )
     datasets["CRM_Statuses"] = safe_fetch_list(
         client,
         log,
@@ -1141,7 +1373,9 @@ def export_all(client: BitrixClient, config: Mapping[str, Any]) -> tuple[Ordered
     task_stages: list[dict[str, Any]] = []
     if config.get("export_task_stages", True):
         group_ids = [str(getv(row, "ID", "id")) for row in datasets.get("Workgroups", []) if str(getv(row, "ID", "id"))]
-        for part in chunks(group_ids, BATCH_SIZE):
+        total_parts = max(1, (len(group_ids) + BATCH_SIZE - 1) // BATCH_SIZE)
+        for part_number, part in enumerate(chunks(group_ids, BATCH_SIZE), start=1):
+            logging.info("[Task_Stages] пакет %s/%s", part_number, total_parts)
             calls = [(f"group_{group_id}", "task.stages.get", {"entityId": group_id, "isAdmin": True}) for group_id in part]
             try:
                 results, stage_errors = client.batch(calls)
@@ -1224,7 +1458,10 @@ def export_all(client: BitrixClient, config: Mapping[str, Any]) -> tuple[Ordered
         for source_name, entity_type_id in timeline_specs:
             source_rows = datasets.get(source_name, [])
             ids = [str(getv(row, "ID", "id")) for row in source_rows if str(getv(row, "ID", "id"))]
-            for part in chunks(ids, BATCH_SIZE):
+            total_parts = max(1, (len(ids) + BATCH_SIZE - 1) // BATCH_SIZE)
+            for part_number, part in enumerate(chunks(ids, BATCH_SIZE), start=1):
+                if part_number == 1 or part_number % 10 == 0 or part_number == total_parts:
+                    logging.info("[Timeline_Comments:%s] пакет %s/%s", source_name, part_number, total_parts)
                 calls = [
                     (f"item_{entity_type_id}_{item_id}", "crm.timeline.comment.list", {"entityTypeId": entity_type_id, "entityId": item_id})
                     for item_id in part
@@ -1272,6 +1509,7 @@ def export_all(client: BitrixClient, config: Mapping[str, Any]) -> tuple[Ordered
         "Scrum",
         "Collabs",
         "Tasks",
+        "Task_Statuses",
         "Task_Stages",
         "Deal_Contacts",
         "Lead_Contacts",
@@ -1286,9 +1524,18 @@ def export_all(client: BitrixClient, config: Mapping[str, Any]) -> tuple[Ordered
         "Bank_Details",
         "Requisite_Presets",
         "Requisite_Links",
+        "CRM_Status_Types",
         "CRM_Statuses",
         "Deal_Categories",
         "Smart_Process_Types",
+        "CRM_UserField_Config",
+        "Lead_UserFields",
+        "Deal_UserFields",
+        "Contact_UserFields",
+        "Company_UserFields",
+        "Requisite_UserFields",
+        "Task_UserFields",
+        "User_CustomFields",
         "Lead_Fields",
         "Deal_Fields",
         "Contact_Fields",
@@ -1346,21 +1593,26 @@ def main() -> int:
         "export_timeline_comments": env_bool("EXPORT_TIMELINE_COMMENTS", True) and not args.no_timeline,
         "export_smart_processes": env_bool("EXPORT_SMART_PROCESSES", True) and not args.no_smart_processes,
         "export_task_stages": env_bool("EXPORT_TASK_STAGES", True) and not args.no_task_stages,
+        "save_raw_api": env_bool("SAVE_RAW_API", False),
     }
-    recorder = RawRecorder(dump_dir / "json" / "raw_api")
+    recorder = RawRecorder(dump_dir / "json" / "raw_api") if config["save_raw_api"] else None
     client = BitrixClient(
         webhook,
         timeout=int(os.getenv("HTTP_TIMEOUT_SECONDS", "90")),
         delay=float(os.getenv("REQUEST_DELAY_SECONDS", "0.10")),
         max_retries=int(os.getenv("MAX_RETRIES", "8")),
         recorder=recorder,
+        max_pages=int(os.getenv("MAX_PAGES", str(DEFAULT_MAX_PAGES))),
+        progress_every_pages=int(os.getenv("PROGRESS_EVERY_PAGES", str(DEFAULT_PROGRESS_EVERY_PAGES))),
     )
 
     logging.info("Начинаю выгрузку Bitrix24")
+    logging.info("Параметры: %s", json.dumps(config, ensure_ascii=False, sort_keys=True))
     datasets, export_log = export_all(client, config)
     generated_at = datetime.now().astimezone().isoformat(timespec="seconds")
     portal_hint = client.base_url.split("/rest/")[0]
-    recorder.close()
+    if recorder is not None:
+        recorder.close()
     write_json_bundle(
         dump_dir, datasets, export_log,
         generated_at=generated_at, portal_hint=portal_hint, config=config,
