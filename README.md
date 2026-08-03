@@ -146,3 +146,7 @@ Python должен быть доступен командой `python` из Pow
 2. `02 - Зарегистрировать нужных пользователей` с `mode=dry_run`.
 3. `03 - Перенести CRM в коробку` с `mode=dry_run`, `max_items=10`, `allow_user_fallback=false`.
 4. После проверки отчётов — реальные режимы `apply`.
+
+### Совместимость с Windows PowerShell
+
+В workflow явно используется `shell: powershell`, то есть встроенный Windows PowerShell 5.1. Устанавливать PowerShell 7 (`pwsh`) и получать права администратора не требуется.
