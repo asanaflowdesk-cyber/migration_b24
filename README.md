@@ -150,3 +150,7 @@ Python должен быть доступен командой `python` из Pow
 ### Совместимость с Windows PowerShell
 
 В workflow явно используется `shell: powershell`, то есть встроенный Windows PowerShell 5.1. Устанавливать PowerShell 7 (`pwsh`) и получать права администратора не требуется.
+
+## Windows self-hosted без PowerShell-скриптов
+
+В этой версии все `run`-шаги GitHub Actions выполняются через встроенный `cmd.exe` (`shell: cmd`). Это позволяет работать на корпоративном Windows-компьютере, где запуск файлов `.ps1` запрещён политикой безопасности. Изменение Execution Policy и права администратора не требуются.
