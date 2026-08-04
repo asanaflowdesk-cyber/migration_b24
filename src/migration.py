@@ -86,8 +86,25 @@ class MigrationProject:
         self._user_config = self._load_users_csv()
 
     def _load_users_csv(self) -> list[dict[str, str]]:
-        with self.users_path.open("r", newline="", encoding="utf-8-sig") as f:
-            return [dict(row) for row in csv.DictReader(f)]
+        raw = self.users_path.read_bytes()
+        text: str | None = None
+        last_error: UnicodeDecodeError | None = None
+
+        # GitHub/Windows may preserve CSV files saved either as UTF-8 or
+        # Windows-1251. Support both so a spreadsheet editor cannot break the run.
+        for encoding in ("utf-8-sig", "cp1251"):
+            try:
+                text = raw.decode(encoding)
+                break
+            except UnicodeDecodeError as exc:
+                last_error = exc
+
+        if text is None:
+            raise UnicodeError(
+                f"Unable to decode users CSV as UTF-8 or Windows-1251: {self.users_path}"
+            ) from last_error
+
+        return [dict(row) for row in csv.DictReader(text.splitlines())]
 
     def load_source(self, *sheets: str) -> None:
         needed = [sheet for sheet in sheets if sheet not in self._source]
