@@ -8,6 +8,12 @@ from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
 from urllib.parse import urlencode
 
+# Use the operating system certificate store. On corporate Windows machines
+# this allows Requests to trust the same internal CA certificates as the browser.
+import truststore
+
+truststore.inject_into_ssl()
+
 import requests
 
 LOG = logging.getLogger(__name__)
