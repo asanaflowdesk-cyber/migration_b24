@@ -1,11 +1,11 @@
-п»їsource_user_id,invite,email,name,last_name,target_department_name,target_department_id,source_objects
-1,N,m.snegovskoi@gmail.com,РњРёС…Р°РёР»,РЎРЅРµРіРѕРІСЃРєРѕР№,РџРѕСЂСѓС‡РµРЅРёСЏ,,6
-36,Y,alena.sacheva@gmail.com,РђР»С‘РЅР°,РЎР°С‡РµРІР°,Р”РµРїР°СЂС‚Р°РјРµРЅС‚ СЂРµРіРёРѕРЅР°Р»СЊРЅРѕРіРѕ СЂР°Р·РІРёС‚РёСЏ,,8
-54,Y,svetlana.pak@theeurasia.kz,РЎРІРµС‚Р»Р°РЅР°,РџР°Рє,Р”РµРїР°СЂС‚Р°РјРµРЅС‚ СЂРµРіРёРѕРЅР°Р»СЊРЅРѕРіРѕ СЂР°Р·РІРёС‚РёСЏ,12,118
-56,Y,Tatyana.Dyatlova@theeurasia.kz,РўР°С‚СЊСЏРЅР°,Р”СЏС‚Р»РѕРІР°,Р”РµРїР°СЂС‚Р°РјРµРЅС‚ СЂРµРіРёРѕРЅР°Р»СЊРЅРѕРіРѕ СЂР°Р·РІРёС‚РёСЏ,12,1
-70,Y,Olga.Skrebtsova@theeurasia.kz,РћР»СЊРіР°,РЎРєСЂРµР±С†РѕРІР°,РЈСЃС‚СЊ-РљР°РјРµРЅРѕРіРѕСЂСЃРєРёР№ С„РёР»РёР°Р» Рё РѕС‚РґРµР»РµРЅРёРµ РЈРљ,,239
-74,Y,Andrey.Krizhevskiy@theeurasia.kz,РђРЅРґСЂРµР№,РљСЂРёР¶РµРІСЃРєРёР№,РўР°Р»РґС‹РєРѕСЂРіР°РЅСЃРєРёР№ С„РёР»РёР°Р»,,801
-76,Y,Yuliya.Sidikova@theeurasia.kz,Р®Р»РёСЏ,РЎРёРґРёРєРѕРІР°,РўР°Р»РґС‹РєРѕСЂРіР°РЅСЃРєРёР№ С„РёР»РёР°Р»,,473
-78,Y,Xeniya.Kudaibergenova@theeurasia.kz,РљСЃРµРЅРёСЏ,РљСѓРґР°Р№Р±РµСЂРіРµРЅРѕРІР°,РўР°Р»РґС‹РєРѕСЂРіР°РЅСЃРєРёР№ С„РёР»РёР°Р»,,366
-110,Y,Aliya.Kazrakhmetova@theeurasia.kz,РђР»РёСЏ,РљР°Р·СЂР°С…РјРµС‚РѕРІР°,РџР°РІР»РѕРґР°СЂСЃРєРёР№ С„РёР»РёР°Р»,,477
-900001,Y,Yevgeniy.Shveigert@theeurasia.kz,Р•РІРіРµРЅРёР№,РЁРІРµР№РіРµСЂС‚,РўР°Р»РґС‹РєРѕСЂРіР°РЅСЃРєРёР№ С„РёР»РёР°Р»,14,0
+source_user_id,invite,email,name,last_name,target_department_name,target_department_id,source_objects
+1,N,m.snegovskoi@gmail.com,Михаил,Снеговской,Поручения,,6
+36,Y,alena.sacheva@gmail.com,Алёна,Сачева,Департамент регионального развития,,8
+54,N,svetlana.pak@theeurasia.kz,Светлана,Пак,Департамент регионального развития,12,118
+56,Y,Tatyana.Dyatlova@theeurasia.kz,Татьяна,Дятлова,Департамент регионального развития,12,1
+70,Y,Olga.Skrebtsova@theeurasia.kz,Ольга,Скребцова,Усть-Каменогорский филиал и отделение УК,15,239
+74,Y,Andrey.Krizhevskiy@theeurasia.kz,Андрей,Крижевский,Талдыкорганский филиал,14,801
+76,Y,Yuliya.Sidikova@theeurasia.kz,Юлия,Сидикова,Талдыкорганский филиал,14,473
+78,Y,Xeniya.Kudaibergenova@theeurasia.kz,Ксения,Кудайбергенова,Талдыкорганский филиал,14,366
+110,Y,Aliya.Kazrakhmetova@theeurasia.kz,Алия,Казрахметова,Павлодарский филиал,16,477
+900001,Y,Yevgeniy.Shveigert@theeurasia.kz,Евгений,Швейгерт,Талдыкорганский филиал,14,0
