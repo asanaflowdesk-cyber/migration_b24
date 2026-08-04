@@ -1,8 +1,8 @@
-source_user_id,invite,email,name,last_name,target_department_name,target_department_id,source_objects
-1,Y,m.snegovskoi@gmail.com,Михаил,Снеговской,Поручения,,6
+﻿source_user_id,invite,email,name,last_name,target_department_name,target_department_id,source_objects
+1,N,m.snegovskoi@gmail.com,Михаил,Снеговской,Поручения,,6
 36,Y,alena.sacheva@gmail.com,Алёна,Сачева,Департамент регионального развития,,8
-54,Y,svetlana.pak@theeurasia.kz,Светлана,Пак,Кураторы (Алибек Жунусов),,118
-56,Y,Tatyana.Dyatlova@theeurasia.kz,Татьяна,Дятлова,Региональное Развитие,,1
+54,Y,svetlana.pak@theeurasia.kz,Светлана,Пак,Департамент регионального развития,12,118
+56,Y,Tatyana.Dyatlova@theeurasia.kz,Татьяна,Дятлова,Департамент регионального развития,12,1
 70,Y,Olga.Skrebtsova@theeurasia.kz,Ольга,Скребцова,Усть-Каменогорский филиал и отделение УК,,239
 74,Y,Andrey.Krizhevskiy@theeurasia.kz,Андрей,Крижевский,Талдыкорганский филиал,,801
 76,Y,Yuliya.Sidikova@theeurasia.kz,Юлия,Сидикова,Талдыкорганский филиал,,473
