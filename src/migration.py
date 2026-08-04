@@ -226,20 +226,42 @@ class MigrationProject:
     def _target_users_by_email(self) -> dict[str, dict[str, Any]]:
         return {normalize_name(x.get("EMAIL")): x for x in self._target_users if x.get("EMAIL")}
 
+    @staticmethod
+    def _target_users_by_full_name(users: Iterable[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+        result: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for user in users:
+            full_name = normalize_name(f"{text(user.get('NAME'))} {text(user.get('LAST_NAME'))}")
+            if full_name:
+                result[full_name].append(user)
+        return result
+
+    @staticmethod
+    def _match_target_user(
+        row: Mapping[str, Any],
+        by_email: Mapping[str, dict[str, Any]],
+        by_full_name: Mapping[str, list[dict[str, Any]]],
+    ) -> dict[str, Any] | None:
+        email = normalize_name(row.get("email"))
+        if email and email in by_email:
+            return by_email[email]
+        full_name = normalize_name(f"{text(row.get('name'))} {text(row.get('last_name'))}")
+        matches = by_full_name.get(full_name, [])
+        return matches[0] if len(matches) == 1 else None
+
     def build_user_map(self, *, strict: bool = True) -> dict[str, int]:
         if not self.client:
             raise RuntimeError("Target Bitrix client is required")
         if not self._target_users:
             self._target_users = self.client.list_all("user.get", {"FILTER": {"ACTIVE": "Y"}})
         by_email = self._target_users_by_email()
+        by_full_name = self._target_users_by_full_name(self._target_users)
         current = self.client.call("user.current") or {}
         fallback_id = int(current.get("ID", 0) or 0)
         result: dict[str, int] = {}
         missing: list[dict[str, str]] = []
         for row in self._user_config:
             source_id = text(row.get("source_user_id"))
-            email = normalize_name(row.get("email"))
-            target = by_email.get(email)
+            target = self._match_target_user(row, by_email, by_full_name)
             if target:
                 result[source_id] = int(target["ID"])
                 self.report.add("map_user", "USER", source_id, "USER", target["ID"], "OK", text(target.get("EMAIL")))
@@ -260,20 +282,21 @@ class MigrationProject:
             raise RuntimeError("Target Bitrix client is required")
         target_users = self.client.list_all("user.get", {})
         by_email = {normalize_name(x.get("EMAIL")): x for x in target_users if x.get("EMAIL")}
+        by_full_name = self._target_users_by_full_name(target_users)
         departments = self.client.list_all("department.get", {})
         by_department_name: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for department in departments:
             by_department_name[normalize_name(department.get("NAME"))].append(department)
         mapping: dict[str, int] = {}
         for row in self._user_config:
-            if not bool_y(row.get("invite", "Y")):
-                continue
             source_id = text(row.get("source_user_id"))
-            email = normalize_name(row.get("email"))
-            existing = by_email.get(email)
+            existing = self._match_target_user(row, by_email, by_full_name)
             if existing:
                 mapping[source_id] = int(existing["ID"])
                 self.report.add("invite_user", "USER", source_id, "USER", existing["ID"], "SKIP", "already exists")
+                continue
+            if not bool_y(row.get("invite", "Y")):
+                self.report.add("invite_user", "USER", source_id, "USER", "", "SKIP", "invite disabled; existing user not resolved")
                 continue
             department_id = int(row.get("target_department_id") or 0)
             if not department_id:
