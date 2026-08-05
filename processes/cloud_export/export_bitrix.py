@@ -316,6 +316,7 @@ class BitrixClient:
                 result = deep_get(result, result_path)
             page = normalize_records(result)
             all_rows.extend(page)
+            logging.info("    %s: получено %s, всего %s", method, len(page), len(all_rows))
 
             next_value = data.get("next")
             if next_value is None and isinstance(data.get("result"), dict):
@@ -375,7 +376,9 @@ def export_batch_relations(
     output: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
     ids = [str(getv(row, "ID", "id")) for row in source_rows if str(getv(row, "ID", "id"))]
-    for part in chunks(ids, BATCH_SIZE):
+    total_batches = max(1, (len(ids) + BATCH_SIZE - 1) // BATCH_SIZE)
+    for batch_number, part in enumerate(chunks(ids, BATCH_SIZE), start=1):
+        logging.info("    %s: пакет %s/%s", source_label, batch_number, total_batches)
         calls = [(f"item_{item_id}", method, {"id": item_id}) for item_id in part]
         results, batch_errors = client.batch(calls)
         for alias, payload in results.items():
@@ -768,6 +771,7 @@ def safe_fetch_list(
     result_path: Sequence[str] = (),
     start_key: str = "start",
 ) -> list[dict[str, Any]]:
+    logging.info("▶ %s (%s)", dataset, method)
     try:
         rows = client.list_all(
             method,
@@ -776,6 +780,7 @@ def safe_fetch_list(
             start_key=start_key,
         )
         log.add(dataset, method, "OK", len(rows))
+        logging.info("✓ %s: %s строк", dataset, len(rows))
         return rows
     except Exception as exc:  # noqa: BLE001 — ошибки должны попасть в Excel, а не оборвать экспорт
         logging.exception("Не удалось выгрузить %s", dataset)
@@ -789,11 +794,13 @@ def safe_fetch_fields(
     dataset: str,
     method: str,
 ) -> tuple[list[dict[str, Any]], Any]:
+    logging.info("▶ %s (%s)", dataset, method)
     try:
         data = client.call(method, {})
         payload = data.get("result", {})
         rows = flatten_field_catalog(payload)
         log.add(dataset, method, "OK", len(rows))
+        logging.info("✓ %s: %s полей", dataset, len(rows))
         return rows, payload
     except Exception as exc:  # noqa: BLE001
         logging.exception("Не удалось выгрузить %s", dataset)
@@ -810,9 +817,11 @@ def safe_fetch_crm_entity(
     fallback_select: Sequence[str],
 ) -> list[dict[str, Any]]:
     params = {"order": {"ID": "ASC"}, "filter": {}, "select": list(select)}
+    logging.info("▶ %s (%s)", dataset, method)
     try:
         rows = client.list_all(method, params)
         log.add(dataset, method, "OK", len(rows))
+        logging.info("✓ %s: %s строк", dataset, len(rows))
         return rows
     except Exception as exc:  # noqa: BLE001
         logging.warning("Полный select для %s не сработал: %s. Пробую резервный.", dataset, exc)
@@ -822,6 +831,7 @@ def safe_fetch_crm_entity(
                 {"order": {"ID": "ASC"}, "filter": {}, "select": list(fallback_select)},
             )
             log.add(dataset, method, "PARTIAL", len(rows), f"Полный select не принят: {exc}")
+            logging.info("⚠ %s: %s строк через резервный select", dataset, len(rows))
             return rows
         except Exception as fallback_exc:  # noqa: BLE001
             logging.exception("Не удалось выгрузить %s", dataset)
@@ -1357,24 +1367,29 @@ def main() -> int:
     )
 
     logging.info("Начинаю выгрузку Bitrix24")
+    logging.info("Этап 1/4: получение данных через REST API")
     datasets, export_log = export_all(client, config)
     generated_at = datetime.now().astimezone().isoformat(timespec="seconds")
     portal_hint = client.base_url.split("/rest/")[0]
     recorder.close()
+    logging.info("Этап 2/4: сохранение JSON и manifest")
     write_json_bundle(
         dump_dir, datasets, export_log,
         generated_at=generated_at, portal_hint=portal_hint, config=config,
     )
 
+    logging.info("Этап 3/4: формирование Excel")
     writer = ExcelWriter(output_path)
     try:
         # Summary должен быть первым листом.
         writer.write_summary(datasets, export_log, generated_at, portal_hint)
         for name, rows in datasets.items():
+            logging.info("    Excel: %s — %s строк", name, len(rows))
             writer.write_dataset(name, rows)
     finally:
         writer.close()
 
+    logging.info("Этап 4/4: создание ZIP-архива")
     zip_path = None if args.no_zip else make_zip(dump_dir)
     logging.info("Готово: %s", dump_dir.resolve())
     print(dump_dir.resolve())
