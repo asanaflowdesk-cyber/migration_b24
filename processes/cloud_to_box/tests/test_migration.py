@@ -4,6 +4,7 @@ from pathlib import Path
 from common.bitrix import BitrixClient
 from src.dump_reader import DumpReader
 from src.file_transfer import FileTransfer
+from src.live_source import LiveCloudSource
 from src.migration import MigrationProject, migration_marker, normalize_name_tokens, parse_marker
 from src.reporting import Report
 
@@ -376,13 +377,67 @@ def test_report_writes_full_payload_previews(tmp_path: Path) -> None:
     assert "preview_contact.csv" in index
 
 
-def test_dump_reader_prefers_excel_registry() -> None:
-    with DumpReader(DUMP, prefer_excel=True) as reader:
-        assert reader.registry_source == "excel"
+def test_dump_is_checkpoint_not_excel_primary() -> None:
+    with DumpReader(DUMP) as reader:
         assert len(reader.rows("Companies")) == 604
         company = next(row for row in reader.rows("Companies") if row.get("PHONE"))
         assert isinstance(company["PHONE"], list)
         assert company["PHONE"][0]["VALUE"]
+
+
+class _LiveCompanyClient:
+    base = "https://source.example/rest/1/token/"
+
+    def call(self, method, params=None):
+        assert method == "crm.company.fields"
+        return {"ID": {}, "TITLE": {}, "PHONE": {}, "EMAIL": {}}
+
+    def list_all(self, method, params=None):
+        assert method == "crm.company.list"
+        return [{
+            "ID": "9",
+            "TITLE": "Live company",
+            "PHONE": [{"VALUE": "+77010000000", "VALUE_TYPE": "WORK"}],
+            "EMAIL": [{"VALUE": "live@example.kz", "VALUE_TYPE": "WORK"}],
+        }]
+
+
+def test_live_cloud_source_returns_full_card_fields() -> None:
+    reader = LiveCloudSource(_LiveCompanyClient())
+    rows = reader.rows("Companies")
+    assert reader.manifest()["source_mode"] == "direct_cloud_api"
+    assert rows[0]["TITLE"] == "Live company"
+    assert rows[0]["PHONE"][0]["VALUE"] == "+77010000000"
+    assert rows[0]["EMAIL"][0]["VALUE"] == "live@example.kz"
+
+
+
+
+def test_migration_project_prefers_live_source_over_dump(tmp_path: Path) -> None:
+    p = MigrationProject(
+        DUMP,
+        ROOT / "config/migration.json",
+        ROOT / "config/users.csv",
+        tmp_path,
+        target_client=None,
+        source_client=_LiveCompanyClient(),
+    )
+    p.load_source("Companies")
+    assert p._source["Companies"][0]["TITLE"] == "Live company"
+    assert p.report.extra["source_dataset_origins"]["Companies"] == "live_cloud_api"
+
+
+def test_same_code_user_field_is_included_in_target_payload(tmp_path: Path) -> None:
+    p = project(tmp_path)
+    p._target_fields["company"] = {
+        "TITLE": {},
+        "UF_CRM_SHARED": {},
+    }
+    fields = p._copy_standard_fields(
+        "company",
+        {"TITLE": "Company", "UF_CRM_SHARED": "value", "UF_CRM_MISSING": "drop"},
+    )
+    assert fields == {"TITLE": "Company", "UF_CRM_SHARED": "value"}
 
 
 def test_dry_run_builds_requisites_relations_tasks_and_activities(tmp_path: Path) -> None:

@@ -11,6 +11,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from common.bitrix import BitrixClient, BitrixError
 from .dump_reader import DumpReader
+from .live_source import LiveCloudSource
 from .file_transfer import FileTransfer
 from .reporting import Report
 
@@ -98,7 +99,7 @@ class MigrationProject:
         source_client: BitrixClient | None = None,
     ):
         self.source_dump = Path(source_dump)
-        self._reader = DumpReader(self.source_dump, prefer_excel=True)
+        self._reader = DumpReader(self.source_dump)
         self.config = json.loads(Path(config_path).read_text(encoding="utf-8"))
         self.users_path = Path(users_path) if users_path else None
         self.report = Report(output_dir)
@@ -106,10 +107,12 @@ class MigrationProject:
         self.source_client = source_client
         self._source: dict[str, list[dict[str, Any]]] = {}
         self._manifest: dict[str, Any] = self._reader.manifest()
+        self._live_source: LiveCloudSource | None = None
+        self._source_origins: dict[str, str] = {}
         self.report.extra["source_registry"] = {
-            "primary": self._reader.registry_source,
-            "excel_is_primary": self._reader.registry_source == "excel",
-            "json_role": "technical fallback and enrichment",
+            "primary": "live_cloud_api" if source_client else "dump",
+            "dump_role": "checkpoint and dataset-level fallback",
+            "excel_role": "human-readable audit only; not used as migration source",
         }
         self._target_fields: dict[str, dict[str, Any]] = {}
         self._target_statuses: list[dict[str, Any]] = []
@@ -203,18 +206,38 @@ class MigrationProject:
             required.update(self._task_participant_ids(row))
         return required
 
+    def _source_warning(self, dataset: str, message: str) -> None:
+        LOG.warning("Live source %s: %s", dataset, message)
+        self.report.add("read_source", dataset, "", dataset, "", "WARN", message)
+
     def load_source(self, *datasets: str) -> None:
+        """Load source data directly from cloud, with dump fallback per dataset."""
         needed = [name for name in datasets if name not in self._source]
         if not needed:
             return
+
+        if self.source_client and self._live_source is None:
+            self._live_source = LiveCloudSource(self.source_client, self._source_warning)
+            self._manifest = self._live_source.manifest()
+
         for name in needed:
-            self._source[name] = self._reader.rows(name)
-            LOG.info(
-                "Loaded %-22s %s rows from %s registry",
-                name,
-                len(self._source[name]),
-                self._reader.registry_source,
-            )
+            if self._live_source is not None:
+                try:
+                    rows = self._live_source.rows(name)
+                    self._source[name] = rows
+                    self._source_origins[name] = "live_cloud_api"
+                    LOG.info("Source %-22s LIVE %s rows", name, len(rows))
+                    continue
+                except Exception as exc:  # noqa: BLE001
+                    self._source_warning(name, f"live dataset unavailable; dump fallback used: {exc}")
+
+            rows = self._reader.rows(name)
+            self._source[name] = rows
+            self._source_origins[name] = "dump_fallback" if self.source_client else "dump"
+            LOG.info("Source %-22s DUMP %s rows", name, len(rows))
+
+        self.report.extra["source_mode"] = "direct_cloud_api" if self.source_client else "dump"
+        self.report.extra["source_dataset_origins"] = dict(self._source_origins)
 
     # ---------- target discovery and validation ----------
 
@@ -509,7 +532,7 @@ class MigrationProject:
         excluded = excluded or set()
         result: dict[str, Any] = {}
         for code, value in row.items():
-            if code in excluded or code.startswith("UF_") or not self._is_target_field_writable(entity, code):
+            if code in excluded or not self._is_target_field_writable(entity, code):
                 continue
             if value in (None, "", [], {}):
                 continue
@@ -794,11 +817,11 @@ class MigrationProject:
         return prepared
 
     def validate_live_source(self) -> dict[str, Any]:
-        """Probe live-cloud enrichment endpoints without blocking the migration.
+        """Probe direct cloud access without blocking on optional child data.
 
-        The dump is sufficient for the main CRM objects and task/activity shells.
-        Comments, checklists and binary files are best-effort enrichment: failures
-        are written as warnings so available data can still be migrated.
+        Main CRM cards, relations, tasks and activities are read from the live
+        cloud portal. Comments, checklists and binary files are best-effort child
+        data: failures are logged and the remaining records continue.
         """
         if not self.source_client:
             raise RuntimeError("SOURCE_BITRIX_WEBHOOK_URL is required")
