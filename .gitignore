@@ -1,0 +1,13 @@
+.env
+output/
+**/output/
+**/.venv/
+__pycache__/
+**/__pycache__/
+.pytest_cache/
+**/.pytest_cache/
+*.pyc
+*.zip
+*.xlsx
+!processes/cloud_to_box/input/bitrix24_export.xlsx
+!processes/user_registration/input/users_to_invite.xlsx
