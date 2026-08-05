@@ -73,17 +73,20 @@ def resolve_requisite_preset(
     source_entity_type: Any,
     target_presets: Sequence[Mapping[str, Any]],
 ) -> tuple[int | None, str]:
-    """Resolve a box requisite preset without relying on identical portal labels.
+    """Resolve a target requisite preset without assuming portal IDs are equal.
 
-    Priority: XML_ID, normalized exact label, semantic alias for the same owner
-    type, then a unique preset for the same ENTITY_TYPE_ID. Multiple possible
-    presets are never guessed.
+    ``crm.requisite.preset.list.ENTITY_TYPE_ID`` identifies the parent object
+    type of the preset itself and is normally ``8`` (Requisite). It does *not*
+    identify whether a concrete requisite belongs to a contact (3) or company
+    (4). Therefore owner-type matching must be based on the semantic preset
+    name (person/legal entity), not on the preset's ENTITY_TYPE_ID.
+
+    Priority: reserved/default XML_ID, exact normalized name, semantic alias.
+    Country is used only as a narrowing signal when it is available. Ambiguous
+    matches are never guessed.
     """
-    entity_type = text(source_entity_type)
-    valid = [
-        row for row in target_presets
-        if text(row.get("ID")).isdigit()
-    ]
+    owner_type = text(source_entity_type)
+    valid = [row for row in target_presets if text(row.get("ID")).isdigit()]
 
     source_xml = text(source_preset.get("XML_ID")).strip()
     if source_xml:
@@ -97,21 +100,36 @@ def resolve_requisite_preset(
         if len(exact) == 1:
             return int(exact[0]["ID"]), "exact name"
 
-    same_type = [row for row in valid if text(row.get("ENTITY_TYPE_ID")) == entity_type]
-    aliases = PRESET_NAME_ALIASES.get(entity_type, set())
-    source_is_alias = source_name in aliases
-    if source_is_alias:
-        alias_matches = [row for row in same_type if normalize_preset_label(row.get("NAME")) in aliases]
+    aliases = PRESET_NAME_ALIASES.get(owner_type, set())
+    if source_name in aliases:
+        alias_matches = [
+            row for row in valid
+            if normalize_preset_label(row.get("NAME")) in aliases
+        ]
+
+        source_country = text(source_preset.get("COUNTRY_ID")).strip()
+        if source_country:
+            same_country = [
+                row for row in alias_matches
+                if text(row.get("COUNTRY_ID")).strip() == source_country
+            ]
+            if len(same_country) == 1:
+                return int(same_country[0]["ID"]), "semantic alias + country"
+            if len(same_country) > 1:
+                alias_matches = same_country
+
         if len(alias_matches) == 1:
             return int(alias_matches[0]["ID"]), "semantic alias"
 
-    if len(same_type) == 1:
-        return int(same_type[0]["ID"]), "unique owner type"
+        candidate_names = ", ".join(
+            f"{row.get('ID')}:{row.get('NAME')}" for row in alias_matches
+        ) or "none"
+        return None, f"ambiguous semantic presets for owner type {owner_type}: {candidate_names}"
 
     candidate_names = ", ".join(
-        f"{row.get('ID')}:{row.get('NAME')}" for row in same_type
+        f"{row.get('ID')}:{row.get('NAME')}" for row in valid
     ) or "none"
-    return None, f"ambiguous target presets for ENTITY_TYPE_ID={entity_type}: {candidate_names}"
+    return None, f"target preset not matched for owner type {owner_type}; available: {candidate_names}"
 
 
 def normalize_name_tokens(*values: Any) -> tuple[str, ...]:

@@ -471,43 +471,66 @@ def test_dry_run_builds_requisites_relations_tasks_and_activities(tmp_path: Path
     assert calls == ["requisites", "relations", "tasks_activities"]
 
 
-def test_requisite_preset_maps_legal_entity_alias() -> None:
+def test_requisite_preset_maps_legal_entity_alias_with_real_preset_entity_type() -> None:
     target = [
-        {"ID": "1", "NAME": "Организация", "ENTITY_TYPE_ID": "4", "XML_ID": ""},
-        {"ID": "3", "NAME": "Физ. лицо", "ENTITY_TYPE_ID": "3", "XML_ID": ""},
+        {"ID": "1", "NAME": "Организация", "ENTITY_TYPE_ID": "8", "COUNTRY_ID": "6", "XML_ID": ""},
+        {"ID": "3", "NAME": "Физ. лицо", "ENTITY_TYPE_ID": "8", "COUNTRY_ID": "6", "XML_ID": ""},
     ]
     preset_id, reason = resolve_requisite_preset(
-        {"NAME": "Юр. лицо", "XML_ID": ""},
+        {"NAME": "Юр. лицо", "COUNTRY_ID": "6", "XML_ID": ""},
         "4",
         target,
     )
     assert preset_id == 1
-    assert reason == "semantic alias"
+    assert reason == "semantic alias + country"
 
 
-def test_requisite_preset_uses_unique_owner_type() -> None:
+def test_requisite_preset_maps_person_alias_with_real_preset_entity_type() -> None:
     target = [
-        {"ID": "7", "NAME": "Контрагент KZ", "ENTITY_TYPE_ID": "4", "XML_ID": ""},
-        {"ID": "3", "NAME": "Физ. лицо", "ENTITY_TYPE_ID": "3", "XML_ID": ""},
+        {"ID": "1", "NAME": "Организация", "ENTITY_TYPE_ID": "8", "COUNTRY_ID": "6", "XML_ID": ""},
+        {"ID": "3", "NAME": "Физическое лицо", "ENTITY_TYPE_ID": "8", "COUNTRY_ID": "6", "XML_ID": ""},
     ]
     preset_id, reason = resolve_requisite_preset(
-        {"NAME": "Неизвестное название", "XML_ID": ""},
+        {"NAME": "Физ. лицо", "COUNTRY_ID": "6", "XML_ID": ""},
+        "3",
+        target,
+    )
+    assert preset_id == 3
+    assert reason == "semantic alias + country"
+
+
+def test_requisite_preset_prefers_reserved_xml_id() -> None:
+    target = [
+        {
+            "ID": "11",
+            "NAME": "Компания KZ",
+            "ENTITY_TYPE_ID": "8",
+            "COUNTRY_ID": "6",
+            "XML_ID": "#CRM_REQUISITE_PRESET_DEF_KZ_LEGALENTITY#",
+        }
+    ]
+    preset_id, reason = resolve_requisite_preset(
+        {
+            "NAME": "Юр. лицо",
+            "COUNTRY_ID": "6",
+            "XML_ID": "#CRM_REQUISITE_PRESET_DEF_KZ_LEGALENTITY#",
+        },
         "4",
         target,
     )
-    assert preset_id == 7
-    assert reason == "unique owner type"
+    assert preset_id == 11
+    assert reason == "XML_ID"
 
 
-def test_requisite_preset_does_not_guess_multiple_company_presets() -> None:
+def test_requisite_preset_does_not_guess_multiple_company_aliases() -> None:
     target = [
-        {"ID": "1", "NAME": "Организация", "ENTITY_TYPE_ID": "4", "XML_ID": ""},
-        {"ID": "2", "NAME": "ИП", "ENTITY_TYPE_ID": "4", "XML_ID": ""},
+        {"ID": "1", "NAME": "Организация", "ENTITY_TYPE_ID": "8", "COUNTRY_ID": "6", "XML_ID": ""},
+        {"ID": "2", "NAME": "Компания", "ENTITY_TYPE_ID": "8", "COUNTRY_ID": "6", "XML_ID": ""},
     ]
     preset_id, reason = resolve_requisite_preset(
-        {"NAME": "Неизвестное название", "XML_ID": ""},
+        {"NAME": "Юр. лицо", "COUNTRY_ID": "6", "XML_ID": ""},
         "4",
         target,
     )
     assert preset_id is None
-    assert "ambiguous target presets" in reason
+    assert "ambiguous semantic presets" in reason
