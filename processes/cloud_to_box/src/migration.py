@@ -98,13 +98,19 @@ class MigrationProject:
         source_client: BitrixClient | None = None,
     ):
         self.source_dump = Path(source_dump)
+        self._reader = DumpReader(self.source_dump, prefer_excel=True)
         self.config = json.loads(Path(config_path).read_text(encoding="utf-8"))
         self.users_path = Path(users_path) if users_path else None
         self.report = Report(output_dir)
         self.client = target_client
         self.source_client = source_client
         self._source: dict[str, list[dict[str, Any]]] = {}
-        self._manifest: dict[str, Any] = {}
+        self._manifest: dict[str, Any] = self._reader.manifest()
+        self.report.extra["source_registry"] = {
+            "primary": self._reader.registry_source,
+            "excel_is_primary": self._reader.registry_source == "excel",
+            "json_role": "technical fallback and enrichment",
+        }
         self._target_fields: dict[str, dict[str, Any]] = {}
         self._target_statuses: list[dict[str, Any]] = []
         self._target_userfields: dict[str, list[dict[str, Any]]] = {}
@@ -201,12 +207,14 @@ class MigrationProject:
         needed = [name for name in datasets if name not in self._source]
         if not needed:
             return
-        with DumpReader(self.source_dump) as reader:
-            if not self._manifest:
-                self._manifest = reader.manifest()
-            for name in needed:
-                self._source[name] = reader.rows(name)
-                LOG.info("Loaded %-22s %s rows", name, len(self._source[name]))
+        for name in needed:
+            self._source[name] = self._reader.rows(name)
+            LOG.info(
+                "Loaded %-22s %s rows from %s registry",
+                name,
+                len(self._source[name]),
+                self._reader.registry_source,
+            )
 
     # ---------- target discovery and validation ----------
 
@@ -543,43 +551,96 @@ class MigrationProject:
         existing = self._existing_markers(entity) if not dry_run else {}
         mapping: dict[str, int] = {}
         commands: list[tuple[str, str, Mapping[str, Any]]] = []
-        contexts: dict[str, tuple[str, tuple[str, str, str]]] = {}
+        contexts: dict[str, tuple[str, tuple[str, str, str], dict[str, Any]]] = {}
         limited = prepared[:max_items] if max_items else prepared
         for index, (source_key, fields) in enumerate(limited):
             source_type, source_id, route = source_key.split(":", 2)
             marker_key = (source_type, source_id, route)
+            operation = f"create_{entity}"
             if marker_key in existing:
                 target_id = existing[marker_key]
                 mapping[source_key] = target_id
-                self.report.add(f"create_{entity}", source_type, source_id, target_type, target_id, "SKIP", "migration marker exists")
+                self.report.add(operation, source_type, source_id, target_type, target_id, "SKIP", "migration marker exists")
+                self.report.add_transfer(
+                    operation=operation,
+                    source_type=source_type,
+                    source_id=source_id,
+                    target_type=target_type,
+                    target_id=target_id,
+                    status="SKIP",
+                    payload=fields,
+                    route=route,
+                )
                 continue
             if dry_run:
                 synthetic_id = -(index + 1)
                 mapping[source_key] = synthetic_id
-                self.report.add(f"create_{entity}", source_type, source_id, target_type, synthetic_id, "DRY_RUN", text(fields.get("TITLE") or fields.get("NAME")))
+                self.report.add(operation, source_type, source_id, target_type, synthetic_id, "DRY_RUN", text(fields.get("TITLE") or fields.get("NAME")))
+                self.report.add_transfer(
+                    operation=operation,
+                    source_type=source_type,
+                    source_id=source_id,
+                    target_type=target_type,
+                    target_id=synthetic_id,
+                    status="DRY_RUN",
+                    payload=fields,
+                    route=route,
+                )
                 continue
             cmd_key = f"i{index}"
             commands.append((cmd_key, method, {"fields": fields}))
-            contexts[cmd_key] = (source_key, marker_key)
+            contexts[cmd_key] = (source_key, marker_key, fields)
         if dry_run:
             return mapping
         for success, errors in self.client.batch_chunks(commands, size=35):
             for cmd_key, raw_target in success.items():
-                source_key, _marker_key = contexts[cmd_key]
+                source_key, _marker_key, fields = contexts[cmd_key]
                 source_type, source_id, route = source_key.split(":", 2)
+                operation = f"create_{entity}"
                 target_id = extract_id(raw_target)
                 if not target_id:
                     self.report.add(
-                        f"create_{entity}", source_type, source_id, target_type, "", "ERROR",
+                        operation, source_type, source_id, target_type, "", "ERROR",
                         f"Bitrix returned no target ID: {raw_target}",
+                    )
+                    self.report.add_transfer(
+                        operation=operation,
+                        source_type=source_type,
+                        source_id=source_id,
+                        target_type=target_type,
+                        target_id="",
+                        status="SKIP",
+                        payload=fields,
+                        route=route,
                     )
                     continue
                 mapping[source_key] = target_id
-                self.report.add(f"create_{entity}", source_type, source_id, target_type, target_id, "OK", route)
+                self.report.add(operation, source_type, source_id, target_type, target_id, "OK", route)
+                self.report.add_transfer(
+                    operation=operation,
+                    source_type=source_type,
+                    source_id=source_id,
+                    target_type=target_type,
+                    target_id=target_id,
+                    status="OK",
+                    payload=fields,
+                    route=route,
+                )
             for cmd_key, error in errors.items():
-                source_key, _marker_key = contexts[cmd_key]
+                source_key, _marker_key, fields = contexts[cmd_key]
                 source_type, source_id, route = source_key.split(":", 2)
-                self.report.add(f"create_{entity}", source_type, source_id, target_type, "", "ERROR", text(error))
+                operation = f"create_{entity}"
+                self.report.add(operation, source_type, source_id, target_type, "", "ERROR", text(error))
+                self.report.add_transfer(
+                    operation=operation,
+                    source_type=source_type,
+                    source_id=source_id,
+                    target_type=target_type,
+                    target_id="",
+                    status="SKIP",
+                    payload=fields,
+                    route=route,
+                )
         return mapping
 
     def prepare_companies(self, user_map: Mapping[str, int]) -> list[tuple[str, dict[str, Any]]]:
@@ -866,6 +927,16 @@ class MigrationProject:
         self.report.maps["deals"].update(deal_map)
 
         if dry_run:
+            # Build the same target-side records as apply, but do not write them.
+            # The dry-run artifact must therefore contain requisites, addresses,
+            # all CRM relations, tasks and activities in addition to the main
+            # company/contact/lead/deal payloads.
+            self._dry_run_requisites_and_addresses(
+                company_map, contact_map, max_items=max_items
+            )
+            self._record_crm_relation_registry(
+                company_map, contact_map, lead_map, deal_map, status="DRY_RUN"
+            )
             self._dry_run_tasks_activities(
                 user_map, company_map, contact_map, lead_map, deal_map, max_items=max_items
             )
@@ -875,6 +946,396 @@ class MigrationProject:
         self.import_requisite_links(deal_map, lead_map)
         self.import_tasks(user_map, company_map, contact_map, lead_map, deal_map, max_items=max_items)
         self.import_activities(user_map, company_map, contact_map, lead_map, deal_map, max_items=max_items)
+
+
+    def _record_crm_relation_registry(
+        self,
+        company_map: Mapping[str, int],
+        contact_map: Mapping[str, int],
+        lead_map: Mapping[str, int],
+        deal_map: Mapping[str, int],
+        *,
+        status: str,
+    ) -> None:
+        """Write every source CRM relation to a separate audit register."""
+        self.load_source("Contact_Companies", "Lead_Contacts", "Deal_Contacts", "Requisite_Links")
+
+        for row in self._source["Contact_Companies"]:
+            old_contact = text(row.get("CONTACT_ID"))
+            old_company = text(row.get("COMPANY_ID"))
+            mapped = old_contact in contact_map and old_company in company_map
+            self.report.add_relation(
+                relation_type="CONTACT_COMPANY",
+                source_from_type="CONTACT",
+                source_from_id=old_contact,
+                source_to_type="COMPANY",
+                source_to_id=old_company,
+                target_from_type="CONTACT" if mapped else "",
+                target_from_id=contact_map.get(old_contact, ""),
+                target_to_type="COMPANY" if mapped else "",
+                target_to_id=company_map.get(old_company, ""),
+                status=status if mapped else "SKIP",
+                details={
+                    "is_primary": row.get("IS_PRIMARY"),
+                    "sort": row.get("SORT"),
+                    "role_id": row.get("ROLE_ID"),
+                },
+            )
+
+        aliases = self._converted_lead_to_deal()
+        for row in self._source["Lead_Contacts"]:
+            old_lead = text(row.get("LEAD_ID"))
+            old_contact = text(row.get("CONTACT_ID"))
+            target_kind = ""
+            target_crm_id: Any = ""
+            source_key = f"LEAD:{old_lead}:LEAD"
+            if source_key in lead_map:
+                target_kind, target_crm_id = "LEAD", lead_map[source_key]
+            elif old_lead in aliases:
+                target = self._source_deal_target(aliases[old_lead], lead_map, deal_map)
+                if target:
+                    target_kind = target[0].upper()
+                    target_crm_id = target[1]
+            mapped = bool(target_kind and old_contact in contact_map)
+            self.report.add_relation(
+                relation_type="LEAD_CONTACT",
+                source_from_type="LEAD",
+                source_from_id=old_lead,
+                source_to_type="CONTACT",
+                source_to_id=old_contact,
+                target_from_type=target_kind if mapped else "",
+                target_from_id=target_crm_id if mapped else "",
+                target_to_type="CONTACT" if mapped else "",
+                target_to_id=contact_map.get(old_contact, ""),
+                status=status if mapped else "SKIP",
+                details={"is_primary": row.get("IS_PRIMARY"), "sort": row.get("SORT")},
+            )
+
+        for row in self._source["Deal_Contacts"]:
+            old_deal = text(row.get("DEAL_ID"))
+            old_contact = text(row.get("CONTACT_ID"))
+            target = self._source_deal_target(old_deal, lead_map, deal_map)
+            mapped = bool(target and old_contact in contact_map)
+            self.report.add_relation(
+                relation_type="DEAL_CONTACT",
+                source_from_type="DEAL",
+                source_from_id=old_deal,
+                source_to_type="CONTACT",
+                source_to_id=old_contact,
+                target_from_type=target[0].upper() if mapped and target else "",
+                target_from_id=target[1] if mapped and target else "",
+                target_to_type="CONTACT" if mapped else "",
+                target_to_id=contact_map.get(old_contact, ""),
+                status=status if mapped else "SKIP",
+                details={"is_primary": row.get("IS_PRIMARY"), "sort": row.get("SORT")},
+            )
+
+        req_map = self.report.maps["requisites"]
+        for row in self._source["Requisite_Links"]:
+            if text(row.get("ENTITY_TYPE_ID")) != "2":
+                continue
+            old_deal = text(row.get("ENTITY_ID"))
+            old_req = text(row.get("REQUISITE_ID"))
+            target = self._source_deal_target(old_deal, lead_map, deal_map)
+            mapped = bool(target and old_req in req_map)
+            target_status = status if mapped else "SKIP"
+            details = {
+                "bank_detail_id": row.get("BANK_DETAIL_ID"),
+                "note": "For a deal routed to a lead, the requisite remains attached through company/contact",
+            }
+            self.report.add_relation(
+                relation_type="CRM_REQUISITE",
+                source_from_type="DEAL",
+                source_from_id=old_deal,
+                source_to_type="REQUISITE",
+                source_to_id=old_req,
+                target_from_type=target[0].upper() if target else "",
+                target_from_id=target[1] if target else "",
+                target_to_type="REQUISITE" if old_req in req_map else "",
+                target_to_id=req_map.get(old_req, ""),
+                status=target_status,
+                details=details,
+            )
+
+    def _dry_run_requisites_and_addresses(
+        self,
+        company_map: Mapping[str, int],
+        contact_map: Mapping[str, int],
+        *,
+        max_items: int = 0,
+    ) -> None:
+        """Prepare exact requisite/address payloads without writing to the box."""
+        self.load_source("Requisites", "Addresses", "Requisite_Presets")
+        target_presets = self.client.list_all(
+            "crm.requisite.preset.list",
+            {"select": ["ID", "NAME", "XML_ID", "ENTITY_TYPE_ID"]},
+        )
+        preset_by_xml = {
+            text(row.get("XML_ID")): int(row["ID"])
+            for row in target_presets
+            if row.get("XML_ID") and text(row.get("ID")).isdigit()
+        }
+        preset_by_name = {
+            normalize_text(row.get("NAME")): int(row["ID"])
+            for row in target_presets
+            if row.get("NAME") and text(row.get("ID")).isdigit()
+        }
+        source_presets = {text(row.get("ID")): row for row in self._source["Requisite_Presets"]}
+        rows = self._source["Requisites"][:max_items] if max_items else self._source["Requisites"]
+        req_map: dict[str, int] = {}
+        for index, row in enumerate(rows):
+            old_id = text(row.get("ID"))
+            source_entity_type = text(row.get("ENTITY_TYPE_ID"))
+            old_entity = text(row.get("ENTITY_ID"))
+            target_entity = (
+                company_map.get(old_entity)
+                if source_entity_type == "4"
+                else contact_map.get(old_entity)
+                if source_entity_type == "3"
+                else None
+            )
+            if not target_entity:
+                self.report.add("create_requisite", "REQUISITE", old_id, "REQUISITE", "", "SKIP", "owner company/contact was not mapped")
+                continue
+            source_preset = source_presets.get(text(row.get("PRESET_ID")), {})
+            target_preset = (
+                preset_by_xml.get(text(source_preset.get("XML_ID")))
+                or preset_by_name.get(normalize_text(source_preset.get("NAME")))
+            )
+            if not target_preset:
+                self.report.add("create_requisite", "REQUISITE", old_id, "REQUISITE", "", "SKIP", f"target preset not found: {source_preset.get('NAME')}")
+                continue
+            fields = self._copy_standard_fields(
+                "requisite",
+                row,
+                excluded={"ENTITY_ID", "ENTITY_TYPE_ID", "PRESET_ID", "XML_ID"},
+            )
+            fields.update({
+                "ENTITY_ID": target_entity,
+                "ENTITY_TYPE_ID": int(source_entity_type),
+                "PRESET_ID": target_preset,
+                "XML_ID": text(row.get("XML_ID")) or f"B24MIG_REQ_{old_id}",
+            })
+            target_id = -(index + 1)
+            req_map[old_id] = target_id
+            self.report.maps["requisites"][old_id] = target_id
+            self.report.add("create_requisite", "REQUISITE", old_id, "REQUISITE", target_id, "DRY_RUN", text(fields.get("NAME")))
+            self.report.add_transfer(
+                operation="create_requisite",
+                source_type="REQUISITE",
+                source_id=old_id,
+                target_type="REQUISITE",
+                target_id=target_id,
+                status="DRY_RUN",
+                payload=fields,
+                route="REQUISITE",
+            )
+            owner_kind = "COMPANY" if source_entity_type == "4" else "CONTACT"
+            self.report.add_relation(
+                relation_type="REQUISITE_OWNER",
+                source_from_type="REQUISITE",
+                source_from_id=old_id,
+                source_to_type=owner_kind,
+                source_to_id=old_entity,
+                target_from_type="REQUISITE",
+                target_from_id=target_id,
+                target_to_type=owner_kind,
+                target_to_id=target_entity,
+                status="DRY_RUN",
+                details={"preset_id": target_preset},
+            )
+
+        address_rows = self._source["Addresses"][:max_items] if max_items else self._source["Addresses"]
+        for index, row in enumerate(address_rows):
+            old_req = text(row.get("ENTITY_ID"))
+            if text(row.get("ENTITY_TYPE_ID")) != "8" or old_req not in req_map:
+                continue
+            fields = self._copy_standard_fields(
+                "address",
+                row,
+                excluded={"ENTITY_ID", "ENTITY_TYPE_ID", "ANCHOR_ID", "ANCHOR_TYPE_ID", "LOC_ADDR_ID"},
+            )
+            fields.update({
+                "ENTITY_ID": req_map[old_req],
+                "ENTITY_TYPE_ID": 8,
+                "TYPE_ID": int(row.get("TYPE_ID") or 1),
+            })
+            source_address_id = text(row.get("ID")) or f"{old_req}:{row.get('TYPE_ID')}:{index}"
+            target_address_id = -(index + 1)
+            self.report.maps["addresses"][source_address_id] = target_address_id
+            self.report.add("create_address", "ADDRESS", source_address_id, "ADDRESS", target_address_id, "DRY_RUN", text(fields.get("ADDRESS_1")))
+            self.report.add_transfer(
+                operation="create_address",
+                source_type="ADDRESS",
+                source_id=source_address_id,
+                target_type="ADDRESS",
+                target_id=target_address_id,
+                status="DRY_RUN",
+                payload=fields,
+                route="REQUISITE_ADDRESS",
+            )
+            self.report.add_relation(
+                relation_type="ADDRESS_REQUISITE",
+                source_from_type="ADDRESS",
+                source_from_id=source_address_id,
+                source_to_type="REQUISITE",
+                source_to_id=old_req,
+                target_from_type="ADDRESS",
+                target_from_id=target_address_id,
+                target_to_type="REQUISITE",
+                target_to_id=req_map[old_req],
+                status="DRY_RUN",
+                details={"type_id": row.get("TYPE_ID")},
+            )
+
+    def _task_registry_fields(
+        self,
+        row: Mapping[str, Any],
+        user_map: Mapping[str, int],
+        company_map: Mapping[str, int],
+        contact_map: Mapping[str, int],
+        lead_map: Mapping[str, int],
+        deal_map: Mapping[str, int],
+        task_map: Mapping[str, int],
+    ) -> tuple[dict[str, Any], list[str]]:
+        old_id = text(row.get("id"))
+        problems: list[str] = []
+        created_by = self._context_user_target(row.get("createdBy"), "task", user_map)
+        responsible = self._context_user_target(row.get("responsibleId"), "task", user_map)
+        accomplices = [
+            self._context_user_target(source_user, "task", user_map)
+            for source_user in (row.get("accomplices") or [])
+        ]
+        auditors = [
+            self._context_user_target(source_user, "task", user_map)
+            for source_user in (row.get("auditors") or [])
+        ]
+        if not created_by:
+            problems.append(f"unmapped creator {text(row.get('createdBy'))}")
+        if not responsible:
+            problems.append(f"unmapped responsible {text(row.get('responsibleId'))}")
+        if any(value is None for value in accomplices):
+            problems.append("one or more accomplices are not mapped")
+        if any(value is None for value in auditors):
+            problems.append("one or more auditors are not mapped")
+        parent_old = text(row.get("parentId"))
+        if parent_old not in {"", "0"} and parent_old not in task_map:
+            problems.append(f"parent task {parent_old} was not mapped")
+        crm_refs: list[str] = []
+        for reference in row.get("ufCrmTask") or []:
+            mapped = self._map_crm_ref(text(reference), company_map, contact_map, lead_map, deal_map)
+            if mapped:
+                crm_refs.append(mapped)
+            else:
+                problems.append(f"unresolved CRM link {text(reference)}")
+        description = text(row.get("description"))
+        if row.get("closedDate"):
+            description = append_text(description, f"Исходная дата завершения: {text(row.get('closedDate'))}")
+        description = append_text(description, migration_marker("TASK", old_id, "TASK"))
+        fields: dict[str, Any] = {
+            "TITLE": text(row.get("title")) or f"Задача {old_id}",
+            "DESCRIPTION": description,
+            "DESCRIPTION_IN_BBCODE": text(row.get("descriptionInBbcode")) or "Y",
+            "CREATED_BY": created_by,
+            "RESPONSIBLE_ID": responsible,
+            "ACCOMPLICES": [value for value in accomplices if value],
+            "AUDITORS": [value for value in auditors if value],
+            "PRIORITY": text(row.get("priority")) or "1",
+            "ALLOW_CHANGE_DEADLINE": text(row.get("allowChangeDeadline")) or "N",
+            "ALLOW_TIME_TRACKING": text(row.get("allowTimeTracking")) or "N",
+            "TASK_CONTROL": text(row.get("taskControl")) or "N",
+            "ADD_IN_REPORT": text(row.get("addInReport")) or "N",
+            "MATCH_WORK_TIME": text(row.get("matchWorkTime")) or "N",
+            "TIME_ESTIMATE": int(row.get("timeEstimate") or 0),
+            "GROUP_ID": 0,
+            "XML_ID": f"B24MIG_TASK_{old_id}",
+        }
+        for source_key, target_key in {
+            "deadline": "DEADLINE",
+            "dateStart": "DATE_START",
+            "startDatePlan": "START_DATE_PLAN",
+            "endDatePlan": "END_DATE_PLAN",
+            "mark": "MARK",
+        }.items():
+            if row.get(source_key) not in (None, ""):
+                fields[target_key] = row.get(source_key)
+        if parent_old not in {"", "0"} and parent_old in task_map:
+            fields["PARENT_ID"] = task_map[parent_old]
+        if crm_refs:
+            fields["UF_CRM_TASK"] = crm_refs
+        if row.get("ufTaskWebdavFiles"):
+            fields["SOURCE_FILE_REFERENCES"] = row.get("ufTaskWebdavFiles")
+        return fields, problems
+
+    def _activity_registry_fields(
+        self,
+        activity: Mapping[str, Any],
+        user_map: Mapping[str, int],
+        company_map: Mapping[str, int],
+        contact_map: Mapping[str, int],
+        lead_map: Mapping[str, int],
+        deal_map: Mapping[str, int],
+    ) -> tuple[dict[str, Any], list[tuple[int, int]], list[str], list[str]]:
+        old_id = text(activity.get("ID"))
+        problems: list[str] = []
+        warnings: list[str] = []
+        bindings, unresolved_bindings = self._activity_bindings(
+            activity, company_map, contact_map, lead_map, deal_map
+        )
+        if unresolved_bindings:
+            problems.append(f"unresolved CRM bindings: {unresolved_bindings}")
+        if not bindings:
+            problems.append("no mapped CRM owner/binding")
+        responsible = self._context_user_target(activity.get("RESPONSIBLE_ID"), "crm", user_map)
+        if not responsible:
+            problems.append(f"unmapped responsible {text(activity.get('RESPONSIBLE_ID'))}")
+        communications, unresolved_communications = self._map_activity_communications(
+            activity.get("COMMUNICATIONS") or [], company_map, contact_map, lead_map, deal_map
+        )
+        communication_note = self._unresolved_communications_note(
+            activity.get("COMMUNICATIONS") or [], unresolved_communications
+        )
+        if unresolved_communications:
+            warnings.append(f"unresolved communications omitted: {unresolved_communications}")
+        settings = activity.get("SETTINGS") if isinstance(activity.get("SETTINGS"), dict) else {}
+        primary_type, primary_id = bindings[0] if bindings else (0, 0)
+        fields: dict[str, Any] = {
+            "OWNER_TYPE_ID": primary_type,
+            "OWNER_ID": primary_id,
+            "TYPE_ID": int(activity.get("TYPE_ID") or 0),
+            "SUBJECT": text(activity.get("SUBJECT")) or f"Дело {old_id}",
+            "RESPONSIBLE_ID": responsible,
+            "COMPLETED": text(activity.get("COMPLETED")) or "N",
+            "STATUS": int(activity.get("STATUS") or 1),
+            "PRIORITY": int(activity.get("PRIORITY") or 1),
+            "DESCRIPTION": append_text(text(activity.get("DESCRIPTION")), communication_note),
+            "DESCRIPTION_TYPE": int(activity.get("DESCRIPTION_TYPE") or 1),
+            "DIRECTION": int(activity.get("DIRECTION") or 0),
+            "LOCATION": text(activity.get("LOCATION")),
+            "NOTIFY_TYPE": int(activity.get("NOTIFY_TYPE") or 0),
+            "NOTIFY_VALUE": int(activity.get("NOTIFY_VALUE") or 0),
+            "START_TIME": activity.get("START_TIME"),
+            "END_TIME": activity.get("END_TIME"),
+            "DEADLINE": activity.get("DEADLINE"),
+            "COMMUNICATIONS": communications,
+            "PROVIDER_ID": text(activity.get("PROVIDER_ID")),
+            "PROVIDER_TYPE_ID": text(activity.get("PROVIDER_TYPE_ID")),
+            "PROVIDER_GROUP_ID": text(activity.get("PROVIDER_GROUP_ID")),
+            "PROVIDER_PARAMS": activity.get("PROVIDER_PARAMS") or {},
+            "PROVIDER_DATA": text(activity.get("PROVIDER_DATA")),
+            "IS_INCOMING_CHANNEL": text(activity.get("IS_INCOMING_CHANNEL")) or "N",
+            "ORIGINATOR_ID": "B24_CLOUD_MIGRATION",
+            "ORIGIN_ID": f"ACTIVITY_{old_id}",
+            "SETTINGS": {**settings, "DISABLE_SENDING_MESSAGE_COPY": "Y"},
+        }
+        if activity.get("FILES"):
+            fields["SOURCE_FILE_REFERENCES"] = activity.get("FILES")
+        fields = {
+            key: value
+            for key, value in fields.items()
+            if value not in (None, "", [], {}) or key in {"COMMUNICATIONS", "SETTINGS"}
+        }
+        return fields, bindings, problems, warnings
 
     def _dry_run_tasks_activities(
         self,
@@ -886,45 +1347,26 @@ class MigrationProject:
         *,
         max_items: int = 0,
     ) -> None:
-        """Validate every task/activity dependency without writing to the box."""
+        """Validate and register every task/activity payload without writing."""
         self.load_source("Tasks", "CRM_Activities")
         tasks = self._task_rows_topological(self._source["Tasks"])
         activities = self._source["CRM_Activities"]
         if max_items:
             tasks = tasks[:max_items]
             activities = activities[:max_items]
-        source_task_ids = {text(row.get("id")) for row in self._source["Tasks"]}
 
-        for row in tasks:
+        task_map: dict[str, int] = {}
+        for index, row in enumerate(tasks):
             old_id = text(row.get("id"))
             skip_reason = self._task_skip_reason(row)
             if skip_reason:
                 self.report.add("create_task", "TASK", old_id, "TASK", "", "SKIP", skip_reason)
                 continue
-            blocking_problems: list[str] = []
+
+            fields, blocking_problems = self._task_registry_fields(
+                row, user_map, company_map, contact_map, lead_map, deal_map, task_map
+            )
             warnings_for_row: list[str] = []
-            ids = [
-                row.get("createdBy"),
-                row.get("responsibleId"),
-                *(row.get("accomplices") or []),
-                *(row.get("auditors") or []),
-            ]
-            missing = sorted({text(item) for item in ids if text(item) and not self._context_user_target(item, "task", user_map)})
-            if missing:
-                blocking_problems.append(f"unmapped users: {missing}")
-
-            parent = text(row.get("parentId"))
-            if parent not in {"", "0"} and parent not in source_task_ids:
-                blocking_problems.append(f"source parent task not found: {parent}")
-
-            unresolved_crm = [
-                text(reference)
-                for reference in (row.get("ufCrmTask") or [])
-                if not self._map_crm_ref(text(reference), company_map, contact_map, lead_map, deal_map)
-            ]
-            if unresolved_crm:
-                blocking_problems.append(f"unresolved CRM links: {unresolved_crm}")
-
             for source_file in row.get("ufTaskWebdavFiles") or []:
                 raw = text(source_file).removeprefix("n")
                 try:
@@ -933,67 +1375,173 @@ class MigrationProject:
                     self.source_client.call("disk.attachedObject.get", {"id": int(raw)})
                 except Exception as exc:
                     warnings_for_row.append(f"task file {source_file}: {exc}")
+                self.report.add_relation(
+                    relation_type="TASK_FILE",
+                    source_from_type="TASK",
+                    source_from_id=old_id,
+                    source_to_type="FILE",
+                    source_to_id=source_file,
+                    target_from_type="TASK",
+                    target_from_id="",
+                    target_to_type="FILE",
+                    target_to_id="",
+                    status="WARN" if warnings_for_row else "DRY_RUN",
+                    details="file will be downloaded from the cloud and attached to the created task",
+                )
 
             regular_comments = int(row.get("commentsCount") or 0) - int(row.get("serviceCommentsCount") or 0)
             if regular_comments > 0:
                 comments = self._fetch_task_comments(self.source_client, int(old_id))
                 if not comments:
                     warnings_for_row.append(f"{regular_comments} comments reported but none readable")
+                else:
+                    for comment in comments:
+                        comment_id = text(comment.get("ID") or comment.get("id"))
+                        self.report.add_relation(
+                            relation_type="TASK_COMMENT",
+                            source_from_type="TASK",
+                            source_from_id=old_id,
+                            source_to_type="COMMENT",
+                            source_to_id=comment_id,
+                            target_from_type="TASK",
+                            target_from_id="",
+                            target_to_type="COMMENT",
+                            target_to_id="",
+                            status="DRY_RUN",
+                            details={
+                                "author_id": comment.get("AUTHOR_ID") or comment.get("authorId"),
+                                "post_date": comment.get("POST_DATE") or comment.get("postDate"),
+                            },
+                        )
 
             if blocking_problems:
                 status = "SKIP"
-                message = "Пропущено: " + "; ".join(blocking_problems + (["WARN: " + "; ".join(warnings_for_row)] if warnings_for_row else []))
-            elif warnings_for_row:
-                status = "WARN"
-                message = "; ".join(warnings_for_row)
+                target_id: Any = ""
+                message = "Пропущено: " + "; ".join(
+                    blocking_problems
+                    + (["WARN: " + "; ".join(warnings_for_row)] if warnings_for_row else [])
+                )
             else:
-                status = "DRY_RUN"
-                message = text(row.get("title"))
-            self.report.add(
-                "create_task", "TASK", old_id, "TASK", "", status, message,
+                target_id = -(index + 1)
+                task_map[old_id] = target_id
+                self.report.maps["tasks"][old_id] = target_id
+                status = "WARN" if warnings_for_row else "DRY_RUN"
+                message = "; ".join(warnings_for_row) if warnings_for_row else text(row.get("title"))
+
+            self.report.add("create_task", "TASK", old_id, "TASK", target_id, status, message)
+            self.report.add_transfer(
+                operation="create_task",
+                source_type="TASK",
+                source_id=old_id,
+                target_type="TASK",
+                target_id=target_id,
+                status=status,
+                payload=fields,
+                route="TASK_WITHOUT_PROJECT",
             )
 
-        for row in activities:
-            old_id = text(row.get("ID"))
-            blocking_problems: list[str] = []
-            warnings_for_row: list[str] = []
-            if not self._context_user_target(row.get("RESPONSIBLE_ID"), "crm", user_map):
-                blocking_problems.append(f"unmapped responsible: {text(row.get('RESPONSIBLE_ID'))}")
-            bindings, unresolved_bindings = self._activity_bindings(
-                row, company_map, contact_map, lead_map, deal_map
-            )
-            if unresolved_bindings:
-                blocking_problems.append(f"unresolved CRM bindings: {unresolved_bindings}")
-            if not bindings:
-                blocking_problems.append("no mapped CRM owner/binding")
-            _communications, unresolved_communications = self._map_activity_communications(
-                row.get("COMMUNICATIONS") or [], company_map, contact_map, lead_map, deal_map
-            )
-            if unresolved_communications:
-                warnings_for_row.append(
-                    "unresolved CRM communications omitted: "
-                    + ", ".join(unresolved_communications)
+            parent_old = text(row.get("parentId"))
+            if parent_old not in {"", "0"}:
+                self.report.add_relation(
+                    relation_type="TASK_PARENT",
+                    source_from_type="TASK",
+                    source_from_id=old_id,
+                    source_to_type="TASK",
+                    source_to_id=parent_old,
+                    target_from_type="TASK" if target_id else "",
+                    target_from_id=target_id,
+                    target_to_type="TASK" if parent_old in task_map else "",
+                    target_to_id=task_map.get(parent_old, ""),
+                    status=status if target_id and parent_old in task_map else "SKIP",
+                    details="subtask hierarchy",
                 )
-            for index, item in enumerate(row.get("FILES") or []):
-                source_file = item.get("FILE_ID") or item.get("fileId") or item.get("id") if isinstance(item, dict) else item
+            for reference in row.get("ufCrmTask") or []:
+                mapped = self._map_crm_ref(text(reference), company_map, contact_map, lead_map, deal_map)
+                prefix = text(reference).split("_", 1)[0].upper()
+                target_prefix = text(mapped).split("_", 1)[0].upper() if mapped else ""
+                self.report.add_relation(
+                    relation_type="TASK_CRM",
+                    source_from_type="TASK",
+                    source_from_id=old_id,
+                    source_to_type=prefix,
+                    source_to_id=text(reference).split("_", 1)[-1],
+                    target_from_type="TASK" if target_id else "",
+                    target_from_id=target_id,
+                    target_to_type=target_prefix,
+                    target_to_id=text(mapped).split("_", 1)[-1] if mapped else "",
+                    status=status if target_id and mapped else "SKIP",
+                    details={"source_reference": reference, "target_reference": mapped},
+                )
+
+        for index, row in enumerate(activities):
+            old_id = text(row.get("ID"))
+            fields, bindings, blocking_problems, warnings_for_row = self._activity_registry_fields(
+                row, user_map, company_map, contact_map, lead_map, deal_map
+            )
+            for file_index, item in enumerate(row.get("FILES") or []):
+                source_file = (
+                    item.get("FILE_ID") or item.get("fileId") or item.get("id")
+                    if isinstance(item, dict)
+                    else item
+                )
                 if not source_file:
                     continue
                 try:
                     self.source_client.call("disk.file.get", {"id": int(source_file)})
                 except Exception as exc:
-                    warnings_for_row.append(f"activity file {index}:{source_file}: {exc}")
+                    warnings_for_row.append(f"activity file {file_index}:{source_file}: {exc}")
+                self.report.add_relation(
+                    relation_type="ACTIVITY_FILE",
+                    source_from_type="ACTIVITY",
+                    source_from_id=old_id,
+                    source_to_type="FILE",
+                    source_to_id=source_file,
+                    target_from_type="ACTIVITY",
+                    target_from_id="",
+                    target_to_type="FILE",
+                    target_to_id="",
+                    status="WARN" if warnings_for_row else "DRY_RUN",
+                    details="file will be downloaded and attached to the CRM activity",
+                )
+
             if blocking_problems:
                 status = "SKIP"
-                message = "Пропущено: " + "; ".join(blocking_problems + (["WARN: " + "; ".join(warnings_for_row)] if warnings_for_row else []))
-            elif warnings_for_row:
-                status = "WARN"
-                message = "; ".join(warnings_for_row)
+                target_id = ""
+                message = "Пропущено: " + "; ".join(
+                    blocking_problems
+                    + (["WARN: " + "; ".join(warnings_for_row)] if warnings_for_row else [])
+                )
             else:
-                status = "DRY_RUN"
-                message = text(row.get("SUBJECT"))
-            self.report.add(
-                "create_activity", "ACTIVITY", old_id, "ACTIVITY", "", status, message,
+                target_id = -(index + 1)
+                self.report.maps["activities"][old_id] = target_id
+                status = "WARN" if warnings_for_row else "DRY_RUN"
+                message = "; ".join(warnings_for_row) if warnings_for_row else text(row.get("SUBJECT"))
+
+            self.report.add("create_activity", "ACTIVITY", old_id, "ACTIVITY", target_id, status, message)
+            self.report.add_transfer(
+                operation="create_activity",
+                source_type="ACTIVITY",
+                source_id=old_id,
+                target_type="ACTIVITY",
+                target_id=target_id,
+                status=status,
+                payload=fields,
+                route="CRM_ACTIVITY",
             )
+            for owner_type, owner_id in bindings:
+                self.report.add_relation(
+                    relation_type="ACTIVITY_CRM_BINDING",
+                    source_from_type="ACTIVITY",
+                    source_from_id=old_id,
+                    source_to_type=CRM_OWNER_TYPES.get(int(row.get("OWNER_TYPE_ID") or 0), "CRM").upper(),
+                    source_to_id=text(row.get("OWNER_ID")),
+                    target_from_type="ACTIVITY" if target_id else "",
+                    target_from_id=target_id,
+                    target_to_type=CRM_OWNER_TYPES.get(owner_type, "CRM").upper(),
+                    target_to_id=owner_id,
+                    status=status if target_id else "SKIP",
+                    details={"owner_type_id": owner_type},
+                )
 
     # ---------- relations and requisites ----------
 

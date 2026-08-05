@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from common.bitrix import BitrixClient
@@ -339,3 +340,77 @@ def test_skip_and_log_policy_has_no_blocking_import_exit() -> None:
     assert "exit_code = 4" not in source
     assert 'row["status"] = "SKIP"' in source
     assert "exit_code = 0" in source
+
+
+def test_report_writes_full_payload_previews(tmp_path: Path) -> None:
+    report = Report(tmp_path)
+    report.add_transfer(
+        operation="create_contact",
+        source_type="CONTACT",
+        source_id="44",
+        target_type="CONTACT",
+        target_id=-1,
+        status="DRY_RUN",
+        route="CONTACT",
+        payload={
+            "NAME": "Иван",
+            "LAST_NAME": "Иванов",
+            "PHONE": [{"VALUE": "+77010000000", "VALUE_TYPE": "WORK"}],
+            "EMAIL": [{"VALUE": "ivan@example.kz", "VALUE_TYPE": "WORK"}],
+            "ADDRESS": "Алматы",
+        },
+    )
+    report.save()
+
+    wide = (tmp_path / "preview_contact.csv").read_text(encoding="utf-8-sig")
+    assert "+77010000000" in wide
+    assert "ivan@example.kz" in wide
+    assert "Алматы" in wide
+
+    full = json.loads((tmp_path / "full_transfer_preview.json").read_text(encoding="utf-8"))
+    assert full[0]["payload"]["PHONE"][0]["VALUE"] == "+77010000000"
+    assert full[0]["payload"]["ADDRESS"] == "Алматы"
+
+    index = (tmp_path / "preview_index.csv").read_text(encoding="utf-8-sig")
+    assert "CONTACT" in index
+    assert "preview_contact.csv" in index
+
+
+def test_dump_reader_prefers_excel_registry() -> None:
+    with DumpReader(DUMP, prefer_excel=True) as reader:
+        assert reader.registry_source == "excel"
+        assert len(reader.rows("Companies")) == 604
+        company = next(row for row in reader.rows("Companies") if row.get("PHONE"))
+        assert isinstance(company["PHONE"], list)
+        assert company["PHONE"][0]["VALUE"]
+
+
+def test_dry_run_builds_requisites_relations_tasks_and_activities(tmp_path: Path) -> None:
+    p = object.__new__(MigrationProject)
+    p.client = object()
+    p.source_client = object()
+    p.report = Report(tmp_path)
+    p.file_transfer = None
+
+    p.discover_target = lambda: None
+    p.validate_target = lambda: {"ok": True}
+    p.validate_live_source = lambda: {"ok": True}
+    p.build_user_map = lambda strict=True: {"1": 101}
+    p.prepare_companies = lambda user_map: [("COMPANY:1:COMPANY", {"TITLE": "C"})]
+    p.prepare_contacts = lambda user_map, company_map: [("CONTACT:2:CONTACT", {"NAME": "N"})]
+    p.prepare_original_leads = lambda user_map, company_map, contact_map: []
+    p.prepare_routed_deal_leads = lambda user_map, company_map, contact_map: [("DEAL:3:LEAD", {"TITLE": "L"})]
+    p.prepare_deals = lambda user_map, company_map, contact_map: [("DEAL:4:DEAL", {"TITLE": "D"})]
+
+    def fake_batch(entity, prepared, *, dry_run, max_items=0):
+        assert dry_run is True
+        return {key: -(index + 1) for index, (key, _fields) in enumerate(prepared)}
+
+    p._batch_create = fake_batch
+    calls: list[str] = []
+    p._dry_run_requisites_and_addresses = lambda company_map, contact_map, max_items=0: calls.append("requisites")
+    p._record_crm_relation_registry = lambda company_map, contact_map, lead_map, deal_map, status: calls.append("relations")
+    p._dry_run_tasks_activities = lambda user_map, company_map, contact_map, lead_map, deal_map, max_items=0: calls.append("tasks_activities")
+
+    p.import_all(dry_run=True, max_items=0)
+    assert calls == ["requisites", "relations", "tasks_activities"]
