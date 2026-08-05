@@ -1,26 +1,49 @@
-# Карта файлов
+# Структура репозитория
 
-## Общие файлы
+```text
+.github/workflows/
+  10-migration-plan.yml       проверка дампа, коробки и конфигурации
+  11-migration-users.yml      только сопоставление существующих пользователей
+  12-migration-import.yml     dry-run и реальный перенос
+  13-migration-verify.yml     итоговая сверка по маркерам и картам ID
+  20-user-registration.yml    отдельный инструмент; сейчас не используется
+  30-eqazyna-leads.yml        постоянный парсер e-Qazyna → лиды коробки
 
-- `common/bitrix.py` — REST-клиент коробочного Bitrix24, повторы запросов и корпоративные сертификаты Windows.
-- `scripts/prepare-python.cmd` — создает локальную `.venv` без административных прав.
+common/
+  bitrix.py                   общий REST-клиент миграции и регистрации
 
-## Выгрузка облака
+processes/cloud_to_box/
+  input/
+    bitrix24_dump_20260805_072425.zip   зафиксированный разовый дамп облака
+  config/
+    migration.json            маршрутизация стадий, поля и справочники коробки
+    users.csv                 ручные соответствия пользователей
+    source_plan.json          контрольные количества по дампу
+  src/
+    dump_reader.py            чтение JSON из ZIP
+    migration.py              основная логика переноса
+    file_transfer.py          скачивание и загрузка вложений
+    reporting.py              отчеты и карты ID
+  tests/
+    test_migration.py         автономные проверки дампа и правил
+  migrate.py                  командная строка для workflow
 
-- `processes/cloud_export/export_bitrix.py` — выгружает сущности облачного Bitrix24.
-- `processes/cloud_export/requirements.txt` — зависимости выгрузки.
-- `processes/cloud_export/tests/` — проверки выгрузчика.
+processes/eqazyna_leads/
+  eqazyna_bitrix/
+    main.py                   последовательность обработки
+    scraper.py                чтение реестра e-Qazyna
+    egov_client.py            необязательное обогащение через data.egov.kz
+    bitrix_client.py          REST-клиент коробки и поиск старых мигрированных лидов
+    lead_pipeline.py          один БИН → один основной лид
+    formatter.py              текст карточки и таймлайна
+    exporter.py               Excel/JSON журнала запуска
+  scripts/
+    run_from_env.py           безопасная сборка аргументов для Windows cmd
+    check_run_result.py       итоговая проверка журнала
+  tests/                      автономные тесты парсера
 
-## Перенос облако → коробка
+processes/user_registration/  отдельный процесс регистрации пользователей
+scripts/prepare-python.cmd     подготовка Python на Windows runner
+```
 
-- `processes/cloud_to_box/migrate.py` — команды `plan`, `invite-users`, `import`, `verify`.
-- `processes/cloud_to_box/input/bitrix24_export.xlsx` — входная выгрузка облака.
-- `processes/cloud_to_box/config/migration.json` — правила стадий и полей.
-- `processes/cloud_to_box/config/users.csv` — сопоставление ответственных и подразделений.
-- `processes/cloud_to_box/src/` — логика миграции.
-- `processes/cloud_to_box/tests/` — контрольные тесты.
-
-## Регистрация пользователей
-
-- `processes/user_registration/register_users_from_excel.py` — проверка и приглашение пользователей.
-- `processes/user_registration/input/users_to_invite.xlsx` — редактируемый документ.
+Папки `output/` создаются только во время выполнения. Миграционный поток 12 сохраняет карты ID в GitHub Actions Cache. Парсер e-Qazyna не использует миграционные карты и не изменяет файлы разовой миграции.

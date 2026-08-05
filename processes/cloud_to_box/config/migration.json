@@ -1,6 +1,14 @@
 {
   "target_deal_category_id": 0,
   "target_source_id": "UC_5XK8LY",
+  "skip_original_leads": true,
+  "product_field": {
+    "code": "UF_CRM_1785917145255",
+    "value": "ГПО недропользователя"
+  },
+  "target_files_folder_id": 0,
+  "target_files_folder_name": "B24 migration files",
+  "max_file_bytes": 104857600,
   "target_statuses": {
     "STATUS": {
       "NEW": "Новый лид",
@@ -41,17 +49,13 @@
       "UC_HRSCUK": "UC_C7B94L",
       "UC_2DA5PB": "UC_P6PL43",
       "UC_2Z4T64": "UC_P6PL43",
-      "FINAL_INVOICE": "PROCESSED",
       "UC_BF5JWI": "PROCESSED"
     },
     "deal_stage_map": {
+      "FINAL_INVOICE": "PREPAYMENT_INVOICE",
       "UC_9TWGUF": "PREPAYMENT_INVOICE",
-      "WON": "WON",
-      "LOSE": "LOSE"
+      "WON": "WON"
     },
-    "lost_deal_previous_stages_kept_as_deal": [
-      "UC_9TWGUF"
-    ],
     "lost_deal_target_lead_status": "JUNK"
   },
   "field_mapping": {

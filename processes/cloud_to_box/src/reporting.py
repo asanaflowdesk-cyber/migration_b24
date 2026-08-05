@@ -9,14 +9,33 @@ from typing import Any
 
 
 class Report:
+    MAP_NAMES = (
+        "users", "companies", "contacts", "leads", "deals", "requisites", "addresses",
+        "tasks", "activities", "files", "task_comments", "checklist_items",
+    )
+
     def __init__(self, output_dir: str | Path):
         self.dir = Path(output_dir)
         self.dir.mkdir(parents=True, exist_ok=True)
         self.actions: list[dict[str, Any]] = []
-        self.maps: dict[str, dict[str, int]] = {
-            "users": {}, "companies": {}, "contacts": {}, "leads": {}, "deals": {}, "requisites": {}
-        }
+        self.maps: dict[str, dict[str, int]] = {name: {} for name in self.MAP_NAMES}
         self.extra: dict[str, Any] = {}
+        self._load_existing_maps()
+
+    def _load_existing_maps(self) -> None:
+        path = self.dir / "maps.json"
+        if not path.exists():
+            return
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        if not isinstance(value, dict):
+            return
+        for name in self.MAP_NAMES:
+            current = value.get(name)
+            if isinstance(current, dict):
+                self.maps[name].update({str(k): int(v) for k, v in current.items() if str(v).isdigit()})
 
     def add(
         self,
