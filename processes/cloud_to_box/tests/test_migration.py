@@ -5,7 +5,15 @@ from common.bitrix import BitrixClient
 from src.dump_reader import DumpReader
 from src.file_transfer import FileTransfer
 from src.live_source import LiveCloudSource
-from src.migration import MigrationProject, migration_marker, normalize_name_tokens, parse_marker, resolve_requisite_preset
+from src.migration import (
+    MigrationProject,
+    contact_display_name,
+    migration_marker,
+    normalize_name_tokens,
+    parse_marker,
+    resolve_requisite_preset,
+    restore_contact_name_fields,
+)
 from src.reporting import Report
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -534,3 +542,75 @@ def test_requisite_preset_does_not_guess_multiple_company_aliases() -> None:
     )
     assert preset_id is None
     assert "ambiguous semantic presets" in reason
+
+
+def test_contact_full_name_is_restored_from_source_comment() -> None:
+    row = {
+        "NAME": "МАХМУД",
+        "COMMENTS": "Руководитель извлечён. Исходное ФИО: КАСЫМБЕКОВ МАХМУД БАЗАРКУЛОВИЧ\n",
+    }
+    fields = restore_contact_name_fields(row, {"NAME": "МАХМУД"})
+    assert fields["LAST_NAME"] == "КАСЫМБЕКОВ"
+    assert fields["NAME"] == "МАХМУД"
+    assert fields["SECOND_NAME"] == "БАЗАРКУЛОВИЧ"
+    assert contact_display_name(row) == "КАСЫМБЕКОВ МАХМУД БАЗАРКУЛОВИЧ"
+
+
+def test_coherent_sample_includes_dependencies_of_selected_deals(tmp_path: Path) -> None:
+    p = project(tmp_path)
+    scope = p._build_sample_scope(10)
+    assert len(scope["lead_deal_ids"]) == 10
+    assert len(scope["deal_ids"]) == 10
+    p.load_source("Deals", "Deal_Contacts")
+    selected = [
+        row for row in p._source["Deals"]
+        if str(row.get("ID")) in scope["lead_deal_ids"] | scope["deal_ids"]
+    ]
+    for row in selected:
+        company_id = str(row.get("COMPANY_ID") or "")
+        contact_id = str(row.get("CONTACT_ID") or "")
+        if company_id:
+            assert company_id in scope["company_ids"]
+        if contact_id:
+            assert contact_id in scope["contact_ids"]
+    for relation in p._source["Deal_Contacts"]:
+        if str(relation.get("DEAL_ID")) in scope["lead_deal_ids"] | scope["deal_ids"]:
+            assert str(relation.get("CONTACT_ID")) in scope["contact_ids"]
+
+
+def test_sample_tasks_prioritize_related_and_active(tmp_path: Path) -> None:
+    p = project(tmp_path)
+    rows = [
+        {"id": "1", "status": "5", "parentId": "0", "ufCrmTask": [], "createdBy": "1", "responsibleId": "1"},
+        {"id": "2", "status": "5", "parentId": "0", "ufCrmTask": ["CO_9"], "createdBy": "1", "responsibleId": "1"},
+        {"id": "3", "status": "3", "parentId": "0", "ufCrmTask": [], "createdBy": "1", "responsibleId": "1"},
+    ]
+    selected = p._select_sample_task_rows(
+        rows, 2, {"9": 99}, {}, {}, {}
+    )
+    assert [row["id"] for row in selected] == ["2", "3"]
+
+
+def test_report_writes_task_preview_and_direct_url(tmp_path: Path) -> None:
+    report = Report(tmp_path)
+    report.extra["target_portal"] = "https://bitrix.example"
+    report.add_transfer(
+        operation="create_task",
+        source_type="TASK",
+        source_id="7",
+        target_type="TASK",
+        target_id=77,
+        status="OK",
+        route="TASK_WITHOUT_PROJECT",
+        payload={
+            "TITLE": "Проверочная задача",
+            "RESPONSIBLE_ID": 4,
+            "DESCRIPTION": "Полное описание",
+        },
+    )
+    report.save()
+    preview = (tmp_path / "preview_task.csv").read_text(encoding="utf-8-sig")
+    assert "Проверочная задача" in preview
+    assert "/company/personal/user/4/tasks/task/view/77/" in preview
+    created = (tmp_path / "created_objects.csv").read_text(encoding="utf-8-sig")
+    assert "/company/personal/user/4/tasks/task/view/77/" in created

@@ -22,6 +22,33 @@ def _safe_preview_name(value: str) -> str:
     return cleaned or "objects"
 
 
+def _target_url(portal: str, target_type: str, target_id: Any, payload: Mapping[str, Any]) -> str:
+    if not portal or not str(target_id).isdigit() or int(target_id) <= 0:
+        return ""
+    target_id = int(target_id)
+    target_type = str(target_type).upper()
+    if target_type == "COMPANY":
+        return f"{portal}/crm/company/details/{target_id}/"
+    if target_type == "CONTACT":
+        return f"{portal}/crm/contact/details/{target_id}/"
+    if target_type == "LEAD":
+        return f"{portal}/crm/lead/details/{target_id}/"
+    if target_type == "DEAL":
+        return f"{portal}/crm/deal/details/{target_id}/"
+    if target_type == "TASK":
+        responsible = payload.get("RESPONSIBLE_ID") or payload.get("responsibleId") or 0
+        if str(responsible).isdigit():
+            return f"{portal}/company/personal/user/{int(responsible)}/tasks/task/view/{target_id}/"
+    if target_type == "ACTIVITY":
+        owner_type = str(payload.get("OWNER_TYPE_ID") or "")
+        owner_id = payload.get("OWNER_ID")
+        if str(owner_id).isdigit():
+            prefix = {"1": "lead", "2": "deal", "3": "contact", "4": "company"}.get(owner_type)
+            if prefix:
+                return f"{portal}/crm/{prefix}/details/{int(owner_id)}/"
+    return ""
+
+
 class Report:
     MAP_NAMES = (
         "users", "companies", "contacts", "leads", "deals", "requisites", "addresses",
@@ -167,11 +194,44 @@ class Report:
         self._write_csv(self.dir / "warnings.csv", action_fields, warnings)
         self._write_csv(self.dir / "errors.csv", action_fields, errors)
 
+        portal = str(self.extra.get("target_portal") or "").rstrip("/")
+        for transfer in self.transfers:
+            try:
+                payload = json.loads(str(transfer.get("payload_json") or "{}"))
+            except json.JSONDecodeError:
+                payload = {}
+            transfer["target_url"] = _target_url(
+                portal,
+                str(transfer.get("target_type") or ""),
+                transfer.get("target_id"),
+                payload,
+            )
+
         transfer_fields = [
             "operation", "source_type", "source_id", "target_type", "target_id",
-            "status", "route", "title", "field_count", "payload_json",
+            "status", "route", "title", "field_count", "target_url", "payload_json",
         ]
         self._write_csv(self.dir / "transfer_register.csv", transfer_fields, self.transfers)
+        created_rows = [
+            {
+                key: transfer.get(key, "")
+                for key in (
+                    "operation", "source_type", "source_id", "target_type",
+                    "target_id", "status", "title", "target_url",
+                )
+            }
+            for transfer in self.transfers
+            if str(transfer.get("target_id") or "").isdigit()
+            and int(str(transfer.get("target_id"))) > 0
+        ]
+        self._write_csv(
+            self.dir / "created_objects.csv",
+            [
+                "operation", "source_type", "source_id", "target_type",
+                "target_id", "status", "title", "target_url",
+            ],
+            created_rows,
+        )
         field_fields = [
             "operation", "source_type", "source_id", "target_type", "target_id",
             "status", "route", "field_code", "field_value",
@@ -202,6 +262,7 @@ class Report:
                 "status": transfer.get("status", ""),
                 "route": transfer.get("route", ""),
                 "title": transfer.get("title", ""),
+                "target_url": transfer.get("target_url", ""),
                 "payload": payload,
             }
             payload_rows.append(record)
@@ -214,6 +275,7 @@ class Report:
                 "target_id": record["target_id"],
                 "status": record["status"],
                 "route": record["route"],
+                "target_url": record["target_url"],
             }
             for code, value in payload.items():
                 wide[str(code)] = _json_value(value)
@@ -227,7 +289,7 @@ class Report:
         preview_index: list[dict[str, Any]] = []
         base_columns = [
             "operation", "source_type", "source_id", "target_type",
-            "target_id", "status", "route",
+            "target_id", "status", "route", "target_url",
         ]
         for target_type, rows in sorted(grouped_previews.items()):
             dynamic_columns = sorted({key for row in rows for key in row if key not in base_columns})
