@@ -2,11 +2,22 @@ name: 01 | Облако — выгрузить данные
 
 on:
   workflow_dispatch:
+    inputs:
+      include_history:
+        description: "Выгружать CRM-дела и комментарии таймлайна (дольше)"
+        required: true
+        default: true
+        type: boolean
+      save_raw_api:
+        description: "Сохранять дубли сырых REST-ответов (сильно увеличивает размер)"
+        required: true
+        default: false
+        type: boolean
 
 jobs:
   export:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 180
     defaults:
       run:
         working-directory: processes/cloud_export
@@ -30,15 +41,29 @@ jobs:
 
       - name: Выгрузить облачный Bitrix24
         env:
+          PYTHONUNBUFFERED: "1"
           BITRIX_WEBHOOK_URL: ${{ secrets.BITRIX_WEBHOOK_URL }}
-          EXPORT_ACTIVITIES: "true"
+          EXPORT_ACTIVITIES: ${{ inputs.include_history }}
           EXPORT_RELATIONS: "true"
           EXPORT_PRODUCT_ROWS: "true"
-          EXPORT_TIMELINE_COMMENTS: "true"
+          EXPORT_TIMELINE_COMMENTS: ${{ inputs.include_history }}
           EXPORT_SMART_PROCESSES: "true"
           EXPORT_TASK_STAGES: "true"
+          SAVE_RAW_API: ${{ inputs.save_raw_api }}
+          REQUEST_DELAY_SECONDS: "0.03"
+          HTTP_TIMEOUT_SECONDS: "60"
+          MAX_RETRIES: "6"
+          MAX_PAGES: "20000"
+          PROGRESS_EVERY_PAGES: "5"
           OUTPUT_DIR: output
         run: python -u export_bitrix.py
+
+      - name: Показать созданные файлы
+        if: always()
+        shell: bash
+        run: |
+          echo "Output tree:"
+          find output -maxdepth 4 -type f -printf '%p %k KB\n' 2>/dev/null | sort || true
 
       - name: Загрузить выгрузку
         if: always()
@@ -46,5 +71,5 @@ jobs:
         with:
           name: 01-cloud-export-${{ github.run_number }}
           path: processes/cloud_export/output/
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 30
