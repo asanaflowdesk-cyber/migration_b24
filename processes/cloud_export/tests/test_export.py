@@ -64,3 +64,42 @@ def test_raw_recorder_and_json_bundle(tmp_path):
     )
     assert json.loads((tmp_path / "json" / "datasets" / "Deals.json").read_text())[0]["TITLE"] == "Test"
     assert (tmp_path / "manifest.json").exists()
+
+
+class _FakePagingClient:
+    """Минимальный объект для проверки защитной пагинации без сети."""
+
+    max_pages = 10
+    progress_every_pages = 5
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = 0
+
+    def call(self, method, params):
+        self.calls += 1
+        index = min(self.calls - 1, len(self.responses) - 1)
+        return self.responses[index]
+
+
+def test_list_all_stops_on_repeated_page_without_duplicates():
+    from export_bitrix import BitrixClient
+
+    page = [{"ID": str(i)} for i in range(1, 51)]
+    fake = _FakePagingClient([
+        {"result": page},
+        {"result": page},  # метод проигнорировал start
+    ])
+    rows = BitrixClient.list_all(fake, "methods", {})
+    assert len(rows) == 50
+    assert fake.calls == 2
+
+
+def test_list_all_stops_by_total_on_full_page():
+    from export_bitrix import BitrixClient
+
+    page = [{"ID": str(i)} for i in range(1, 51)]
+    fake = _FakePagingClient([{"result": page, "total": 50}])
+    rows = BitrixClient.list_all(fake, "crm.status.list", {})
+    assert len(rows) == 50
+    assert fake.calls == 1
