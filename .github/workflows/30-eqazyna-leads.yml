@@ -1,0 +1,151 @@
+name: 30 | e-Qazyna — ГПО в лиды
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "dry_run — проверить коробку без записи; apply — создать/обновить лиды"
+        required: true
+        default: dry_run
+        type: choice
+        options: [dry_run, apply]
+      pages:
+        description: "Количество последовательных страниц"
+        required: true
+        default: "1"
+        type: string
+      page_start:
+        description: "Первая страница"
+        required: true
+        default: "1"
+        type: string
+      page_list:
+        description: "Точные страницы: 16,22,31-35. Если заполнено, pages/page_start игнорируются"
+        required: false
+        default: ""
+        type: string
+      doc_type:
+        description: "Тип документа e-Qazyna"
+        required: true
+        default: "Заявка на разведку ТПИ"
+        type: string
+      statuses:
+        description: "Статусы через запятую"
+        required: true
+        default: "Отправлено на рассмотрение,Принято"
+        type: string
+      min_created_date:
+        description: "Минимальная дата YYYY-MM-DD; пусто = без ограничения"
+        required: false
+        default: ""
+        type: string
+      no_egov:
+        description: "Отключить обогащение через data.egov.kz"
+        required: true
+        default: false
+        type: boolean
+      upload_logs:
+        description: "Выгрузить Excel/JSON в artifact"
+        required: true
+        default: false
+        type: boolean
+      confirm:
+        description: "Для apply введите IMPORT_EQAZYNA_LEADS"
+        required: false
+        default: ""
+        type: string
+
+concurrency:
+  group: eqazyna-minerals-to-box-leads
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  NODE_USE_SYSTEM_CA: "1"
+
+jobs:
+  eqazyna-leads:
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: cmd
+        working-directory: processes/eqazyna_leads
+
+    steps:
+      - name: Получить код репозитория
+        uses: actions/checkout@v5
+
+      - name: Найти Python и создать локальное окружение
+        run: call ..\..\scripts\prepare-python.cmd
+
+      - name: Установить зависимости
+        env:
+          CUSTOM_PIP_INDEX_URL: ${{ vars.PIP_INDEX_URL }}
+        run: |
+          if not "%CUSTOM_PIP_INDEX_URL%"=="" set "PIP_INDEX_URL=%CUSTOM_PIP_INDEX_URL%"
+          ".venv\Scripts\python.exe" -m pip install -r requirements.txt
+
+      - name: Проверить код парсера
+        env:
+          PYTHONPATH: ${{ github.workspace }}\processes\eqazyna_leads
+        run: |
+          ".venv\Scripts\python.exe" -m pytest -q tests
+          if errorlevel 1 exit /b 1
+          ".venv\Scripts\python.exe" -m eqazyna_bitrix.main --help >nul
+
+      - name: Проверить подтверждение боевого запуска
+        if: ${{ inputs.mode == 'apply' && inputs.confirm != 'IMPORT_EQAZYNA_LEADS' }}
+        run: |
+          echo Для записи в коробку введите IMPORT_EQAZYNA_LEADS
+          exit /b 1
+
+      - name: Проверить или загрузить лиды
+        env:
+          PYTHONUNBUFFERED: "1"
+          PYTHONPATH: ${{ github.workspace }}\processes\eqazyna_leads
+          TARGET_BITRIX_WEBHOOK_URL: ${{ secrets.TARGET_BITRIX_WEBHOOK_URL }}
+          EGOV_API_KEY: ${{ secrets.EGOV_API_KEY }}
+          BITRIX_ASSIGNED_BY_ID: ${{ vars.BITRIX_ASSIGNED_BY_ID }}
+          BITRIX_VERIFY_SSL: ${{ vars.BITRIX_VERIFY_SSL || 'true' }}
+          BITRIX_CA_BUNDLE: ${{ vars.BITRIX_CA_BUNDLE }}
+          BITRIX_OVERWRITE_ASSIGNED_BY_ON_UPDATE: "false"
+          BITRIX_LEAD_GENERATION_FIELD: "UF_CRM_1785917145255"
+          BITRIX_LEAD_GENERATION_VALUE: "ГПО недропользователя"
+          BITRIX_ORIGINATOR_ID: "EQAZYNA_LEAD"
+          BITRIX_SOURCE_ID: "OTHER"
+          BITRIX_SOURCE_DESCRIPTION: "e-Qazyna Minerals — ГПО недропользователи"
+          EQAZYNA_REQUEST_TIMEOUT: ${{ vars.EQAZYNA_REQUEST_TIMEOUT || '15' }}
+          BITRIX_REQUEST_TIMEOUT: ${{ vars.BITRIX_REQUEST_TIMEOUT || '45' }}
+          EGOV_REQUEST_TIMEOUT: ${{ vars.EGOV_REQUEST_TIMEOUT || '25' }}
+          INPUT_MODE: ${{ inputs.mode }}
+          INPUT_PAGES: ${{ inputs.pages }}
+          INPUT_PAGE_START: ${{ inputs.page_start }}
+          INPUT_PAGE_LIST: ${{ inputs.page_list }}
+          INPUT_DOC_TYPE: ${{ inputs.doc_type }}
+          INPUT_STATUSES: ${{ inputs.statuses }}
+          INPUT_MIN_CREATED_DATE: ${{ inputs.min_created_date }}
+          INPUT_NO_EGOV: ${{ inputs.no_egov }}
+        run: |
+          if "%TARGET_BITRIX_WEBHOOK_URL%"=="" (
+            echo Не задан secret TARGET_BITRIX_WEBHOOK_URL
+            exit /b 1
+          )
+          if not exist output mkdir output
+          echo RUNNER=%RUNNER_NAME% / %RUNNER_OS% / %RUNNER_ARCH%
+          ".venv\Scripts\python.exe" -u scripts\run_from_env.py
+          if errorlevel 1 exit /b 1
+          ".venv\Scripts\python.exe" scripts\check_run_result.py --results "output\eqazyna_bitrix_leads.json" --pages "output\eqazyna_bitrix_leads_pages.json"
+          if errorlevel 1 exit /b 1
+          dir output
+
+      - name: Загрузить журнал запуска
+        if: ${{ always() && inputs.upload_logs }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: 30-eqazyna-leads-${{ github.run_number }}
+          path: processes/eqazyna_leads/output/
+          if-no-files-found: warn
+          retention-days: 14

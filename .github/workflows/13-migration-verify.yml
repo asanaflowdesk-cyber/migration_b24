@@ -29,6 +29,14 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}
         run: '".venv\Scripts\python.exe" -m pytest -q tests/test_migration.py'
 
+      - name: Восстановить карты ID последнего реального переноса
+        uses: actions/cache@v4
+        with:
+          path: processes/cloud_to_box/output
+          key: b24-migration-verify-${{ github.run_id }}
+          restore-keys: |
+            b24-migration-state-
+
       - name: Сверить маркеры и количество записей
         env:
           PYTHONUNBUFFERED: "1"
