@@ -479,7 +479,7 @@ class MigrationProject:
         target = self._context_user_target(key, context, user_map)
         if target:
             return int(target)
-        self.report.add(operation, source_type, object_id, "USER", "", "ERROR", f"unmapped {role} source user {key} for {context}")
+        self.report.add(operation, source_type, object_id, "USER", "", "SKIP", f"unmapped {role} source user {key} for {context}; dependent object skipped")
         return None
 
     # ---------- entity preparation ----------
@@ -827,7 +827,7 @@ class MigrationProject:
                 "CRM activity files",
                 "live activity binding enrichment",
             ],
-            "note": "Main objects continue to migrate; unavailable supplemental data is recorded as WARN.",
+            "note": "Any individual object or subobject that cannot be processed is skipped and recorded. The workflow continues.",
         }
         user_map = self.build_user_map(strict=True)
         if not dry_run:
@@ -941,8 +941,8 @@ class MigrationProject:
                     warnings_for_row.append(f"{regular_comments} comments reported but none readable")
 
             if blocking_problems:
-                status = "ERROR"
-                message = "; ".join(blocking_problems + (["WARN: " + "; ".join(warnings_for_row)] if warnings_for_row else []))
+                status = "SKIP"
+                message = "Пропущено: " + "; ".join(blocking_problems + (["WARN: " + "; ".join(warnings_for_row)] if warnings_for_row else []))
             elif warnings_for_row:
                 status = "WARN"
                 message = "; ".join(warnings_for_row)
@@ -970,7 +970,10 @@ class MigrationProject:
                 row.get("COMMUNICATIONS") or [], company_map, contact_map, lead_map, deal_map
             )
             if unresolved_communications:
-                blocking_problems.append(f"unresolved CRM communications: {unresolved_communications}")
+                warnings_for_row.append(
+                    "unresolved CRM communications omitted: "
+                    + ", ".join(unresolved_communications)
+                )
             for index, item in enumerate(row.get("FILES") or []):
                 source_file = item.get("FILE_ID") or item.get("fileId") or item.get("id") if isinstance(item, dict) else item
                 if not source_file:
@@ -980,8 +983,8 @@ class MigrationProject:
                 except Exception as exc:
                     warnings_for_row.append(f"activity file {index}:{source_file}: {exc}")
             if blocking_problems:
-                status = "ERROR"
-                message = "; ".join(blocking_problems + (["WARN: " + "; ".join(warnings_for_row)] if warnings_for_row else []))
+                status = "SKIP"
+                message = "Пропущено: " + "; ".join(blocking_problems + (["WARN: " + "; ".join(warnings_for_row)] if warnings_for_row else []))
             elif warnings_for_row:
                 status = "WARN"
                 message = "; ".join(warnings_for_row)
@@ -1844,7 +1847,7 @@ class MigrationProject:
                 self.client.call(method, {"taskId": target_task_id})
             self.report.add("set_task_status", "TASK", old_task_id, "TASK", target_task_id, "OK", status)
         except Exception as exc:
-            self.report.add("set_task_status", "TASK", old_task_id, "TASK", target_task_id, "ERROR", str(exc))
+            self.report.add("set_task_status", "TASK", old_task_id, "TASK", target_task_id, "WARN", str(exc))
 
     def import_tasks(self, user_map: Mapping[str, int], company_map: Mapping[str, int], contact_map: Mapping[str, int], lead_map: Mapping[str, int], deal_map: Mapping[str, int], *, max_items: int = 0) -> None:
         self.load_source("Tasks", "Users")
@@ -1998,6 +2001,27 @@ class MigrationProject:
             result.append(mapped)
         return result, unresolved
 
+    @staticmethod
+    def _unresolved_communications_note(
+        rows: Iterable[Mapping[str, Any]], unresolved: Iterable[str]
+    ) -> str:
+        unresolved_set = {text(value) for value in unresolved}
+        notes: list[str] = []
+        for item in rows:
+            old_type = int(item.get("ENTITY_TYPE_ID") or 0)
+            old_id = text(item.get("ENTITY_ID"))
+            key = f"{old_type}:{old_id}"
+            if key not in unresolved_set:
+                continue
+            communication_type = text(item.get("TYPE")) or "UNKNOWN"
+            value = text(item.get("VALUE")) or "без значения"
+            notes.append(
+                f"{communication_type} {value} (исходная CRM-сущность {key} отсутствует в дампе)"
+            )
+        if not notes:
+            return ""
+        return "Непривязанные коммуникации из облачного Bitrix24: " + "; ".join(notes)
+
     def _activity_files(self, activity: Mapping[str, Any]) -> list[dict[str, Any]]:
         """Download source activity files and build crm.activity fileData payloads."""
         if not self.file_transfer:
@@ -2082,7 +2106,7 @@ class MigrationProject:
                 self.client.call("crm.activity.binding.add", {"activityId": target_id, "entityTypeId": owner_type, "entityId": owner_id})
                 self.report.add("bind_activity", "ACTIVITY", old_id, "ACTIVITY", target_id, "OK", f"{owner_type}:{owner_id}")
             except Exception as exc:
-                self.report.add("bind_activity", "ACTIVITY", old_id, "ACTIVITY", target_id, "ERROR", f"{owner_type}:{owner_id}: {exc}")
+                self.report.add("bind_activity", "ACTIVITY", old_id, "ACTIVITY", target_id, "WARN", f"{owner_type}:{owner_id}: {exc}")
 
     @staticmethod
     def _activity_target_file_info(activity: Mapping[str, Any]) -> list[tuple[str, int]]:
@@ -2154,15 +2178,20 @@ class MigrationProject:
             old_id = text(activity.get("ID"))
             bindings, unresolved_bindings = self._activity_bindings(activity, company_map, contact_map, lead_map, deal_map)
             if unresolved_bindings:
-                self.report.add("prepare_activity", "ACTIVITY", old_id, "ACTIVITY", "", "ERROR", f"unresolved CRM bindings: {unresolved_bindings}")
+                self.report.add("prepare_activity", "ACTIVITY", old_id, "ACTIVITY", "", "SKIP", f"Пропущено: unresolved CRM bindings: {unresolved_bindings}")
                 continue
             if not bindings:
-                self.report.add("create_activity", "ACTIVITY", old_id, "ACTIVITY", "", "ERROR", "no mapped CRM owner/binding")
+                self.report.add("create_activity", "ACTIVITY", old_id, "ACTIVITY", "", "SKIP", "Пропущено: no mapped CRM owner/binding")
                 continue
             communications, unresolved_communications = self._map_activity_communications(activity.get("COMMUNICATIONS") or [], company_map, contact_map, lead_map, deal_map)
+            communication_note = self._unresolved_communications_note(
+                activity.get("COMMUNICATIONS") or [], unresolved_communications
+            )
             if unresolved_communications:
-                self.report.add("prepare_activity", "ACTIVITY", old_id, "ACTIVITY", "", "ERROR", f"unresolved CRM communications: {unresolved_communications}")
-                continue
+                self.report.add(
+                    "prepare_activity", "ACTIVITY", old_id, "ACTIVITY", "", "WARN",
+                    "unresolved CRM communications omitted: " + ", ".join(unresolved_communications),
+                )
             files = self._activity_files(activity)
             if old_id in existing:
                 target_id = existing[old_id]
@@ -2185,7 +2214,7 @@ class MigrationProject:
                 "COMPLETED": text(activity.get("COMPLETED")) or "N",
                 "STATUS": int(activity.get("STATUS") or 1),
                 "PRIORITY": int(activity.get("PRIORITY") or 1),
-                "DESCRIPTION": text(activity.get("DESCRIPTION")),
+                "DESCRIPTION": append_text(text(activity.get("DESCRIPTION")), communication_note),
                 "DESCRIPTION_TYPE": int(activity.get("DESCRIPTION_TYPE") or 1),
                 "DIRECTION": int(activity.get("DIRECTION") or 0),
                 "LOCATION": text(activity.get("LOCATION")),
@@ -2213,50 +2242,12 @@ class MigrationProject:
                 target_id = extract_id(result)
                 if not target_id:
                     raise RuntimeError(f"crm.activity.add returned no ID: {result}")
-            except Exception as first_exc:
-                fallback_fields = dict(fields)
-                provider_note = (
-                    f"Исходный тип дела: {text(activity.get('TYPE_ID'))}. "
-                    f"Исходный провайдер: {text(activity.get('PROVIDER_ID'))}/"
-                    f"{text(activity.get('PROVIDER_TYPE_ID'))}"
+            except Exception as exc:
+                self.report.add(
+                    "create_activity", "ACTIVITY", old_id, "ACTIVITY", "", "SKIP",
+                    f"Пропущено: activity could not be created without changing its source meaning: {exc}",
                 )
-                fallback_fields["DESCRIPTION"] = append_text(fallback_fields.get("DESCRIPTION"), provider_note)
-                for key in ("PROVIDER_ID", "PROVIDER_TYPE_ID", "PROVIDER_GROUP_ID", "PROVIDER_PARAMS", "PROVIDER_DATA", "IS_INCOMING_CHANNEL"):
-                    fallback_fields.pop(key, None)
-                if int(fallback_fields.get("TYPE_ID") or 0) == 6:
-                    # User Action entries from providers such as Open Lines cannot
-                    # always be recreated outside their original provider context.
-                    # Preserve the record as a generic Action instead of dropping it.
-                    fallback_fields["TYPE_ID"] = 5
-                try:
-                    result = self.client.call("crm.activity.add", {"fields": fallback_fields})
-                    target_id = extract_id(result)
-                    if not target_id:
-                        raise RuntimeError(f"fallback crm.activity.add returned no ID: {result}")
-                    self.report.add(
-                        "create_activity", "ACTIVITY", old_id, "ACTIVITY", target_id, "WARN",
-                        f"generic activity fallback used after: {first_exc}",
-                    )
-                except Exception as retry_exc:
-                    final_fields = dict(fallback_fields)
-                    communications_value = final_fields.get("COMMUNICATIONS") or []
-                    if isinstance(communications_value, list) and len(communications_value) > 1:
-                        final_fields["COMMUNICATIONS"] = communications_value[:1]
-                    try:
-                        result = self.client.call("crm.activity.add", {"fields": final_fields})
-                        target_id = extract_id(result)
-                        if not target_id:
-                            raise RuntimeError(f"final crm.activity.add returned no ID: {result}")
-                        self.report.add(
-                            "create_activity", "ACTIVITY", old_id, "ACTIVITY", target_id, "WARN",
-                            f"generic activity with primary communication used after: {first_exc}; {retry_exc}",
-                        )
-                    except Exception as final_exc:
-                        self.report.add(
-                            "create_activity", "ACTIVITY", old_id, "ACTIVITY", "", "ERROR",
-                            f"original: {first_exc}; generic: {retry_exc}; final: {final_exc}",
-                        )
-                        continue
+                continue
             self.report.maps["activities"][old_id] = target_id
             self.report.add("create_activity", "ACTIVITY", old_id, "ACTIVITY", target_id, "OK", "")
             self._ensure_activity_bindings(old_id, target_id, bindings)
@@ -2280,13 +2271,22 @@ class MigrationProject:
         result["markers"]["deals_kept_as_deals"] = sum(1 for key in deal_markers if key[0] == "DEAL" and key[2] == "DEAL")
         result["markers"]["tasks"] = len(self._existing_tasks())
         result["markers"]["activities"] = len(self._existing_activities())
-        result["ok"] = (
-            result["markers"]["companies"] >= plan["source_counts"]["Companies"]
-            and result["markers"]["contacts"] >= plan["source_counts"]["Contacts"]
-            and result["markers"]["deals_routed_to_leads"] >= plan["source_deals_routed_to_leads"]
-            and result["markers"]["deals_kept_as_deals"] >= plan["source_deals_kept_as_deals"]
-            and result["markers"]["tasks"] >= plan["expected_tasks"]
-            and result["markers"]["activities"] >= plan["expected_activities"]
-        )
+        expected_counts = {
+            "companies": plan["source_counts"]["Companies"],
+            "contacts": plan["source_counts"]["Contacts"],
+            "deals_routed_to_leads": plan["source_deals_routed_to_leads"],
+            "deals_kept_as_deals": plan["source_deals_kept_as_deals"],
+            "tasks": plan["expected_tasks"],
+            "activities": plan["expected_activities"],
+        }
+        gaps = {
+            name: max(0, expected_counts[name] - int(result["markers"].get(name, 0)))
+            for name in expected_counts
+        }
+        result["expected_counts"] = expected_counts
+        result["gaps"] = gaps
+        result["complete"] = not any(gaps.values())
+        result["ok"] = True
+        result["policy"] = "Verification never blocks: gaps are fixed in the report for later review."
         self.report.extra["verification"] = result
         return result

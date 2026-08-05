@@ -4,6 +4,7 @@ from common.bitrix import BitrixClient
 from src.dump_reader import DumpReader
 from src.file_transfer import FileTransfer
 from src.migration import MigrationProject, migration_marker, normalize_name_tokens, parse_marker
+from src.reporting import Report
 
 ROOT = Path(__file__).resolve().parents[1]
 DUMP = ROOT / "input/bitrix24_dump_20260805_072425.zip"
@@ -258,3 +259,83 @@ def test_invalid_file_reference_is_non_blocking_warning(tmp_path: Path) -> None:
     row = p.report.actions[-1]
     assert row["operation"] == "transfer_file"
     assert row["status"] == "WARN"
+
+
+def test_unresolved_activity_communications_are_omitted_with_note(tmp_path: Path) -> None:
+    p = project(tmp_path)
+    rows = [
+        {
+            "TYPE": "PHONE",
+            "VALUE": "+77011110329",
+            "ENTITY_TYPE_ID": "4",
+            "ENTITY_ID": "730",
+        },
+        {
+            "TYPE": "PHONE",
+            "VALUE": "+77010000000",
+            "ENTITY_TYPE_ID": "3",
+            "ENTITY_ID": "20",
+        },
+    ]
+    mapped, unresolved = p._map_activity_communications(
+        rows,
+        company_map={},
+        contact_map={"20": 2000},
+        lead_map={},
+        deal_map={},
+    )
+    assert unresolved == ["4:730"]
+    assert len(mapped) == 1
+    assert mapped[0]["ENTITY_TYPE_ID"] == 3
+    assert mapped[0]["ENTITY_ID"] == 2000
+    note = p._unresolved_communications_note(rows, unresolved)
+    assert "+77011110329" in note
+    assert "4:730" in note
+
+
+def test_report_writes_skipped_and_warning_files(tmp_path: Path) -> None:
+    report = Report(tmp_path)
+    report.add("create_task", "TASK", "1", "TASK", "", "SKIP", "not processed")
+    report.add("copy_comment", "TASK", "1", "TASK", "", "WARN", "comment unavailable")
+    report.add("system", "SYSTEM", "", "SYSTEM", "", "FATAL", "global failure")
+    report.save()
+
+    skipped = (tmp_path / "skipped.csv").read_text(encoding="utf-8-sig")
+    warnings = (tmp_path / "warnings.csv").read_text(encoding="utf-8-sig")
+    errors = (tmp_path / "errors.csv").read_text(encoding="utf-8-sig")
+    assert "not processed" in skipped
+    assert "comment unavailable" in warnings
+    assert "global failure" in errors
+    assert "not processed" not in errors
+
+
+def test_dry_run_dependency_problem_is_skip_not_error(tmp_path: Path) -> None:
+    p = project(tmp_path)
+    p.source_client = object()
+    p._source["Tasks"] = [
+        {
+            "id": "999",
+            "title": "Broken dependency",
+            "createdBy": "9999",
+            "responsibleId": "9999",
+            "accomplices": [],
+            "auditors": [],
+            "parentId": "0",
+            "ufCrmTask": [],
+            "ufTaskWebdavFiles": [],
+            "commentsCount": 0,
+            "serviceCommentsCount": 0,
+        }
+    ]
+    p._source["CRM_Activities"] = []
+    p._dry_run_tasks_activities({}, {}, {}, {}, {})
+    row = p.report.actions[-1]
+    assert row["status"] == "SKIP"
+    assert row["message"].startswith("Пропущено:")
+
+
+def test_skip_and_log_policy_has_no_blocking_import_exit() -> None:
+    source = (ROOT / "migrate.py").read_text(encoding="utf-8")
+    assert "exit_code = 4" not in source
+    assert 'row["status"] = "SKIP"' in source
+    assert "exit_code = 0" in source

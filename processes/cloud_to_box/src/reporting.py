@@ -64,15 +64,27 @@ class Report:
             writer = csv.DictWriter(f, fieldnames=fields)
             writer.writeheader()
             writer.writerows(self.actions)
-        errors = [row for row in self.actions if row["status"] not in {"OK", "SKIP", "DRY_RUN"}]
-        with (self.dir / "errors.csv").open("w", newline="", encoding="utf-8-sig") as f:
-            writer = csv.DictWriter(f, fieldnames=fields)
-            writer.writeheader()
-            writer.writerows(errors)
+        skipped = [row for row in self.actions if row["status"] == "SKIP"]
+        warnings = [row for row in self.actions if row["status"] == "WARN"]
+        errors = [row for row in self.actions if row["status"] in {"ERROR", "FATAL"}]
+
+        for filename, rows in (
+            ("skipped.csv", skipped),
+            ("warnings.csv", warnings),
+            ("errors.csv", errors),
+        ):
+            with (self.dir / filename).open("w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.DictWriter(f, fieldnames=fields)
+                writer.writeheader()
+                writer.writerows(rows)
+
         (self.dir / "maps.json").write_text(json.dumps(self.maps, ensure_ascii=False, indent=2), encoding="utf-8")
         summary = {
             "counts_by_status": dict(Counter(row["status"] for row in self.actions)),
             "counts_by_operation": dict(Counter(row["operation"] for row in self.actions)),
+            "skipped_total": len(skipped),
+            "warnings_total": len(warnings),
+            "errors_total": len(errors),
             "map_sizes": {name: len(values) for name, values in self.maps.items()},
             **self.extra,
         }

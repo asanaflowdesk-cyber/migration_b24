@@ -92,18 +92,42 @@ def main() -> int:
 
         elif args.command == "import":
             project.import_all(dry_run=args.dry_run, max_items=args.max_items)
-            blocking = [
-                row for row in project.report.actions
-                if row.get("status") in {"ERROR", "FATAL"}
-            ]
-            if blocking:
-                logging.error("Import produced %s blocking errors; see errors.csv", len(blocking))
-                exit_code = 4
+
+            # Object-level failures never stop the migration. Any legacy ERROR
+            # produced by an individual record is normalized to SKIP and remains
+            # visible in skipped.csv/actions.csv. Only an unhandled SYSTEM/FATAL
+            # exception may stop the workflow.
+            normalized = 0
+            for row in project.report.actions:
+                if row.get("status") == "ERROR":
+                    row["status"] = "SKIP"
+                    message = str(row.get("message") or "")
+                    if not message.startswith("Пропущено:"):
+                        row["message"] = f"Пропущено: {message}" if message else "Пропущено: объект не обработан"
+                    normalized += 1
+
+            skipped = sum(1 for row in project.report.actions if row.get("status") == "SKIP")
+            warnings = sum(1 for row in project.report.actions if row.get("status") == "WARN")
+            project.report.extra["non_blocking_import_result"] = {
+                "policy": "skip_and_log",
+                "normalized_errors_to_skip": normalized,
+                "skipped": skipped,
+                "warnings": warnings,
+                "workflow_failed": False,
+            }
+            logging.info(
+                "Import completed under skip-and-log policy: skipped=%s, warnings=%s",
+                skipped,
+                warnings,
+            )
+            exit_code = 0
 
         elif args.command == "verify":
             result = project.verify()
             print(json.dumps(result, ensure_ascii=False, indent=2))
-            exit_code = 0 if result["ok"] else 3
+            # Verification reports gaps but does not fail the workflow. Missing
+            # records remain visible in summary.json and the printed result.
+            exit_code = 0
 
     except Exception as exc:
         logging.exception("Migration command failed: %s", exc)
