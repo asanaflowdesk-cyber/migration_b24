@@ -1,0 +1,46 @@
+name: 10 | Миграция — проверить план
+
+on:
+  workflow_dispatch:
+
+env:
+  NODE_USE_SYSTEM_CA: "1"
+
+jobs:
+  plan:
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: cmd
+        working-directory: processes/cloud_to_box
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Найти Python и создать локальное окружение
+        run: call ..\..\scripts\prepare-python.cmd
+
+      - name: Установить зависимости
+        run: '".venv\Scripts\python.exe" -m pip install -r requirements.txt'
+
+      - name: Проверить миграцию
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: '".venv\Scripts\python.exe" -m pytest -q tests/test_migration.py'
+
+      - name: Построить план и проверить коробку
+        env:
+          PYTHONUNBUFFERED: "1"
+          PYTHONPATH: ${{ github.workspace }}
+          TARGET_BITRIX_WEBHOOK_URL: ${{ secrets.TARGET_BITRIX_WEBHOOK_URL }}
+        run: '".venv\Scripts\python.exe" -u migrate.py plan'
+
+      - name: Загрузить отчет
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: 10-migration-plan-${{ github.run_number }}
+          path: processes/cloud_to_box/output/
+          if-no-files-found: warn
+          retention-days: 30

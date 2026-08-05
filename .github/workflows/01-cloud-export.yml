@@ -1,0 +1,50 @@
+name: 01 | Облако — выгрузить данные
+
+on:
+  workflow_dispatch:
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: processes/cloud_export
+
+    steps:
+      - name: Получить репозиторий
+        uses: actions/checkout@v5
+
+      - name: Подготовить Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: processes/cloud_export/requirements.txt
+
+      - name: Установить зависимости
+        run: python -m pip install -r requirements.txt
+
+      - name: Проверить скрипт
+        run: python -m pytest -q tests/test_export.py
+
+      - name: Выгрузить облачный Bitrix24
+        env:
+          BITRIX_WEBHOOK_URL: ${{ secrets.BITRIX_WEBHOOK_URL }}
+          EXPORT_ACTIVITIES: "true"
+          EXPORT_RELATIONS: "true"
+          EXPORT_PRODUCT_ROWS: "true"
+          EXPORT_TIMELINE_COMMENTS: "true"
+          EXPORT_SMART_PROCESSES: "true"
+          EXPORT_TASK_STAGES: "true"
+          OUTPUT_DIR: output
+        run: python -u export_bitrix.py
+
+      - name: Загрузить выгрузку
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: 01-cloud-export-${{ github.run_number }}
+          path: processes/cloud_export/output/
+          if-no-files-found: error
+          retention-days: 30

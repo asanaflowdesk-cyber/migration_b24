@@ -1,0 +1,64 @@
+name: 20 | Пользователи — регистрация из Excel
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "dry_run — проверить файл; apply — создать пользователей и отправить приглашения"
+        required: true
+        default: dry_run
+        type: choice
+        options: [dry_run, apply]
+      file_path:
+        description: "Путь к Excel внутри процесса регистрации"
+        required: true
+        default: "input/users_to_invite.xlsx"
+        type: string
+      confirm:
+        description: "Для apply введите REGISTER_USERS"
+        required: false
+        default: ""
+        type: string
+
+env:
+  NODE_USE_SYSTEM_CA: "1"
+
+jobs:
+  register-users:
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: cmd
+        working-directory: processes/user_registration
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Найти Python и создать локальное окружение
+        run: call ..\..\scripts\prepare-python.cmd
+
+      - name: Установить зависимости
+        run: '".venv\Scripts\python.exe" -m pip install -r requirements.txt'
+
+      - name: Проверить подтверждение
+        if: ${{ inputs.mode == 'apply' && inputs.confirm != 'REGISTER_USERS' }}
+        run: |
+          echo Для реальной регистрации введите REGISTER_USERS
+          exit /b 1
+
+      - name: Проверить или зарегистрировать пользователей
+        env:
+          PYTHONUNBUFFERED: "1"
+          PYTHONPATH: ${{ github.workspace }}
+          TARGET_BITRIX_WEBHOOK_URL: ${{ secrets.TARGET_BITRIX_WEBHOOK_URL }}
+        run: '".venv\Scripts\python.exe" -u register_users_from_excel.py --file "${{ inputs.file_path }}" --mode "${{ inputs.mode }}"'
+
+      - name: Загрузить отчет
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: 20-user-registration-${{ github.run_number }}
+          path: processes/user_registration/output/
+          if-no-files-found: warn
+          retention-days: 30
