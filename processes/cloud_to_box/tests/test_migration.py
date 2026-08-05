@@ -164,3 +164,39 @@ def test_chat_file_fallback_uses_author_and_nearest_time() -> None:
     rows = MigrationProject._merge_chat_page_files(payload)
     assert rows[0]["files"][0]["id"] == 5255
     assert "files" not in rows[1]
+
+
+class _TaskChatClient:
+    def __init__(self) -> None:
+        self.classic_calls = 0
+        self.v3_calls = 0
+
+    def call(self, method, params=None):
+        assert method == "tasks.task.get"
+        self.classic_calls += 1
+        return {"task": {"id": "2", "chatId": None}}
+
+    def call_v3(self, method, params=None):
+        assert method == "tasks.task.get"
+        self.v3_calls += 1
+        return {"item": {"id": 2, "chat": {"id": 777, "entityId": 2, "entityType": "TASKS_TASK"}}}
+
+
+def test_task_chat_id_falls_back_to_rest_v3() -> None:
+    client = _TaskChatClient()
+    assert MigrationProject._task_chat_id(client, 2) == 777
+    assert client.classic_calls == 1
+    assert client.v3_calls == 1
+
+
+class _ClassicTaskChatClient:
+    def call(self, method, params=None):
+        assert method == "tasks.task.get"
+        return {"task": {"id": "2", "chatId": 123}}
+
+    def call_v3(self, method, params=None):
+        raise AssertionError("REST 3.0 should not be called when classic REST returns chatId")
+
+
+def test_task_chat_id_prefers_classic_rest() -> None:
+    assert MigrationProject._task_chat_id(_ClassicTaskChatClient(), 2) == 123

@@ -778,7 +778,10 @@ class MigrationProject:
             if comments:
                 checks["source_task_comments"] = f"OK: {len(comments)}"
             else:
-                message = f"task {task_id} reports comments but the webhook returned none"
+                message = (
+                    f"task {task_id} reports comments but none were returned after classic REST and REST 3.0 chat lookup; "
+                    "check that SOURCE_BITRIX_WEBHOOK_URL includes the im scope and that its user is a participant of the task chat"
+                )
                 checks["source_task_comments"] = f"ERROR: {message}"
                 errors.append(f"source_task_comments: {message}")
 
@@ -1441,6 +1444,52 @@ class MigrationProject:
             used.add(file_id)
         return messages
 
+    @staticmethod
+    def _task_chat_id(client: BitrixClient, task_id: int) -> int:
+        """Return the task chat ID using classic REST and then REST 3.0.
+
+        Some cloud portals with the new task card no longer return ``chatId``
+        through the classic ``tasks.task.get`` call for old tasks. REST 3.0
+        exposes the same chat as the related ``chat.id`` field, so it is used
+        as a mandatory fallback before declaring comments unreadable.
+        """
+        try:
+            task_result = client.call(
+                "tasks.task.get",
+                {"taskId": task_id, "select": ["ID", "CHAT_ID"]},
+            ) or {}
+            task = task_result.get("task", task_result) if isinstance(task_result, dict) else {}
+            chat_id = int(task.get("chatId") or task.get("CHAT_ID") or 0)
+            if chat_id:
+                return chat_id
+        except Exception as exc:
+            LOG.info("Classic task chat lookup failed for task %s: %s", task_id, exc)
+
+        try:
+            task_result_v3 = client.call_v3(
+                "tasks.task.get",
+                {
+                    "id": task_id,
+                    "select": ["id", "chat.id", "chat.entityId", "chat.entityType"],
+                },
+            ) or {}
+            item = (
+                task_result_v3.get("item")
+                if isinstance(task_result_v3, dict)
+                else None
+            )
+            if not isinstance(item, dict) and isinstance(task_result_v3, dict):
+                item = task_result_v3
+            chat = item.get("chat") if isinstance(item, dict) else {}
+            if isinstance(chat, dict):
+                chat_id = int(chat.get("id") or chat.get("ID") or 0)
+                if chat_id:
+                    LOG.info("Task %s chat resolved through REST 3.0: %s", task_id, chat_id)
+                    return chat_id
+        except Exception as exc:
+            LOG.info("REST 3.0 task chat lookup failed for task %s: %s", task_id, exc)
+        return 0
+
     def _fetch_task_comments(self, client: BitrixClient, task_id: int) -> list[dict[str, Any]]:
         try:
             result = client.call("task.commentitem.getlist", {"TASKID": task_id, "ORDER": {"POST_DATE": "ASC"}, "FILTER": {}}) or []
@@ -1449,10 +1498,12 @@ class MigrationProject:
         except Exception as exc:
             LOG.info("Old task comments API unavailable for task %s: %s", task_id, exc)
         try:
-            task_result = client.call("tasks.task.get", {"taskId": task_id, "select": ["CHAT_ID"]}) or {}
-            task = task_result.get("task", task_result) if isinstance(task_result, dict) else {}
-            chat_id = int(task.get("chatId") or task.get("CHAT_ID") or 0)
+            chat_id = self._task_chat_id(client, task_id)
             if not chat_id:
+                LOG.warning(
+                    "Task %s reports comments but no chat ID was returned by classic REST or REST 3.0",
+                    task_id,
+                )
                 return []
             messages: list[dict[str, Any]] = []
             last_id = 0
@@ -1482,9 +1533,19 @@ class MigrationProject:
                     int(item.get("id") or item.get("ID") or 0),
                 )
             )
+            if not messages:
+                LOG.warning(
+                    "Task %s chat %s returned no user messages. The source webhook must include the im scope and its user must be a participant of the task chat.",
+                    task_id,
+                    chat_id,
+                )
             return messages
         except Exception as exc:
-            LOG.warning("Cannot fetch chat comments for task %s: %s", task_id, exc)
+            LOG.warning(
+                "Cannot fetch chat comments for task %s: %s. Check the im scope and task-chat membership of the source webhook user.",
+                task_id,
+                exc,
+            )
             return []
 
     @staticmethod
