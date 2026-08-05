@@ -90,7 +90,8 @@ def test_file_name_is_deterministic() -> None:
 def test_product_field_configuration(tmp_path: Path) -> None:
     p = project(tmp_path)
     assert p.config["product_field"] == {
-        "code": "UF_CRM_1785917145255",
+        "lead_code": "UF_CRM_1785917145255",
+        "deal_code": "UF_CRM_6A73073A5405E",
         "value": "ГПО недропользователя",
     }
 

@@ -3,7 +3,8 @@
   "target_source_id": "UC_5XK8LY",
   "skip_original_leads": true,
   "product_field": {
-    "code": "UF_CRM_1785917145255",
+    "lead_code": "UF_CRM_1785917145255",
+    "deal_code": "UF_CRM_6A73073A5405E",
     "value": "ГПО недропользователя"
   },
   "target_files_folder_id": 0,

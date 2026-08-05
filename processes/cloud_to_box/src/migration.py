@@ -197,7 +197,7 @@ class MigrationProject:
 
     def _resolve_product_field(self, entity: str) -> tuple[Any, str | None]:
         cfg = self.config["product_field"]
-        code = cfg["code"]
+        code = cfg[f"{entity}_code"]
         value = cfg["value"]
         field = next((x for x in self._target_userfields.get(entity, []) if x.get("FIELD_NAME") == code), None)
         if not field:
@@ -542,7 +542,7 @@ class MigrationProject:
                 "ASSIGNED_BY_ID": responsible,
                 "STATUS_ID": status_map.get(text(row.get("STATUS_ID")), "NEW"),
                 "SOURCE_ID": self._target_source_id(row),
-                self.config["product_field"]["code"]: self._product_encoded["lead"],
+                self.config["product_field"]["lead_code"]: self._product_encoded["lead"],
             })
             if text(row.get("COMPANY_ID")) in company_map:
                 fields["COMPANY_ID"] = company_map[text(row.get("COMPANY_ID"))]
@@ -574,7 +574,7 @@ class MigrationProject:
                 "ASSIGNED_BY_ID": responsible,
                 "STATUS_ID": target_status,
                 "SOURCE_ID": self._target_source_id(row),
-                self.config["product_field"]["code"]: self._product_encoded["lead"],
+                self.config["product_field"]["lead_code"]: self._product_encoded["lead"],
             })
             old_company = text(row.get("COMPANY_ID")); old_contact = text(row.get("CONTACT_ID"))
             if old_company in company_map:
@@ -618,7 +618,7 @@ class MigrationProject:
                 "STAGE_ID": target_stage,
                 "CATEGORY_ID": int(self.config.get("target_deal_category_id", 0)),
                 "SOURCE_ID": self._target_source_id(row),
-                self.config["product_field"]["code"]: self._product_encoded["deal"],
+                self.config["product_field"]["deal_code"]: self._product_encoded["deal"],
             })
             old_company = text(row.get("COMPANY_ID")); old_contact = text(row.get("CONTACT_ID"))
             if old_company in company_map:
