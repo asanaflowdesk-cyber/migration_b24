@@ -1,0 +1,50 @@
+{
+  "source_counts": {
+    "Companies": 601,
+    "Contacts": 441,
+    "Leads": 4,
+    "Deals": 1443,
+    "Requisites": 616,
+    "Addresses": 1154,
+    "Deal_Contacts": 1380,
+    "Lead_Contacts": 1,
+    "Contact_Companies": 564
+  },
+  "source_deals_routed_to_leads": 1326,
+  "source_deals_kept_as_deals": 117,
+  "expected_target_leads_total": 1330,
+  "expected_target_deals_total": 117,
+  "route_breakdown": {
+    "UC_2DA5PB->lead:UC_P6PL43": 97,
+    "LOSE->lead:JUNK": 538,
+    "UC_HRSCUK->lead:UC_C7B94L": 127,
+    "NEW->lead:NEW": 383,
+    "UC_BF5JWI->lead:PROCESSED": 27,
+    "UC_2Z4T64->lead:UC_P6PL43": 87,
+    "LOSE->deal:LOSE": 106,
+    "WON->deal:WON": 9,
+    "EXECUTING->lead:IN_PROCESS": 58,
+    "FINAL_INVOICE->lead:PROCESSED": 9,
+    "UC_9TWGUF->deal:PREPAYMENT_INVOICE": 2
+  },
+  "only_crm_scope": [
+    "users needed as CRM responsibles",
+    "companies",
+    "contacts",
+    "leads",
+    "deals",
+    "company/contact/lead/deal relations",
+    "requisites and addresses",
+    "three target user fields"
+  ],
+  "excluded": [
+    "tasks",
+    "projects",
+    "workgroups",
+    "activities",
+    "timeline",
+    "files",
+    "smart processes",
+    "products"
+  ]
+}

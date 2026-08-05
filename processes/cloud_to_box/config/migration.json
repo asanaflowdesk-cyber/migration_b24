@@ -1,0 +1,86 @@
+{
+  "target_deal_category_id": 0,
+  "target_source_id": "UC_5XK8LY",
+  "target_statuses": {
+    "STATUS": {
+      "NEW": "Новый лид",
+      "IN_PROCESS": "Квалификация",
+      "UC_C7B94L": "Недозвон / поиск контакта",
+      "UC_P6PL43": "Повторный контакт",
+      "PROCESSED": "Сбор данных",
+      "CONVERTED": "Лид конвертирован в сделку",
+      "JUNK": "Некачественный лид"
+    },
+    "DEAL_STAGE": {
+      "NEW": "Новая сделка",
+      "PREPARATION": "Ожидает пролонгации",
+      "PREPAYMENT_INVOICE": "Расчёт / андеррайтинг",
+      "EXECUTING": "Оплата",
+      "WON": "Договор подписан",
+      "LOSE": "Сделка провалена"
+    },
+    "SOURCE": {
+      "UC_5XK8LY": "Minerals E-Qazyna"
+    }
+  },
+  "routing": {
+    "source_lead_status_map": {
+      "UC_Q3IKF2": "NEW",
+      "NEW": "NEW",
+      "UC_ECENEO": "IN_PROCESS",
+      "IN_PROCESS": "UC_C7B94L",
+      "PROCESSED": "UC_P6PL43",
+      "UC_4KODX6": "PROCESSED",
+      "UC_CHXDL7": "PROCESSED",
+      "CONVERTED": "CONVERTED",
+      "JUNK": "JUNK"
+    },
+    "deal_to_lead_status_map": {
+      "NEW": "NEW",
+      "EXECUTING": "IN_PROCESS",
+      "UC_HRSCUK": "UC_C7B94L",
+      "UC_2DA5PB": "UC_P6PL43",
+      "UC_2Z4T64": "UC_P6PL43",
+      "FINAL_INVOICE": "PROCESSED",
+      "UC_BF5JWI": "PROCESSED"
+    },
+    "deal_stage_map": {
+      "UC_9TWGUF": "PREPAYMENT_INVOICE",
+      "WON": "WON",
+      "LOSE": "LOSE"
+    },
+    "lost_deal_previous_stages_kept_as_deal": [
+      "UC_9TWGUF"
+    ],
+    "lost_deal_target_lead_status": "JUNK"
+  },
+  "field_mapping": {
+    "lead_loss_reason": {
+      "source_deal_field": "UF_CRM_1779448756033",
+      "target_lead_field": "UF_CRM_1785508658316",
+      "expected_values": [
+        "Не дозвонились",
+        "Уже работают с конкурентом",
+        "Уже работает с Евразией",
+        "Нет данных организации",
+        "Клиент отказался",
+        "Не подходит по критериям",
+        "Ошибка данных",
+        "Не ведёт деятельность / компания неактивна",
+        "Дубль сделки",
+        "Проиграли аукцион"
+      ],
+      "value_aliases": {
+        "Уже работает с конкурентом": "Уже работают с конкурентом"
+      }
+    },
+    "deal_contract_number": {
+      "source_deal_field": "UF_CRM_1781611696235",
+      "target_deal_field": "UF_CRM_1785507415551"
+    },
+    "deal_loss_detail": {
+      "source_deal_field": "UF_CRM_1781611791954",
+      "target_deal_field": "UF_CRM_1785508290845"
+    }
+  }
+}

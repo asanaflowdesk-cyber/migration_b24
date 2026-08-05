@@ -1,0 +1,11 @@
+source_user_id,invite,email,name,last_name,target_department_name,target_department_id,source_objects
+1,N,m.snegovskoi@gmail.com,Михаил,Снеговской,Поручения,,6
+36,Y,alena.sacheva@gmail.com,Алёна,Сачева,Департамент регионального развития,,8
+54,N,svetlana.pak@theeurasia.kz,Светлана,Пак,Департамент регионального развития,12,118
+56,Y,Tatyana.Dyatlova@theeurasia.kz,Татьяна,Дятлова,Департамент регионального развития,12,1
+70,Y,Olga.Skrebtsova@theeurasia.kz,Ольга,Скребцова,Усть-Каменогорский филиал и отделение УК,15,239
+74,Y,Andrey.Krizhevskiy@theeurasia.kz,Андрей,Крижевский,Талдыкорганский филиал,14,801
+76,Y,Yuliya.Sidikova@theeurasia.kz,Юлия,Сидикова,Талдыкорганский филиал,14,473
+78,Y,Xeniya.Kudaibergenova@theeurasia.kz,Ксения,Кудайбергенова,Талдыкорганский филиал,14,366
+110,Y,Aliya.Kazrakhmetova@theeurasia.kz,Алия,Казрахметова,Павлодарский филиал,16,477
+900001,Y,Yevgeniy.Shveigert@theeurasia.kz,Евгений,Швейгерт,Талдыкорганский филиал,14,0
