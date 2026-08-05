@@ -1706,14 +1706,15 @@ class MigrationProject:
         responsible = self._context_user_target(activity.get("RESPONSIBLE_ID"), "crm", user_map)
         if not responsible:
             problems.append(f"unmapped responsible {text(activity.get('RESPONSIBLE_ID'))}")
-        communications, unresolved_communications = self._map_activity_communications(
-            activity.get("COMMUNICATIONS") or [], company_map, contact_map, lead_map, deal_map
+        communications, unresolved_communications, client_warnings = self._activity_client_communications(
+            activity, company_map, contact_map, lead_map, deal_map
         )
         communication_note = self._unresolved_communications_note(
             activity.get("COMMUNICATIONS") or [], unresolved_communications
         )
         if unresolved_communications:
             warnings.append(f"unresolved communications omitted: {unresolved_communications}")
+        warnings.extend(client_warnings)
         settings = activity.get("SETTINGS") if isinstance(activity.get("SETTINGS"), dict) else {}
         primary_type, primary_id = bindings[0] if bindings else (0, 0)
         fields: dict[str, Any] = {
@@ -3122,6 +3123,197 @@ class MigrationProject:
         return result, unresolved
 
     @staticmethod
+    def _first_communication_value(row: Mapping[str, Any]) -> tuple[str, str]:
+        """Return the first usable phone/email/IM value from a CRM client row."""
+        for field, communication_type in (("PHONE", "PHONE"), ("EMAIL", "EMAIL"), ("IM", "IM"), ("WEB", "WEB")):
+            values = row.get(field) or []
+            if isinstance(values, Mapping):
+                values = [values]
+            if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
+                continue
+            for item in values:
+                if isinstance(item, Mapping):
+                    value = text(item.get("VALUE")).strip()
+                else:
+                    value = text(item).strip()
+                if value:
+                    return communication_type, value
+        return "", ""
+
+    def _activity_source_client_candidates(self, activity: Mapping[str, Any]) -> list[tuple[int, str]]:
+        """Resolve the real source client behind an activity owner.
+
+        Bitrix stores the activity owner (lead/deal) separately from the client
+        shown in the ``Клиент`` column. The latter must be a contact/company in
+        ``COMMUNICATIONS``. Source activities often have an empty communication
+        list, so the client is reconstructed from the linked CRM card.
+        """
+        self.load_source("Companies", "Contacts", "Leads", "Deals", "Deal_Contacts", "Lead_Contacts")
+        companies = {text(row.get("ID")): row for row in self._source["Companies"]}
+        contacts = {text(row.get("ID")): row for row in self._source["Contacts"]}
+        leads = {text(row.get("ID")): row for row in self._source["Leads"]}
+        deals = {text(row.get("ID")): row for row in self._source["Deals"]}
+
+        candidates: list[tuple[int, str]] = []
+
+        def add(entity_type: int, entity_id: Any) -> None:
+            key = text(entity_id)
+            if key and (entity_type, key) not in candidates:
+                candidates.append((entity_type, key))
+
+        def add_contact_and_company(contact_id: Any) -> None:
+            key = text(contact_id)
+            if not key:
+                return
+            contact = contacts.get(key) or {}
+            company_id = text(contact.get("COMPANY_ID"))
+            if company_id:
+                add(4, company_id)
+            add(3, key)
+
+        def add_from_crm_row(row: Mapping[str, Any], relation_dataset: str, parent_column: str) -> None:
+            company_id = text(row.get("COMPANY_ID"))
+            if company_id:
+                add(4, company_id)
+            primary_contact = text(row.get("CONTACT_ID"))
+            if primary_contact:
+                add_contact_and_company(primary_contact)
+            parent_id = text(row.get("ID"))
+            relation_rows = sorted(
+                [
+                    item for item in self._source[relation_dataset]
+                    if text(item.get(parent_column)) == parent_id
+                ],
+                key=lambda item: (
+                    0 if text(item.get("IS_PRIMARY")) == "Y" else 1,
+                    int(item.get("SORT") or item.get("RELATION_ORDER") or 9999),
+                ),
+            )
+            for relation in relation_rows:
+                add_contact_and_company(relation.get("CONTACT_ID"))
+
+        owner_type = int(activity.get("OWNER_TYPE_ID") or 0)
+        owner_id = text(activity.get("OWNER_ID"))
+        if owner_type == 4:
+            add(4, owner_id)
+        elif owner_type == 3:
+            add_contact_and_company(owner_id)
+        elif owner_type == 2 and owner_id in deals:
+            add_from_crm_row(deals[owner_id], "Deal_Contacts", "DEAL_ID")
+        elif owner_type == 1 and owner_id in leads:
+            add_from_crm_row(leads[owner_id], "Lead_Contacts", "LEAD_ID")
+
+        # Some source activities carry additional bindings whose first entry is
+        # not necessarily the client-bearing lead/deal. Use them as a fallback.
+        for binding in activity.get("BINDINGS") or []:
+            if not isinstance(binding, Mapping):
+                continue
+            entity_type = int(binding.get("OWNER_TYPE_ID") or binding.get("ENTITY_TYPE_ID") or 0)
+            entity_id = text(binding.get("OWNER_ID") or binding.get("ENTITY_ID"))
+            if entity_type == 4:
+                add(4, entity_id)
+            elif entity_type == 3:
+                add_contact_and_company(entity_id)
+            elif entity_type == 2 and entity_id in deals:
+                add_from_crm_row(deals[entity_id], "Deal_Contacts", "DEAL_ID")
+            elif entity_type == 1 and entity_id in leads:
+                add_from_crm_row(leads[entity_id], "Lead_Contacts", "LEAD_ID")
+
+        return candidates
+
+    def _activity_client_communications(
+        self,
+        activity: Mapping[str, Any],
+        company_map: Mapping[str, int],
+        contact_map: Mapping[str, int],
+        lead_map: Mapping[str, int],
+        deal_map: Mapping[str, int],
+    ) -> tuple[list[dict[str, Any]], list[str], list[str]]:
+        """Build communications that point to the actual client, not owner lead/deal."""
+        mapped, unresolved = self._map_activity_communications(
+            activity.get("COMMUNICATIONS") or [], company_map, contact_map, lead_map, deal_map
+        )
+        warnings: list[str] = []
+        existing_clients = [
+            item for item in mapped
+            if int(item.get("ENTITY_TYPE_ID") or 0) in {3, 4}
+        ]
+        dropped_owner_links = [
+            item for item in mapped
+            if int(item.get("ENTITY_TYPE_ID") or 0) in {1, 2}
+        ]
+        if dropped_owner_links:
+            warnings.append("lead/deal communication replaced by actual client")
+
+        self.load_source("Companies", "Contacts")
+        source_rows = {
+            4: {text(row.get("ID")): row for row in self._source["Companies"]},
+            3: {text(row.get("ID")): row for row in self._source["Contacts"]},
+        }
+
+        result: list[dict[str, Any]] = []
+        seen: set[tuple[int, int, str, str]] = set()
+
+        def append(item: Mapping[str, Any]) -> None:
+            entity_type = int(item.get("ENTITY_TYPE_ID") or 0)
+            entity_id = int(item.get("ENTITY_ID") or 0)
+            communication_type = text(item.get("TYPE"))
+            value = text(item.get("VALUE"))
+            key = (entity_type, entity_id, communication_type, value)
+            if entity_type in {3, 4} and entity_id and key not in seen:
+                seen.add(key)
+                result.append(dict(item))
+
+        for old_type, old_id in self._activity_source_client_candidates(activity):
+            target_id = company_map.get(old_id) if old_type == 4 else contact_map.get(old_id)
+            if not target_id:
+                continue
+            matching = [
+                item for item in existing_clients
+                if int(item.get("ENTITY_TYPE_ID") or 0) == old_type
+                and int(item.get("ENTITY_ID") or 0) == int(target_id)
+            ]
+            if matching:
+                for item in matching:
+                    append(item)
+                continue
+            source_row = source_rows.get(old_type, {}).get(old_id, {})
+            communication_type, value = self._first_communication_value(source_row)
+            append({
+                "TYPE": communication_type,
+                "VALUE": value,
+                "ENTITY_TYPE_ID": old_type,
+                "ENTITY_ID": int(target_id),
+            })
+
+        for item in existing_clients:
+            append(item)
+
+        if not result:
+            warnings.append("actual client communication is unavailable; Client column will be empty")
+        return result, unresolved, warnings
+
+    def _ensure_activity_client_communications(
+        self, old_id: str, target_id: int, communications: Sequence[Mapping[str, Any]]
+    ) -> None:
+        """Repair already-created activities during an idempotent rerun."""
+        if not communications:
+            return
+        try:
+            self.client.call(
+                "crm.activity.update",
+                {"id": target_id, "fields": {"COMMUNICATIONS": [dict(item) for item in communications]}},
+            )
+            self.report.add(
+                "update_activity_client", "ACTIVITY", old_id, "ACTIVITY", target_id, "OK",
+                "Client communication points to contact/company",
+            )
+        except Exception as exc:
+            self.report.add(
+                "update_activity_client", "ACTIVITY", old_id, "ACTIVITY", target_id, "WARN", str(exc)
+            )
+
+    @staticmethod
     def _unresolved_communications_note(
         rows: Iterable[Mapping[str, Any]], unresolved: Iterable[str]
     ) -> str:
@@ -3310,7 +3502,9 @@ class MigrationProject:
             if not bindings:
                 self.report.add("create_activity", "ACTIVITY", old_id, "ACTIVITY", "", "SKIP", "Пропущено: no mapped CRM owner/binding")
                 continue
-            communications, unresolved_communications = self._map_activity_communications(activity.get("COMMUNICATIONS") or [], company_map, contact_map, lead_map, deal_map)
+            communications, unresolved_communications, client_warnings = self._activity_client_communications(
+                activity, company_map, contact_map, lead_map, deal_map
+            )
             communication_note = self._unresolved_communications_note(
                 activity.get("COMMUNICATIONS") or [], unresolved_communications
             )
@@ -3318,6 +3512,10 @@ class MigrationProject:
                 self.report.add(
                     "prepare_activity", "ACTIVITY", old_id, "ACTIVITY", "", "WARN",
                     "unresolved CRM communications omitted: " + ", ".join(unresolved_communications),
+                )
+            for client_warning in client_warnings:
+                self.report.add(
+                    "prepare_activity", "ACTIVITY", old_id, "ACTIVITY", "", "WARN", client_warning
                 )
             files = self._activity_files(activity)
             if old_id in existing:
@@ -3352,6 +3550,9 @@ class MigrationProject:
                         details={"owner_type_id": owner_type},
                     )
                 self._ensure_activity_bindings(old_id, target_id, bindings)
+                self._ensure_activity_client_communications(
+                    old_id, target_id, preview_fields.get("COMMUNICATIONS") or []
+                )
                 self._ensure_activity_files(old_id, target_id, files)
                 continue
             responsible = self._required_user(activity.get("RESPONSIBLE_ID"), user_map, "prepare_activity", "ACTIVITY", old_id, "responsible")

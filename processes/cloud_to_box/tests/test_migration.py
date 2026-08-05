@@ -614,3 +614,77 @@ def test_report_writes_task_preview_and_direct_url(tmp_path: Path) -> None:
     assert "/company/personal/user/4/tasks/task/view/77/" in preview
     created = (tmp_path / "created_objects.csv").read_text(encoding="utf-8-sig")
     assert "/company/personal/user/4/tasks/task/view/77/" in created
+
+
+def test_activity_client_is_company_contact_not_owner_lead(tmp_path: Path) -> None:
+    p = project(tmp_path)
+    p.load_source("CRM_Activities")
+    activity = next(row for row in p._source["CRM_Activities"] if str(row.get("ID")) == "6")
+    communications, unresolved, warnings = p._activity_client_communications(
+        activity,
+        company_map={"18": 1800},
+        contact_map={"20": 2000},
+        lead_map={"DEAL:22:LEAD": 2200},
+        deal_map={},
+    )
+    assert unresolved == []
+    assert communications
+    assert communications[0]["ENTITY_TYPE_ID"] == 4
+    assert communications[0]["ENTITY_ID"] == 1800
+    assert any(
+        item["ENTITY_TYPE_ID"] == 3 and item["ENTITY_ID"] == 2000
+        for item in communications
+    )
+    assert not any(int(item["ENTITY_TYPE_ID"]) in {1, 2} for item in communications)
+    assert not any("unavailable" in warning for warning in warnings)
+
+
+def test_activity_owner_communication_is_removed_when_contact_exists(tmp_path: Path) -> None:
+    p = project(tmp_path)
+    p.load_source("CRM_Activities")
+    activity = next(row for row in p._source["CRM_Activities"] if str(row.get("ID")) == "2")
+    communications, unresolved, warnings = p._activity_client_communications(
+        activity,
+        company_map={},
+        contact_map={"2": 2000},
+        lead_map={},
+        deal_map={"2": 2200},
+    )
+    assert unresolved == []
+    assert communications
+    assert {int(item["ENTITY_TYPE_ID"]) for item in communications} == {3}
+    assert {int(item["ENTITY_ID"]) for item in communications} == {2000}
+    assert any("replaced" in warning for warning in warnings)
+
+
+class _ActivityUpdateClient:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def call(self, method, params=None):
+        self.calls.append((method, params or {}))
+        return True
+
+
+def test_existing_activity_client_is_repaired_on_rerun(tmp_path: Path) -> None:
+    p = project(tmp_path)
+    client = _ActivityUpdateClient()
+    p.client = client
+    p._ensure_activity_client_communications(
+        "6", 6006, [{"TYPE": "PHONE", "VALUE": "+77010000000", "ENTITY_TYPE_ID": 4, "ENTITY_ID": 1800}]
+    )
+    assert client.calls == [
+        (
+            "crm.activity.update",
+            {
+                "id": 6006,
+                "fields": {
+                    "COMMUNICATIONS": [
+                        {"TYPE": "PHONE", "VALUE": "+77010000000", "ENTITY_TYPE_ID": 4, "ENTITY_ID": 1800}
+                    ]
+                },
+            },
+        )
+    ]
+    assert p.report.actions[-1]["operation"] == "update_activity_client"
+    assert p.report.actions[-1]["status"] == "OK"
