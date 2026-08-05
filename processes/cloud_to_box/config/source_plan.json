@@ -18,10 +18,15 @@
   "source_deals_kept_as_deals": 10,
   "expected_target_leads_total": 1233,
   "expected_target_deals_total": 10,
-  "expected_tasks": 597,
+  "expected_tasks": 589,
+  "skipped_tasks": 8,
+  "skipped_tasks_by_source_user": {
+    "10": 5,
+    "28": 3
+  },
   "expected_activities": 134,
   "known_task_file_references": 27,
-  "reported_task_comments": 1389,
+  "reported_task_comments": 1328,
   "known_activity_file_references": 1,
   "route_breakdown": {
     "UC_2DA5PB->lead:UC_P6PL43": 62,

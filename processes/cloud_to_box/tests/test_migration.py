@@ -47,10 +47,26 @@ def test_plan_expected_counts(tmp_path: Path) -> None:
     plan = project(tmp_path).source_plan()
     assert plan["expected_target_leads_total"] == 1233
     assert plan["expected_target_deals_total"] == 10
-    assert plan["expected_tasks"] == 597
+    assert plan["expected_tasks"] == 589
+    assert plan["skipped_tasks"] == 8
+    assert plan["skipped_tasks_by_source_user"] == {"10": 5, "28": 3}
     assert plan["expected_activities"] == 134
     assert plan["source_counts"]["Leads"] == 4
 
+
+
+def test_context_user_assignment_and_task_exclusions(tmp_path: Path) -> None:
+    p = project(tmp_path)
+    assert p._context_user_target("36", "crm", {}) == 21
+    assert p._context_user_target("36", "task", {}) == 4
+    assert p._context_user_target("96", "crm", {}) == 21
+    assert p._context_user_target("96", "task", {}) == 4
+
+    p.load_source("Tasks")
+    skipped = [row for row in p._source["Tasks"] if p._task_skip_reason(row)]
+    assert len(skipped) == 8
+    assert {user for row in skipped for user in p._task_skip_users(row)} == {"10", "28"}
+    assert not any("36" in p._task_skip_users(row) for row in p._source["Tasks"])
 
 def test_converted_test_lead_aliases(tmp_path: Path) -> None:
     aliases = project(tmp_path)._converted_lead_to_deal()

@@ -112,6 +112,8 @@ class MigrationProject:
         self._target_lead_enum_value_to_id: dict[str, str] = {}
         self._target_users: list[dict[str, Any]] = []
         self._user_overrides = self._load_user_overrides()
+        self._context_user_overrides = self._load_context_user_overrides()
+        self._skip_task_user_ids = {text(value) for value in self.config.get("user_assignment", {}).get("skip_tasks_if_participant_source_user_ids", [])}
         self._product_encoded: dict[str, Any] = {}
         self._current_target_user_id = 0
         self._converted_lead_aliases: dict[str, str] | None = None
@@ -137,6 +139,63 @@ class MigrationProject:
             if source_id and target_id.isdigit():
                 result[source_id] = int(target_id)
         return result
+
+    def _load_context_user_overrides(self) -> dict[str, dict[str, int]]:
+        result: dict[str, dict[str, int]] = {}
+        raw = self.config.get("user_assignment", {}).get("context_overrides", {})
+        if not isinstance(raw, dict):
+            return result
+        for source_id, contexts in raw.items():
+            if not isinstance(contexts, dict):
+                continue
+            parsed: dict[str, int] = {}
+            for context in ("crm", "task"):
+                value = contexts.get(context)
+                if str(value or "").isdigit():
+                    parsed[context] = int(value)
+            if parsed:
+                result[text(source_id)] = parsed
+        return result
+
+    def _task_participant_ids(self, row: Mapping[str, Any]) -> set[str]:
+        values = [
+            row.get("createdBy"),
+            row.get("responsibleId"),
+            *(row.get("accomplices") or []),
+            *(row.get("auditors") or []),
+        ]
+        return {text(value) for value in values if text(value)}
+
+    def _task_skip_users(self, row: Mapping[str, Any]) -> list[str]:
+        return sorted(self._task_participant_ids(row) & self._skip_task_user_ids, key=lambda value: int(value) if value.isdigit() else value)
+
+    def _task_skip_reason(self, row: Mapping[str, Any]) -> str:
+        users = self._task_skip_users(row)
+        if not users:
+            return ""
+        return f"task excluded by configured source users: {users}"
+
+    def _context_user_target(self, source_id: Any, context: str, user_map: Mapping[str, int]) -> int | None:
+        key = text(source_id)
+        override = self._context_user_overrides.get(key, {}).get(context)
+        if override:
+            return int(override)
+        target = user_map.get(key)
+        return int(target) if target else None
+
+    def _required_source_user_ids(self) -> set[str]:
+        self.load_source("Companies", "Contacts", "Leads", "Deals", "Tasks", "CRM_Activities")
+        required: set[str] = set()
+        for name in ("Companies", "Contacts", "Deals"):
+            required.update(text(row.get("ASSIGNED_BY_ID")) for row in self._source[name] if text(row.get("ASSIGNED_BY_ID")))
+        if not self.config.get("skip_original_leads", True):
+            required.update(text(row.get("ASSIGNED_BY_ID")) for row in self._source["Leads"] if text(row.get("ASSIGNED_BY_ID")))
+        required.update(text(row.get("RESPONSIBLE_ID")) for row in self._source["CRM_Activities"] if text(row.get("RESPONSIBLE_ID")))
+        for row in self._source["Tasks"]:
+            if self._task_skip_reason(row):
+                continue
+            required.update(self._task_participant_ids(row))
+        return required
 
     def load_source(self, *datasets: str) -> None:
         needed = [name for name in datasets if name not in self._source]
@@ -288,8 +347,14 @@ class MigrationProject:
             kind, target_status = self.route_source_deal(deal)
             route_counts[kind] += 1
             stage_routes[f"{deal.get('STAGE_ID')}->{kind}:{target_status}"] += 1
-        task_files = sum(len(row.get("ufTaskWebdavFiles") or []) for row in self._source["Tasks"])
-        task_comments = sum(int(row.get("commentsCount") or 0) for row in self._source["Tasks"])
+        included_tasks = [row for row in self._source["Tasks"] if not self._task_skip_reason(row)]
+        skipped_tasks = [row for row in self._source["Tasks"] if self._task_skip_reason(row)]
+        skipped_by_user: Counter[str] = Counter()
+        for row in skipped_tasks:
+            for source_user_id in self._task_skip_users(row):
+                skipped_by_user[source_user_id] += 1
+        task_files = sum(len(row.get("ufTaskWebdavFiles") or []) for row in included_tasks)
+        task_comments = sum(int(row.get("commentsCount") or 0) for row in included_tasks)
         activity_files = sum(len(row.get("FILES") or []) for row in self._source["CRM_Activities"])
         original_leads = 0 if self.config.get("skip_original_leads", True) else len(self._source["Leads"])
         plan = {
@@ -299,7 +364,9 @@ class MigrationProject:
             "source_deals_kept_as_deals": route_counts["deal"],
             "expected_target_leads_total": original_leads + route_counts["lead"],
             "expected_target_deals_total": route_counts["deal"],
-            "expected_tasks": len(self._source["Tasks"]),
+            "expected_tasks": len(included_tasks),
+            "skipped_tasks": len(skipped_tasks),
+            "skipped_tasks_by_source_user": dict(skipped_by_user),
             "expected_activities": len(self._source["CRM_Activities"]),
             "known_task_file_references": task_files,
             "reported_task_comments": task_comments,
@@ -331,17 +398,33 @@ class MigrationProject:
             self._target_users = self.client.list_all("user.get", {})
         target_by_id = {int(row["ID"]): row for row in self._target_users if str(row.get("ID", "")).isdigit()}
         target_active = [row for row in self._target_users if bool_y(row.get("ACTIVE", "Y")) or row.get("ACTIVE") is True]
+        active_target_ids = {int(row["ID"]) for row in target_active if str(row.get("ID", "")).isdigit()}
         by_email = {self._user_email(row): row for row in target_active if self._user_email(row)}
         by_signature: dict[tuple[str, ...], list[dict[str, Any]]] = defaultdict(list)
         for row in target_active:
             signature = self._user_signature(row)
             if signature:
                 by_signature[signature].append(row)
+        required_ids = self._required_source_user_ids()
         result: dict[str, int] = {}
         unresolved: list[dict[str, Any]] = []
+        unused_unresolved: list[dict[str, Any]] = []
         ambiguous: list[dict[str, Any]] = []
         for source in self._source["Users"]:
             source_id = text(source.get("ID"))
+            context_override = self._context_user_overrides.get(source_id)
+            if context_override:
+                invalid = {context: target_id for context, target_id in context_override.items() if target_id not in active_target_ids}
+                if invalid:
+                    self.report.add("map_user", "USER", source_id, "USER", "", "ERROR", f"context target user not found or inactive: {invalid}")
+                    unresolved.append(source)
+                    continue
+                default_target = context_override.get("crm") or context_override.get("task")
+                if default_target:
+                    result[source_id] = int(default_target)
+                detail = ", ".join(f"{context}={target_id}" for context, target_id in sorted(context_override.items()))
+                self.report.add("map_user", "USER", source_id, "USER", default_target or "", "OK", f"context override: {detail}")
+                continue
             override = self._user_overrides.get(source_id)
             if override:
                 target = target_by_id.get(override)
@@ -365,28 +448,38 @@ class MigrationProject:
                 result[source_id] = int(target["ID"])
                 self.report.add("map_user", "USER", source_id, "USER", target["ID"], "OK", "name tokens; order ignored")
             elif len(matches) > 1:
-                ambiguous.append({"source": source, "target_ids": [item.get("ID") for item in matches]})
-                self.report.add("map_user", "USER", source_id, "USER", "", "ERROR", f"ambiguous name match: {[item.get('ID') for item in matches]}")
+                if source_id not in required_ids:
+                    unused_unresolved.append(source)
+                    self.report.add("map_user", "USER", source_id, "USER", "", "SKIP", f"unused source user; ambiguous matches {[item.get('ID') for item in matches]}")
+                else:
+                    ambiguous.append({"source": source, "target_ids": [item.get("ID") for item in matches]})
+                    self.report.add("map_user", "USER", source_id, "USER", "", "ERROR", f"ambiguous name match: {[item.get('ID') for item in matches]}")
             else:
-                unresolved.append(source)
-                self.report.add("map_user", "USER", source_id, "USER", "", "ERROR", "no email or unique name match")
+                if source_id not in required_ids:
+                    unused_unresolved.append(source)
+                    self.report.add("map_user", "USER", source_id, "USER", "", "SKIP", "source user is not used by imported objects")
+                else:
+                    unresolved.append(source)
+                    self.report.add("map_user", "USER", source_id, "USER", "", "ERROR", "no email or unique name match")
         self.report.maps["users"].update(result)
         self.report.extra["user_mapping"] = {
             "source_users": len(self._source["Users"]),
             "mapped": len(result),
             "unresolved": [text(row.get("ID")) for row in unresolved],
+            "unused_unresolved": [text(row.get("ID")) for row in unused_unresolved],
+            "context_overrides": self._context_user_overrides,
             "ambiguous": [{"source_id": text(item["source"].get("ID")), "target_ids": item["target_ids"]} for item in ambiguous],
         }
         if strict and (unresolved or ambiguous):
-            LOG.warning("Some source users are not mapped; only objects depending on them will be skipped")
+            LOG.warning("Some required source users are not mapped; only objects depending on them will be skipped")
         return result
 
-    def _required_user(self, source_id: Any, user_map: Mapping[str, int], operation: str, source_type: str, object_id: Any, role: str) -> int | None:
+    def _required_user(self, source_id: Any, user_map: Mapping[str, int], operation: str, source_type: str, object_id: Any, role: str, *, context: str = "crm") -> int | None:
         key = text(source_id)
-        target = user_map.get(key)
+        target = self._context_user_target(key, context, user_map)
         if target:
             return int(target)
-        self.report.add(operation, source_type, object_id, "USER", "", "ERROR", f"unmapped {role} source user {key}")
+        self.report.add(operation, source_type, object_id, "USER", "", "ERROR", f"unmapped {role} source user {key} for {context}")
         return None
 
     # ---------- entity preparation ----------
@@ -788,6 +881,10 @@ class MigrationProject:
 
         for row in tasks:
             old_id = text(row.get("id"))
+            skip_reason = self._task_skip_reason(row)
+            if skip_reason:
+                self.report.add("create_task", "TASK", old_id, "TASK", "", "SKIP", skip_reason)
+                continue
             problems: list[str] = []
             ids = [
                 row.get("createdBy"),
@@ -795,7 +892,7 @@ class MigrationProject:
                 *(row.get("accomplices") or []),
                 *(row.get("auditors") or []),
             ]
-            missing = sorted({text(item) for item in ids if text(item) and text(item) not in user_map})
+            missing = sorted({text(item) for item in ids if text(item) and not self._context_user_target(item, "task", user_map)})
             if missing:
                 problems.append(f"unmapped users: {missing}")
 
@@ -835,7 +932,7 @@ class MigrationProject:
         for row in activities:
             old_id = text(row.get("ID"))
             problems: list[str] = []
-            if text(row.get("RESPONSIBLE_ID")) not in user_map:
+            if not self._context_user_target(row.get("RESPONSIBLE_ID"), "crm", user_map):
                 problems.append(f"unmapped responsible: {text(row.get('RESPONSIBLE_ID'))}")
             bindings, unresolved_bindings = self._activity_bindings(
                 row, company_map, contact_map, lead_map, deal_map
@@ -1454,7 +1551,7 @@ class MigrationProject:
                 or " ".join(filter(None, [text(source_user.get("NAME")), text(source_user.get("LAST_NAME"))])).strip()
                 or source_author
             )
-            author_id = user_map.get(source_author)
+            author_id = self._context_user_target(source_author, "task", user_map)
             prefix = ""
             if not author_id:
                 prefix = f"Исходный автор: {author_label}\n"
@@ -1560,8 +1657,9 @@ class MigrationProject:
                 members = []
                 for member in item.get("MEMBERS") or []:
                     source_user = text(member.get("ID")) if isinstance(member, dict) else text(member)
-                    if source_user in user_map:
-                        members.append(user_map[source_user])
+                    target_user = self._context_user_target(source_user, "task", user_map)
+                    if target_user:
+                        members.append(target_user)
                 fields = {
                     "PARENT_ID": parent_id,
                     "TITLE": text(item.get("TITLE")),
@@ -1652,6 +1750,10 @@ class MigrationProject:
         task_map = dict(self.report.maps["tasks"])
         for row in rows:
             old_id = text(row.get("id")); parent_old = text(row.get("parentId"))
+            skip_reason = self._task_skip_reason(row)
+            if skip_reason:
+                self.report.add("create_task", "TASK", old_id, "TASK", "", "SKIP", skip_reason)
+                continue
             if old_id in existing:
                 target_id = existing[old_id]
                 task_map[old_id] = target_id
@@ -1663,19 +1765,19 @@ class MigrationProject:
                 self._import_task_comments(old_id, target_id, user_map)
                 self._set_task_status(old_id, target_id, text(row.get("status")))
                 continue
-            created_by = self._required_user(row.get("createdBy"), user_map, "prepare_task", "TASK", old_id, "creator")
-            responsible = self._required_user(row.get("responsibleId"), user_map, "prepare_task", "TASK", old_id, "responsible")
+            created_by = self._required_user(row.get("createdBy"), user_map, "prepare_task", "TASK", old_id, "creator", context="task")
+            responsible = self._required_user(row.get("responsibleId"), user_map, "prepare_task", "TASK", old_id, "responsible", context="task")
             accomplices = []
             auditors = []
             missing = False
             for source_user in row.get("accomplices") or []:
-                target_user = self._required_user(source_user, user_map, "prepare_task", "TASK", old_id, "accomplice")
+                target_user = self._required_user(source_user, user_map, "prepare_task", "TASK", old_id, "accomplice", context="task")
                 if not target_user:
                     missing = True
                 else:
                     accomplices.append(target_user)
             for source_user in row.get("auditors") or []:
-                target_user = self._required_user(source_user, user_map, "prepare_task", "TASK", old_id, "auditor")
+                target_user = self._required_user(source_user, user_map, "prepare_task", "TASK", old_id, "auditor", context="task")
                 if not target_user:
                     missing = True
                 else:

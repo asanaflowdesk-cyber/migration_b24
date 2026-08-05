@@ -87,5 +87,23 @@
       "source_deal_field": "UF_CRM_1781611791954",
       "target_deal_field": "UF_CRM_1785508290845"
     }
+  },
+  "user_assignment": {
+    "context_overrides": {
+      "36": {
+        "crm": 21,
+        "task": 4,
+        "label": "Sacheva Alena"
+      },
+      "96": {
+        "crm": 21,
+        "task": 4,
+        "label": "Тестовый Сотрудник"
+      }
+    },
+    "skip_tasks_if_participant_source_user_ids": [
+      "10",
+      "28"
+    ]
   }
 }
