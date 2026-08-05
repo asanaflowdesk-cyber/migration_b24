@@ -5,7 +5,7 @@ from common.bitrix import BitrixClient
 from src.dump_reader import DumpReader
 from src.file_transfer import FileTransfer
 from src.live_source import LiveCloudSource
-from src.migration import MigrationProject, migration_marker, normalize_name_tokens, parse_marker
+from src.migration import MigrationProject, migration_marker, normalize_name_tokens, parse_marker, resolve_requisite_preset
 from src.reporting import Report
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -469,3 +469,45 @@ def test_dry_run_builds_requisites_relations_tasks_and_activities(tmp_path: Path
 
     p.import_all(dry_run=True, max_items=0)
     assert calls == ["requisites", "relations", "tasks_activities"]
+
+
+def test_requisite_preset_maps_legal_entity_alias() -> None:
+    target = [
+        {"ID": "1", "NAME": "Организация", "ENTITY_TYPE_ID": "4", "XML_ID": ""},
+        {"ID": "3", "NAME": "Физ. лицо", "ENTITY_TYPE_ID": "3", "XML_ID": ""},
+    ]
+    preset_id, reason = resolve_requisite_preset(
+        {"NAME": "Юр. лицо", "XML_ID": ""},
+        "4",
+        target,
+    )
+    assert preset_id == 1
+    assert reason == "semantic alias"
+
+
+def test_requisite_preset_uses_unique_owner_type() -> None:
+    target = [
+        {"ID": "7", "NAME": "Контрагент KZ", "ENTITY_TYPE_ID": "4", "XML_ID": ""},
+        {"ID": "3", "NAME": "Физ. лицо", "ENTITY_TYPE_ID": "3", "XML_ID": ""},
+    ]
+    preset_id, reason = resolve_requisite_preset(
+        {"NAME": "Неизвестное название", "XML_ID": ""},
+        "4",
+        target,
+    )
+    assert preset_id == 7
+    assert reason == "unique owner type"
+
+
+def test_requisite_preset_does_not_guess_multiple_company_presets() -> None:
+    target = [
+        {"ID": "1", "NAME": "Организация", "ENTITY_TYPE_ID": "4", "XML_ID": ""},
+        {"ID": "2", "NAME": "ИП", "ENTITY_TYPE_ID": "4", "XML_ID": ""},
+    ]
+    preset_id, reason = resolve_requisite_preset(
+        {"NAME": "Неизвестное название", "XML_ID": ""},
+        "4",
+        target,
+    )
+    assert preset_id is None
+    assert "ambiguous target presets" in reason

@@ -40,6 +40,80 @@ def normalize_text(value: Any) -> str:
     return " ".join(text(value).strip().casefold().replace("ё", "е").split())
 
 
+PRESET_NAME_ALIASES = {
+    "3": {
+        "физ лицо",
+        "физическое лицо",
+        "персона",
+        "частное лицо",
+        "individual",
+        "person",
+    },
+    "4": {
+        "юр лицо",
+        "юридическое лицо",
+        "организация",
+        "компания",
+        "legal entity",
+        "company",
+        "organization",
+    },
+}
+
+
+def normalize_preset_label(value: Any) -> str:
+    normalized = normalize_text(value)
+    normalized = normalized.replace("юр.", "юр ").replace("физ.", "физ ")
+    normalized = re.sub(r"[^0-9a-zа-я]+", " ", normalized, flags=re.IGNORECASE)
+    return " ".join(normalized.split())
+
+
+def resolve_requisite_preset(
+    source_preset: Mapping[str, Any],
+    source_entity_type: Any,
+    target_presets: Sequence[Mapping[str, Any]],
+) -> tuple[int | None, str]:
+    """Resolve a box requisite preset without relying on identical portal labels.
+
+    Priority: XML_ID, normalized exact label, semantic alias for the same owner
+    type, then a unique preset for the same ENTITY_TYPE_ID. Multiple possible
+    presets are never guessed.
+    """
+    entity_type = text(source_entity_type)
+    valid = [
+        row for row in target_presets
+        if text(row.get("ID")).isdigit()
+    ]
+
+    source_xml = text(source_preset.get("XML_ID")).strip()
+    if source_xml:
+        xml_matches = [row for row in valid if text(row.get("XML_ID")).strip() == source_xml]
+        if len(xml_matches) == 1:
+            return int(xml_matches[0]["ID"]), "XML_ID"
+
+    source_name = normalize_preset_label(source_preset.get("NAME"))
+    if source_name:
+        exact = [row for row in valid if normalize_preset_label(row.get("NAME")) == source_name]
+        if len(exact) == 1:
+            return int(exact[0]["ID"]), "exact name"
+
+    same_type = [row for row in valid if text(row.get("ENTITY_TYPE_ID")) == entity_type]
+    aliases = PRESET_NAME_ALIASES.get(entity_type, set())
+    source_is_alias = source_name in aliases
+    if source_is_alias:
+        alias_matches = [row for row in same_type if normalize_preset_label(row.get("NAME")) in aliases]
+        if len(alias_matches) == 1:
+            return int(alias_matches[0]["ID"]), "semantic alias"
+
+    if len(same_type) == 1:
+        return int(same_type[0]["ID"]), "unique owner type"
+
+    candidate_names = ", ".join(
+        f"{row.get('ID')}:{row.get('NAME')}" for row in same_type
+    ) or "none"
+    return None, f"ambiguous target presets for ENTITY_TYPE_ID={entity_type}: {candidate_names}"
+
+
 def normalize_name_tokens(*values: Any) -> tuple[str, ...]:
     merged = " ".join(text(value) for value in values).casefold().replace("ё", "е")
     tokens = re.findall(r"[\w'-]+", merged, flags=re.UNICODE)
@@ -1121,12 +1195,21 @@ class MigrationProject:
                 self.report.add("create_requisite", "REQUISITE", old_id, "REQUISITE", "", "SKIP", "owner company/contact was not mapped")
                 continue
             source_preset = source_presets.get(text(row.get("PRESET_ID")), {})
-            target_preset = (
-                preset_by_xml.get(text(source_preset.get("XML_ID")))
-                or preset_by_name.get(normalize_text(source_preset.get("NAME")))
+            target_preset, preset_match = resolve_requisite_preset(
+                source_preset,
+                source_entity_type,
+                target_presets,
             )
             if not target_preset:
-                self.report.add("create_requisite", "REQUISITE", old_id, "REQUISITE", "", "SKIP", f"target preset not found: {source_preset.get('NAME')}")
+                self.report.add(
+                    "create_requisite",
+                    "REQUISITE",
+                    old_id,
+                    "REQUISITE",
+                    "",
+                    "SKIP",
+                    f"target preset not resolved: {source_preset.get('NAME')}; {preset_match}",
+                )
                 continue
             fields = self._copy_standard_fields(
                 "requisite",
@@ -1667,9 +1750,21 @@ class MigrationProject:
                 self.report.add("create_requisite", "REQUISITE", old_id, "REQUISITE", req_map[old_id], "SKIP", "XML_ID exists")
                 continue
             src_preset = source_preset.get(text(row.get("PRESET_ID")), {})
-            target_preset = preset_by_xml.get(text(src_preset.get("XML_ID"))) or preset_by_name.get(normalize_text(src_preset.get("NAME")))
+            target_preset, preset_match = resolve_requisite_preset(
+                src_preset,
+                source_entity_type,
+                target_presets,
+            )
             if not target_preset:
-                self.report.add("create_requisite", "REQUISITE", old_id, "REQUISITE", "", "ERROR", f"preset not found: {src_preset.get('NAME')}")
+                self.report.add(
+                    "create_requisite",
+                    "REQUISITE",
+                    old_id,
+                    "REQUISITE",
+                    "",
+                    "SKIP",
+                    f"target preset not resolved: {src_preset.get('NAME')}; {preset_match}",
+                )
                 continue
             fields = self._copy_standard_fields("requisite", row, excluded={"ENTITY_ID", "ENTITY_TYPE_ID", "PRESET_ID", "XML_ID"})
             fields.update({"ENTITY_ID": target_entity, "ENTITY_TYPE_ID": int(source_entity_type), "PRESET_ID": target_preset, "XML_ID": xml_id})
