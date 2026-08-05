@@ -167,7 +167,7 @@ class FileTransfer:
         """Build the Base64 fileData payload required by crm.activity.* fields."""
         raw_id = _text(source_id).strip().removeprefix("n")
         if not raw_id.isdigit():
-            self.report.add("read_activity_file", "FILE", raw_id, "CRM_FILE", "", "ERROR", "invalid numeric file reference")
+            self.report.add("read_activity_file", "FILE", raw_id, "CRM_FILE", "", "WARN", "invalid numeric file reference")
             return None
         candidates = ("attached", "disk") if prefer_attached else ("disk", "attached")
         errors: list[str] = []
@@ -187,7 +187,7 @@ class FileTransfer:
                 return resolved_key, upload_name, payload
             except Exception as exc:
                 errors.append(f"{kind}: {exc}")
-        self.report.add("read_activity_file", "FILE", raw_id, "CRM_FILE", "", "ERROR", "; ".join(errors))
+        self.report.add("read_activity_file", "FILE", raw_id, "CRM_FILE", "", "WARN", "; ".join(errors))
         return None
 
     def activity_payload_url(
@@ -199,7 +199,7 @@ class FileTransfer:
             payload = {"fileData": [upload_name, base64.b64encode(content).decode("ascii")]}
             return resolved_key, upload_name, payload
         except Exception as exc:
-            self.report.add("read_activity_file", "FILE", source_key, "CRM_FILE", "", "ERROR", str(exc))
+            self.report.add("read_activity_file", "FILE", source_key, "CRM_FILE", "", "WARN", str(exc))
             return None
 
     def transfer_reference(self, source_id: Any, *, prefer_attached: bool = True) -> int | None:
@@ -211,7 +211,7 @@ class FileTransfer:
         """
         raw_id = _text(source_id).strip().removeprefix("n")
         if not raw_id.isdigit():
-            self.report.add("transfer_file", "FILE", raw_id, "DISK_FILE", "", "ERROR", "invalid numeric file reference")
+            self.report.add("transfer_file", "FILE", raw_id, "DISK_FILE", "", "WARN", "invalid numeric file reference")
             return None
         candidates = ("attached", "disk") if prefer_attached else ("disk", "attached")
         errors: list[str] = []
@@ -236,7 +236,7 @@ class FileTransfer:
                 return target_id
             except Exception as exc:
                 errors.append(f"{kind}: {exc}")
-        self.report.add("transfer_file", "FILE", raw_id, "DISK_FILE", "", "ERROR", "; ".join(errors))
+        self.report.add("transfer_file", "FILE", raw_id, "DISK_FILE", "", "WARN", "; ".join(errors))
         return None
 
     def transfer_disk_file(self, source_file_id: Any) -> int | None:
@@ -253,5 +253,5 @@ class FileTransfer:
         try:
             return self._download_and_upload(key, url, name)
         except Exception as exc:
-            self.report.add("transfer_file", "FILE", source_key, "DISK_FILE", "", "ERROR", str(exc))
+            self.report.add("transfer_file", "FILE", source_key, "DISK_FILE", "", "WARN", str(exc))
             return None

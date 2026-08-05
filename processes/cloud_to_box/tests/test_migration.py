@@ -200,3 +200,61 @@ class _ClassicTaskChatClient:
 
 def test_task_chat_id_prefers_classic_rest() -> None:
     assert MigrationProject._task_chat_id(_ClassicTaskChatClient(), 2) == 123
+
+
+class _UnreadableCommentsSourceClient:
+    def call(self, method, params=None):
+        if method == "user.current":
+            return {"ID": "1"}
+        if method == "tasks.task.get":
+            return {"task": {"id": str((params or {}).get("taskId", 2)), "chatId": 3918}}
+        if method == "task.commentitem.getlist":
+            raise RuntimeError("old comments API unavailable")
+        if method == "im.dialog.messages.get":
+            return {"messages": [], "files": []}
+        if method == "disk.attachedObject.get":
+            return {"ID": str((params or {}).get("id", 1)), "OBJECT_ID": "10"}
+        if method == "crm.activity.get":
+            return {"ID": str((params or {}).get("id", 1))}
+        if method == "crm.activity.binding.list":
+            return []
+        raise AssertionError(f"Unexpected method: {method}")
+
+    def call_v3(self, method, params=None):
+        if method == "tasks.task.get":
+            return {"item": {"id": (params or {}).get("id", 2), "chat": {"id": 3918}}}
+        raise AssertionError(f"Unexpected v3 method: {method}")
+
+
+def test_live_source_unreadable_comments_are_non_blocking(tmp_path: Path) -> None:
+    p = project(tmp_path)
+    p.source_client = _UnreadableCommentsSourceClient()
+    result = p.validate_live_source()
+    assert result["ok"] is True
+    assert not result["errors"]
+    assert any("source_task_comments" in warning for warning in result["warnings"])
+    assert str(result["checks"]["source_task_comments"]).startswith("WARN:")
+
+
+def test_missing_task_comments_are_reported_as_warning(tmp_path: Path) -> None:
+    p = project(tmp_path)
+    p.source_client = object()
+    p.client = object()
+    p._source["Tasks"] = [
+        {"id": "2", "commentsCount": 3, "serviceCommentsCount": 1}
+    ]
+    p._fetch_task_comments = lambda client, task_id: []  # type: ignore[method-assign]
+    p._import_task_comments("2", 2002, {})
+    row = p.report.actions[-1]
+    assert row["operation"] == "copy_task_comments"
+    assert row["status"] == "WARN"
+    assert "2 comments reported" in row["message"]
+
+
+def test_invalid_file_reference_is_non_blocking_warning(tmp_path: Path) -> None:
+    p = project(tmp_path)
+    transfer = FileTransfer(object(), object(), p.report)
+    assert transfer.transfer_reference("not-a-file") is None
+    row = p.report.actions[-1]
+    assert row["operation"] == "transfer_file"
+    assert row["status"] == "WARN"

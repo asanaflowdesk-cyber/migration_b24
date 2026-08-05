@@ -733,11 +733,11 @@ class MigrationProject:
         return prepared
 
     def validate_live_source(self) -> dict[str, Any]:
-        """Confirm that the live cloud webhook can read data absent from the dump.
+        """Probe live-cloud enrichment endpoints without blocking the migration.
 
-        Comments, checklist attachments and binary files are copied directly from
-        the cloud portal, therefore an apply run must stop before writing anything
-        when that portal cannot be read.
+        The dump is sufficient for the main CRM objects and task/activity shells.
+        Comments, checklists and binary files are best-effort enrichment: failures
+        are written as warnings so available data can still be migrated.
         """
         if not self.source_client:
             raise RuntimeError("SOURCE_BITRIX_WEBHOOK_URL is required")
@@ -746,14 +746,16 @@ class MigrationProject:
         errors: list[str] = []
         warnings: list[str] = []
 
-        def check(label: str, callback: Any) -> Any:
+        def check(label: str, callback: Any, *, blocking: bool = False) -> Any:
             try:
                 value = callback()
                 checks[label] = "OK"
                 return value
             except Exception as exc:
-                checks[label] = f"ERROR: {exc}"
-                errors.append(f"{label}: {exc}")
+                prefix = "ERROR" if blocking else "WARN"
+                checks[label] = f"{prefix}: {exc}"
+                target = errors if blocking else warnings
+                target.append(f"{label}: {exc}")
                 return None
 
         check("source_user", lambda: self.source_client.call("user.current"))
@@ -782,8 +784,8 @@ class MigrationProject:
                     f"task {task_id} reports comments but none were returned after classic REST and REST 3.0 chat lookup; "
                     "check that SOURCE_BITRIX_WEBHOOK_URL includes the im scope and that its user is a participant of the task chat"
                 )
-                checks["source_task_comments"] = f"ERROR: {message}"
-                errors.append(f"source_task_comments: {message}")
+                checks["source_task_comments"] = f"WARN: {message}"
+                warnings.append(f"source_task_comments: {message}")
 
         task_with_file = next((row for row in self._source["Tasks"] if row.get("ufTaskWebdavFiles")), None)
         if task_with_file:
@@ -816,6 +818,17 @@ class MigrationProject:
         source_validation = self.validate_live_source()
         if not source_validation["ok"]:
             raise RuntimeError(f"Live cloud validation failed: {json.dumps(source_validation, ensure_ascii=False)}")
+        self.report.extra["best_effort_policy"] = {
+            "enabled": True,
+            "non_blocking": [
+                "source task comments",
+                "task and checklist files",
+                "task checklists",
+                "CRM activity files",
+                "live activity binding enrichment",
+            ],
+            "note": "Main objects continue to migrate; unavailable supplemental data is recorded as WARN.",
+        }
         user_map = self.build_user_map(strict=True)
         if not dry_run:
             self.file_transfer = FileTransfer(
@@ -888,7 +901,8 @@ class MigrationProject:
             if skip_reason:
                 self.report.add("create_task", "TASK", old_id, "TASK", "", "SKIP", skip_reason)
                 continue
-            problems: list[str] = []
+            blocking_problems: list[str] = []
+            warnings_for_row: list[str] = []
             ids = [
                 row.get("createdBy"),
                 row.get("responsibleId"),
@@ -897,11 +911,11 @@ class MigrationProject:
             ]
             missing = sorted({text(item) for item in ids if text(item) and not self._context_user_target(item, "task", user_map)})
             if missing:
-                problems.append(f"unmapped users: {missing}")
+                blocking_problems.append(f"unmapped users: {missing}")
 
             parent = text(row.get("parentId"))
             if parent not in {"", "0"} and parent not in source_task_ids:
-                problems.append(f"source parent task not found: {parent}")
+                blocking_problems.append(f"source parent task not found: {parent}")
 
             unresolved_crm = [
                 text(reference)
@@ -909,7 +923,7 @@ class MigrationProject:
                 if not self._map_crm_ref(text(reference), company_map, contact_map, lead_map, deal_map)
             ]
             if unresolved_crm:
-                problems.append(f"unresolved CRM links: {unresolved_crm}")
+                blocking_problems.append(f"unresolved CRM links: {unresolved_crm}")
 
             for source_file in row.get("ufTaskWebdavFiles") or []:
                 raw = text(source_file).removeprefix("n")
@@ -918,37 +932,45 @@ class MigrationProject:
                         raise ValueError(f"invalid file reference {source_file!r}")
                     self.source_client.call("disk.attachedObject.get", {"id": int(raw)})
                 except Exception as exc:
-                    problems.append(f"task file {source_file}: {exc}")
+                    warnings_for_row.append(f"task file {source_file}: {exc}")
 
             regular_comments = int(row.get("commentsCount") or 0) - int(row.get("serviceCommentsCount") or 0)
             if regular_comments > 0:
                 comments = self._fetch_task_comments(self.source_client, int(old_id))
                 if not comments:
-                    problems.append(f"{regular_comments} comments reported but none readable")
+                    warnings_for_row.append(f"{regular_comments} comments reported but none readable")
 
-            status = "ERROR" if problems else "DRY_RUN"
+            if blocking_problems:
+                status = "ERROR"
+                message = "; ".join(blocking_problems + (["WARN: " + "; ".join(warnings_for_row)] if warnings_for_row else []))
+            elif warnings_for_row:
+                status = "WARN"
+                message = "; ".join(warnings_for_row)
+            else:
+                status = "DRY_RUN"
+                message = text(row.get("title"))
             self.report.add(
-                "create_task", "TASK", old_id, "TASK", "", status,
-                "; ".join(problems) if problems else text(row.get("title")),
+                "create_task", "TASK", old_id, "TASK", "", status, message,
             )
 
         for row in activities:
             old_id = text(row.get("ID"))
-            problems: list[str] = []
+            blocking_problems: list[str] = []
+            warnings_for_row: list[str] = []
             if not self._context_user_target(row.get("RESPONSIBLE_ID"), "crm", user_map):
-                problems.append(f"unmapped responsible: {text(row.get('RESPONSIBLE_ID'))}")
+                blocking_problems.append(f"unmapped responsible: {text(row.get('RESPONSIBLE_ID'))}")
             bindings, unresolved_bindings = self._activity_bindings(
                 row, company_map, contact_map, lead_map, deal_map
             )
             if unresolved_bindings:
-                problems.append(f"unresolved CRM bindings: {unresolved_bindings}")
+                blocking_problems.append(f"unresolved CRM bindings: {unresolved_bindings}")
             if not bindings:
-                problems.append("no mapped CRM owner/binding")
+                blocking_problems.append("no mapped CRM owner/binding")
             _communications, unresolved_communications = self._map_activity_communications(
                 row.get("COMMUNICATIONS") or [], company_map, contact_map, lead_map, deal_map
             )
             if unresolved_communications:
-                problems.append(f"unresolved CRM communications: {unresolved_communications}")
+                blocking_problems.append(f"unresolved CRM communications: {unresolved_communications}")
             for index, item in enumerate(row.get("FILES") or []):
                 source_file = item.get("FILE_ID") or item.get("fileId") or item.get("id") if isinstance(item, dict) else item
                 if not source_file:
@@ -956,11 +978,18 @@ class MigrationProject:
                 try:
                     self.source_client.call("disk.file.get", {"id": int(source_file)})
                 except Exception as exc:
-                    problems.append(f"activity file {index}:{source_file}: {exc}")
-            status = "ERROR" if problems else "DRY_RUN"
+                    warnings_for_row.append(f"activity file {index}:{source_file}: {exc}")
+            if blocking_problems:
+                status = "ERROR"
+                message = "; ".join(blocking_problems + (["WARN: " + "; ".join(warnings_for_row)] if warnings_for_row else []))
+            elif warnings_for_row:
+                status = "WARN"
+                message = "; ".join(warnings_for_row)
+            else:
+                status = "DRY_RUN"
+                message = text(row.get("SUBJECT"))
             self.report.add(
-                "create_activity", "ACTIVITY", old_id, "ACTIVITY", "", status,
-                "; ".join(problems) if problems else text(row.get("SUBJECT")),
+                "create_activity", "ACTIVITY", old_id, "ACTIVITY", "", status, message,
             )
 
     # ---------- relations and requisites ----------
@@ -1294,7 +1323,7 @@ class MigrationProject:
                 self.report.add("attach_task_file", "TASK_FILE", f"{old_task_id}:{file_id}", "TASK", target_task_id, "OK", f"{context}; REST 3.0")
         except Exception as exc:
             for file_id in failed_old:
-                self.report.add("attach_task_file", "TASK_FILE", f"{old_task_id}:{file_id}", "TASK", target_task_id, "ERROR", f"{context}; classic and REST 3.0 failed: {exc}")
+                self.report.add("attach_task_file", "TASK_FILE", f"{old_task_id}:{file_id}", "TASK", target_task_id, "WARN", f"{context}; classic and REST 3.0 failed: {exc}")
 
     def _send_task_chat_message(self, target_task_id: int, message: str) -> int:
         result = self.client.call_v3(
@@ -1592,6 +1621,21 @@ class MigrationProject:
 
     def _import_task_comments(self, old_task_id: str, target_task_id: int, user_map: Mapping[str, int]) -> None:
         source_comments = self._fetch_task_comments(self.source_client, int(old_task_id))
+        source_task = next(
+            (row for row in self._source.get("Tasks", []) if text(row.get("id")) == text(old_task_id)),
+            {},
+        )
+        expected_comments = max(
+            0,
+            int(source_task.get("commentsCount") or 0)
+            - int(source_task.get("serviceCommentsCount") or 0),
+        )
+        if expected_comments and not source_comments:
+            self.report.add(
+                "copy_task_comments", "TASK", old_task_id, "TASK", target_task_id, "WARN",
+                f"{expected_comments} comments reported by the dump but unavailable through the source API; task migrated without them",
+            )
+            return
         target_comments = self._fetch_task_comments(self.client, target_task_id)
         target_text = "\n".join(self._comment_values(item)[1] for item in target_comments)
         for index, comment in enumerate(source_comments):
@@ -1671,13 +1715,13 @@ class MigrationProject:
                     f"{fallback_method} used after: {first_exc}; retry: {retry_exc}",
                 )
             except Exception as chat_exc:
-                self.report.add("create_task_comment", "TASK_COMMENT", map_key, "TASK", target_task_id, "ERROR", f"classic: {first_exc}; retry: {retry_exc}; chat: {chat_exc}")
+                self.report.add("create_task_comment", "TASK_COMMENT", map_key, "TASK", target_task_id, "WARN", f"classic: {first_exc}; retry: {retry_exc}; chat: {chat_exc}")
 
     def _import_task_checklist(self, old_task_id: str, target_task_id: int, user_map: Mapping[str, int]) -> None:
         try:
             items = self.source_client.call("task.checklistitem.getlist", {"TASKID": int(old_task_id), "ORDER": {"SORT_INDEX": "ASC"}}) or []
         except Exception as exc:
-            self.report.add("create_checklist", "TASK", old_task_id, "TASK", target_task_id, "ERROR", str(exc))
+            self.report.add("create_checklist", "TASK", old_task_id, "TASK", target_task_id, "WARN", str(exc))
             return
         if not isinstance(items, list):
             return
@@ -1737,7 +1781,7 @@ class MigrationProject:
                         self.report.maps["checklist_items"][f"{old_task_id}:{old_id}"] = new_id
                     self.report.add("create_checklist", "CHECKLIST", f"{old_task_id}:{old_id}", "CHECKLIST", new_id, "OK", "")
                 except Exception as exc:
-                    self.report.add("create_checklist", "CHECKLIST", f"{old_task_id}:{old_id}", "TASK", target_task_id, "ERROR", str(exc))
+                    self.report.add("create_checklist", "CHECKLIST", f"{old_task_id}:{old_id}", "TASK", target_task_id, "WARN", str(exc))
 
                 attachments = item.get("ATTACHMENTS") or {}
                 values = list(attachments.values()) if isinstance(attachments, dict) else attachments if isinstance(attachments, list) else []
@@ -1777,13 +1821,13 @@ class MigrationProject:
                             )
                             self.report.add("attach_checklist_files", "CHECKLIST", f"{old_task_id}:{old_id}", "TASK", target_task_id, "WARN", f"im.disk.file.commit used after: {first_exc}")
                         except Exception as chat_exc:
-                            self.report.add("attach_checklist_files", "CHECKLIST", f"{old_task_id}:{old_id}", "TASK", target_task_id, "ERROR", f"comment: {first_exc}; chat: {chat_exc}")
+                            self.report.add("attach_checklist_files", "CHECKLIST", f"{old_task_id}:{old_id}", "TASK", target_task_id, "WARN", f"comment: {first_exc}; chat: {chat_exc}")
                 pending.remove(item)
                 progress = True
             if not pending or not progress:
                 break
         for item in pending:
-            self.report.add("create_checklist", "CHECKLIST", f"{old_task_id}:{item.get('ID')}", "TASK", target_task_id, "ERROR", "parent checklist item was not created")
+            self.report.add("create_checklist", "CHECKLIST", f"{old_task_id}:{item.get('ID')}", "TASK", target_task_id, "WARN", "parent checklist item was not created")
 
     def _set_task_status(self, old_task_id: str, target_task_id: int, status: str) -> None:
         methods: list[str] = []
@@ -1965,7 +2009,7 @@ class MigrationProject:
             if isinstance(result, dict):
                 live = result
         except Exception as exc:
-            self.report.add("read_activity_files", "ACTIVITY", old_id, "ACTIVITY", "", "ERROR", str(exc))
+            self.report.add("read_activity_files", "ACTIVITY", old_id, "ACTIVITY", "", "WARN", str(exc))
         files = live.get("FILES") or activity.get("FILES") or []
         result: list[dict[str, Any]] = []
         for index, item in enumerate(files):
@@ -1998,7 +2042,7 @@ class MigrationProject:
             if isinstance(result, list):
                 source_bindings = [dict(item) for item in result if isinstance(item, dict)]
         except Exception as exc:
-            self.report.add("read_activity_bindings", "ACTIVITY", old_id, "ACTIVITY", "", "ERROR", str(exc))
+            self.report.add("read_activity_bindings", "ACTIVITY", old_id, "ACTIVITY", "", "WARN", str(exc))
         source_bindings.append({"OWNER_TYPE_ID": activity.get("OWNER_TYPE_ID"), "OWNER_ID": activity.get("OWNER_ID")})
         mapped: list[tuple[int, int]] = []
         unresolved: list[str] = []
@@ -2060,7 +2104,7 @@ class MigrationProject:
             current = self.client.call("crm.activity.get", {"id": target_id}) or {}
             current = current if isinstance(current, dict) else {}
         except Exception as exc:
-            self.report.add("attach_activity_files", "ACTIVITY", old_id, "ACTIVITY", target_id, "ERROR", f"cannot read target activity: {exc}")
+            self.report.add("attach_activity_files", "ACTIVITY", old_id, "ACTIVITY", target_id, "WARN", f"cannot read target activity: {exc}")
             return
         current_info = self._activity_target_file_info(current)
         current_by_name = {name: file_id for name, file_id in current_info if name}
@@ -2077,7 +2121,7 @@ class MigrationProject:
             return
         if current_info:
             self.report.add(
-                "attach_activity_files", "ACTIVITY", old_id, "ACTIVITY", target_id, "ERROR",
+                "attach_activity_files", "ACTIVITY", old_id, "ACTIVITY", target_id, "WARN",
                 "target activity already has different files; refusing to replace them automatically",
             )
             return
@@ -2100,7 +2144,7 @@ class MigrationProject:
                     "OK" if file_id else "WARN", name,
                 )
         except Exception as exc:
-            self.report.add("attach_activity_files", "ACTIVITY", old_id, "ACTIVITY", target_id, "ERROR", str(exc))
+            self.report.add("attach_activity_files", "ACTIVITY", old_id, "ACTIVITY", target_id, "WARN", str(exc))
 
     def import_activities(self, user_map: Mapping[str, int], company_map: Mapping[str, int], contact_map: Mapping[str, int], lead_map: Mapping[str, int], deal_map: Mapping[str, int], *, max_items: int = 0) -> None:
         self.load_source("CRM_Activities")
