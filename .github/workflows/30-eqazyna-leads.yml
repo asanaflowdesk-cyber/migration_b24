@@ -107,6 +107,8 @@ jobs:
           TARGET_BITRIX_WEBHOOK_URL: ${{ secrets.TARGET_BITRIX_WEBHOOK_URL }}
           EGOV_API_KEY: ${{ secrets.EGOV_API_KEY }}
           BITRIX_ASSIGNED_BY_ID: ${{ vars.BITRIX_ASSIGNED_BY_ID }}
+          BITRIX_MANAGER_IDS: "22,23,16,17,18,38,44,39,40,19,15"
+          BITRIX_LEAD_FAILURE_REASON_FIELD: "STATUS_DESCRIPTION"
           BITRIX_VERIFY_SSL: ${{ vars.BITRIX_VERIFY_SSL || 'true' }}
           BITRIX_CA_BUNDLE: ${{ vars.BITRIX_CA_BUNDLE }}
           BITRIX_OVERWRITE_ASSIGNED_BY_ON_UPDATE: "false"
@@ -122,6 +124,7 @@ jobs:
           EQAZYNA_RETRY_BASE_SLEEP_SECONDS: ${{ vars.EQAZYNA_RETRY_BASE_SLEEP_SECONDS || '3' }}
           BITRIX_REQUEST_TIMEOUT: ${{ vars.BITRIX_REQUEST_TIMEOUT || '45' }}
           EGOV_REQUEST_TIMEOUT: ${{ vars.EGOV_REQUEST_TIMEOUT || '25' }}
+          EGOV_MIN_NAME_MATCH: "60"
           INPUT_MODE: ${{ inputs.mode }}
           INPUT_PAGES: ${{ inputs.pages }}
           INPUT_PAGE_START: ${{ inputs.page_start }}
