@@ -10,7 +10,6 @@ from src.migration import (
     contact_display_name,
     migration_marker,
     normalize_name_tokens,
-    owner_scoped_requisite_xml_id,
     parse_marker,
     resolve_requisite_preset,
     restore_contact_name_fields,
@@ -768,89 +767,6 @@ def test_sample_dry_run_uses_requisites_of_selected_clients_not_first_rows(tmp_p
     assert len(addresses) == 1
 
 
-class _RequisiteOwnerConflictClient:
-    def __init__(self) -> None:
-        self.commands: list[tuple[str, dict]] = []
-
-    def list_all(self, method, params=None):
-        if method == "crm.requisite.preset.list":
-            return [
-                {
-                    "ID": "1",
-                    "NAME": "Организация",
-                    "XML_ID": "",
-                    "ENTITY_TYPE_ID": "8",
-                    "COUNTRY_ID": "6",
-                }
-            ]
-        if method == "crm.requisite.list":
-            return [
-                {
-                    "ID": "39",
-                    "XML_ID": "EQAZYNA-REQ-091140011780",
-                    "ENTITY_TYPE_ID": "4",
-                    "ENTITY_ID": "31",
-                    "PRESET_ID": "1",
-                }
-            ]
-        if method == "crm.address.list":
-            return []
-        raise AssertionError(method)
-
-    def batch_chunks(self, commands, size=30):
-        commands = list(commands)
-        for _key, method, params in commands:
-            self.commands.append((method, params))
-        success = {}
-        for key, method, _params in commands:
-            success[key] = 77 if method == "crm.requisite.add" else True
-        yield success, {}
-
-
-def test_requisite_with_same_xml_under_another_company_is_recreated_for_target_owner(tmp_path: Path) -> None:
-    p = project(tmp_path)
-    client = _RequisiteOwnerConflictClient()
-    p.client = client
-    p.load_source = lambda *args: None
-    p._target_fields["requisite"] = {"NAME": {}, "RQ_BIN": {}}
-    p._target_fields["address"] = {"ADDRESS_1": {}}
-    p._source["Requisite_Presets"] = [
-        {"ID": "1", "NAME": "Юр. лицо", "COUNTRY_ID": "6"}
-    ]
-    p._source["Requisites"] = [
-        {
-            "ID": "90",
-            "ENTITY_TYPE_ID": "4",
-            "ENTITY_ID": "90",
-            "PRESET_ID": "1",
-            "XML_ID": "EQAZYNA-REQ-091140011780",
-            "NAME": "Есиль Company",
-            "RQ_BIN": "091140011780",
-        }
-    ]
-    p._source["Addresses"] = []
-
-    p.import_requisites({"90": 44}, {})
-
-    assert client.commands == [
-        (
-            "crm.requisite.add",
-            {
-                "fields": {
-                    "NAME": "Есиль Company",
-                    "RQ_BIN": "091140011780",
-                    "ENTITY_ID": 44,
-                    "ENTITY_TYPE_ID": 4,
-                    "PRESET_ID": 1,
-                    "XML_ID": owner_scoped_requisite_xml_id("90", "4", 44),
-                }
-            },
-        )
-    ]
-    assert p.report.maps["requisites"]["90"] == 77
-    assert p.report.extra["requisite_owner_conflicts_repaired"] == 1
-
-
 class _VerifyScopeClient:
     def list_all(self, method, params=None):
         if method == "crm.requisite.list":
@@ -1160,3 +1076,57 @@ def test_limited_apply_skips_portal_wide_title_cleanup(tmp_path: Path) -> None:
 
     assert client.commands == []
     assert p.report.extra["target_title_normalization"]["skipped_limited_apply"] == 1
+
+
+def test_loss_reason_enum_maps_to_lead_and_deal_fields(tmp_path: Path) -> None:
+    p = project(tmp_path)
+    p.load_source("Deal_UserFields")
+    p._target_userfields["lead"] = [
+        {
+            "FIELD_NAME": "UF_CRM_1785508658316",
+            "USER_TYPE_ID": "enumeration",
+            "LIST": [
+                {"ID": "501", "VALUE": "Уже работают с конкурентом"},
+            ],
+        }
+    ]
+    p._target_userfields["deal"] = [
+        {
+            "FIELD_NAME": "UF_CRM_6A73073A44A53",
+            "USER_TYPE_ID": "enumeration",
+            "LIST": [
+                {"ID": "57", "VALUE": "Уже работают с конкурентом"},
+            ],
+        }
+    ]
+
+    p._build_enum_maps()
+
+    assert p._enum_target_id("388", "lead") == "501"
+    assert p._enum_target_id("388", "deal") == "57"
+
+
+def test_prepare_deal_writes_loss_reason_to_enumeration_field(tmp_path: Path) -> None:
+    p = project(tmp_path)
+    p._source["Deals"] = [
+        {
+            "ID": "1001",
+            "TITLE": "Тестовая сделка",
+            "STAGE_ID": "WON",
+            "ASSIGNED_BY_ID": "1",
+            "UF_CRM_1779448756033": "388",
+            "UF_CRM_1781611791954": "Комментарий менеджера",
+        }
+    ]
+    p._source_enum_id_to_value = {"388": "Уже работает с конкурентом"}
+    p._target_loss_enum_value_to_id["deal"] = {
+        "уже работают с конкурентом": "57",
+    }
+    p._product_encoded["deal"] = "ГПО недропользователя"
+
+    prepared = p.prepare_deals({"1": 21}, {}, {})
+
+    assert len(prepared) == 1
+    _, fields = prepared[0]
+    assert fields["UF_CRM_6A73073A44A53"] == "57"
+    assert fields["UF_CRM_1785508290845"] == "Комментарий менеджера"

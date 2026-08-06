@@ -77,7 +77,8 @@
       ],
       "value_aliases": {
         "Уже работает с конкурентом": "Уже работают с конкурентом"
-      }
+      },
+      "target_deal_field": "UF_CRM_6A73073A44A53"
     },
     "deal_contract_number": {
       "source_deal_field": "UF_CRM_1781611696235",

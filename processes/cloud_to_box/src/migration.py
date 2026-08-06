@@ -52,26 +52,6 @@ def normalize_text(value: Any) -> str:
     return " ".join(text(value).strip().casefold().replace("ё", "е").split())
 
 
-def owner_scoped_requisite_xml_id(
-    source_requisite_id: Any,
-    source_entity_type: Any,
-    target_entity_id: Any,
-) -> str:
-    """Return a deterministic XML_ID for a requisite recreated under another owner.
-
-    Bitrix24 does not reliably move a requisite between companies/contacts through
-    ``crm.requisite.update``. If an XML_ID already exists under another owner,
-    reusing that row makes ``crm.requisite.link.register`` fail later. The scoped
-    identifier keeps the source requisite stable while making the target owner
-    explicit, so repeated runs remain idempotent.
-    """
-    return (
-        f"B24MIG_REQ_{text(source_requisite_id)}"
-        f"_E{text(source_entity_type)}"
-        f"_T{text(target_entity_id)}"
-    )
-
-
 PRESET_NAME_ALIASES = {
     "3": {
         "физ лицо",
@@ -347,7 +327,7 @@ class MigrationProject:
         self._target_statuses: list[dict[str, Any]] = []
         self._target_userfields: dict[str, list[dict[str, Any]]] = {}
         self._source_enum_id_to_value: dict[str, str] = {}
-        self._target_lead_enum_value_to_id: dict[str, str] = {}
+        self._target_loss_enum_value_to_id: dict[str, dict[str, str]] = {"lead": {}, "deal": {}}
         self._target_users: list[dict[str, Any]] = []
         self._user_overrides = self._load_user_overrides()
         self._context_user_overrides = self._load_context_user_overrides()
@@ -505,6 +485,9 @@ class MigrationProject:
         self._build_enum_maps()
 
     def _build_enum_maps(self) -> None:
+        self._source_enum_id_to_value.clear()
+        for values in self._target_loss_enum_value_to_id.values():
+            values.clear()
         self.load_source("Deal_UserFields")
         source_code = self.config["field_mapping"]["lead_loss_reason"]["source_deal_field"]
         for field in self._source["Deal_UserFields"]:
@@ -519,11 +502,26 @@ class MigrationProject:
             for item in values or []:
                 if isinstance(item, dict):
                     self._source_enum_id_to_value[text(item.get("ID") or item.get("id"))] = text(item.get("VALUE") or item.get("value"))
-        target_code = self.config["field_mapping"]["lead_loss_reason"]["target_lead_field"]
-        target_field = next((x for x in self._target_userfields.get("lead", []) if x.get("FIELD_NAME") == target_code), None)
-        if target_field:
+        loss_cfg = self.config["field_mapping"]["lead_loss_reason"]
+        target_codes = {
+            "lead": loss_cfg.get("target_lead_field"),
+            "deal": loss_cfg.get("target_deal_field"),
+        }
+        for entity, target_code in target_codes.items():
+            if not target_code:
+                continue
+            target_field = next(
+                (
+                    item
+                    for item in self._target_userfields.get(entity, [])
+                    if item.get("FIELD_NAME") == target_code
+                ),
+                None,
+            )
+            if not target_field:
+                continue
             for item in target_field.get("LIST") or []:
-                self._target_lead_enum_value_to_id[normalize_text(item.get("VALUE"))] = text(item.get("ID"))
+                self._target_loss_enum_value_to_id[entity][normalize_text(item.get("VALUE"))] = text(item.get("ID"))
 
     def _resolve_product_field(self, entity: str) -> tuple[Any, str | None]:
         cfg = self.config["product_field"]
@@ -561,8 +559,10 @@ class MigrationProject:
                     wrong_names.append({"key": f"{entity_id}:{status_id}", "expected": name, "actual": text(found.get("NAME"))})
         missing_fields: list[str] = []
         wrong_types: list[dict[str, str]] = []
+        loss_cfg = cfg["field_mapping"]["lead_loss_reason"]
         checks = [
-            ("lead", cfg["field_mapping"]["lead_loss_reason"]["target_lead_field"], "enumeration"),
+            ("lead", loss_cfg["target_lead_field"], "enumeration"),
+            ("deal", loss_cfg["target_deal_field"], "enumeration"),
             ("deal", cfg["field_mapping"]["deal_contract_number"]["target_deal_field"], "string"),
             ("deal", cfg["field_mapping"]["deal_loss_detail"]["target_deal_field"], "string"),
         ]
@@ -572,8 +572,15 @@ class MigrationProject:
                 missing_fields.append(f"{entity}:{field_code}")
             elif text(found.get("USER_TYPE_ID")) != expected_type:
                 wrong_types.append({"field": f"{entity}:{field_code}", "expected": expected_type, "actual": text(found.get("USER_TYPE_ID"))})
-        expected_enum = [normalize_text(v) for v in cfg["field_mapping"]["lead_loss_reason"]["expected_values"]]
-        missing_enum_values = [v for v in expected_enum if v not in self._target_lead_enum_value_to_id]
+        expected_enum = [normalize_text(v) for v in loss_cfg["expected_values"]]
+        missing_lead_enum_values = [
+            value for value in expected_enum
+            if value not in self._target_loss_enum_value_to_id["lead"]
+        ]
+        missing_deal_enum_values = [
+            value for value in expected_enum
+            if value not in self._target_loss_enum_value_to_id["deal"]
+        ]
         product_errors: list[str] = []
         for entity in ("lead", "deal"):
             encoded, error = self._resolve_product_field(entity)
@@ -586,9 +593,17 @@ class MigrationProject:
             "status_name_differences": wrong_names,
             "missing_fields": missing_fields,
             "wrong_field_types": wrong_types,
-            "missing_lead_loss_reason_values": missing_enum_values,
+            "missing_lead_loss_reason_values": missing_lead_enum_values,
+            "missing_deal_loss_reason_values": missing_deal_enum_values,
             "product_field_errors": product_errors,
-            "ok": not (missing_statuses or missing_fields or wrong_types or missing_enum_values or product_errors),
+            "ok": not (
+                missing_statuses
+                or missing_fields
+                or wrong_types
+                or missing_lead_enum_values
+                or missing_deal_enum_values
+                or product_errors
+            ),
         }
         self.report.extra["target_validation"] = result
         return result
@@ -966,11 +981,12 @@ class MigrationProject:
         available = {text(x.get("STATUS_ID")) for x in self._target_statuses if x.get("ENTITY_ID") == "SOURCE"}
         return source if source in available else "OTHER"
 
-    def _enum_target_id(self, source_enum_id: Any) -> str:
+    def _enum_target_id(self, source_enum_id: Any, target_entity: str = "lead") -> str:
         value = self._source_enum_id_to_value.get(text(source_enum_id), "")
         aliases = self.config["field_mapping"]["lead_loss_reason"].get("value_aliases", {})
         target_value = aliases.get(value, value)
-        return self._target_lead_enum_value_to_id.get(normalize_text(target_value), "")
+        entity_map = self._target_loss_enum_value_to_id.get(target_entity, {})
+        return entity_map.get(normalize_text(target_value), "")
 
     def _source_loss_reason_value(self, source_enum_id: Any) -> str:
         return self._source_enum_id_to_value.get(text(source_enum_id), "")
@@ -1517,7 +1533,7 @@ class MigrationProject:
                 fields["COMPANY_ID"] = company_map[old_company]
             if old_contact in contact_map:
                 fields["CONTACT_ID"] = contact_map[old_contact]
-            enum_id = self._enum_target_id(row.get(loss_cfg["source_deal_field"]))
+            enum_id = self._enum_target_id(row.get(loss_cfg["source_deal_field"]), "lead")
             if enum_id:
                 fields[loss_cfg["target_lead_field"]] = enum_id
             comments = text(row.get("COMMENTS"))
@@ -1565,13 +1581,25 @@ class MigrationProject:
             contract = text(row.get(contract_cfg["source_deal_field"]))
             if contract:
                 fields[contract_cfg["target_deal_field"]] = contract
+            source_reason_id = row.get(loss_cfg["source_deal_field"])
+            reason_value = self._source_loss_reason_value(source_reason_id)
+            target_reason_id = self._enum_target_id(source_reason_id, "deal")
+            if target_reason_id:
+                fields[loss_cfg["target_deal_field"]] = target_reason_id
+            elif reason_value:
+                self.report.add(
+                    "map_deal_loss_reason",
+                    "DEAL",
+                    old_id,
+                    "DEAL",
+                    "",
+                    "WARN",
+                    f"Не сопоставлена причина срыва сделки: {reason_value} (source enum ID {text(source_reason_id)})",
+                )
+
             detail = text(row.get(detail_cfg["source_deal_field"]))
-            reason_value = self._source_loss_reason_value(row.get(loss_cfg["source_deal_field"]))
-            combined = detail
-            if reason_value:
-                combined = f"Причина: {reason_value}" + (f"\nДетали: {detail}" if detail else "")
-            if combined:
-                fields[detail_cfg["target_deal_field"]] = combined
+            if detail:
+                fields[detail_cfg["target_deal_field"]] = detail
             fields["COMMENTS"] = append_text(row.get("COMMENTS"), migration_marker("DEAL", old_id, "DEAL"))
             prepared.append((f"DEAL:{old_id}:DEAL", fields))
         return prepared
@@ -2555,14 +2583,13 @@ class MigrationProject:
             for row in target_existing
             if row.get("XML_ID") and text(row.get("ID")).isdigit()
         }
-        existing_rows_by_xml: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        for row in target_existing:
-            xml_id = text(row.get("XML_ID"))
-            if xml_id and text(row.get("ID")).isdigit():
-                existing_rows_by_xml[xml_id].append(dict(row))
+        existing_by_xml = {
+            text(row.get("XML_ID")): int(row["ID"])
+            for row in target_existing
+            if row.get("XML_ID") and text(row.get("ID")).isdigit()
+        }
 
         req_map: dict[str, int] = dict(self.report.maps["requisites"])
-        owner_conflicts_repaired = 0
         commands: list[tuple[str, str, Mapping[str, Any]]] = []
         context: dict[str, tuple[str, str, dict[str, Any], int | None]] = {}
         for index, row in enumerate(self._source["Requisites"]):
@@ -2581,10 +2608,7 @@ class MigrationProject:
                 )
                 continue
 
-            base_xml_id = text(row.get("XML_ID")) or f"B24MIG_REQ_{old_id}"
-            scoped_xml_id = owner_scoped_requisite_xml_id(
-                old_id, source_entity_type, target_entity
-            )
+            xml_id = text(row.get("XML_ID")) or f"B24MIG_REQ_{old_id}"
             source_preset = source_presets.get(text(row.get("PRESET_ID")), {})
             target_preset, preset_match = resolve_requisite_preset(
                 source_preset, source_entity_type, target_presets
@@ -2596,38 +2620,6 @@ class MigrationProject:
                 )
                 continue
 
-            exact_base_id = existing_by_key.get(
-                (base_xml_id, source_entity_type, text(target_entity))
-            )
-            exact_scoped_id = existing_by_key.get(
-                (scoped_xml_id, source_entity_type, text(target_entity))
-            )
-            conflicting_base_rows = [
-                item
-                for item in existing_rows_by_xml.get(base_xml_id, [])
-                if not (
-                    text(item.get("ENTITY_TYPE_ID")) == source_entity_type
-                    and text(item.get("ENTITY_ID")) == text(target_entity)
-                )
-            ]
-
-            if exact_base_id:
-                xml_id = base_xml_id
-                existing_id = exact_base_id
-            elif exact_scoped_id:
-                xml_id = scoped_xml_id
-                existing_id = exact_scoped_id
-            elif conflicting_base_rows:
-                # A requisite cannot safely be moved from one company/contact to
-                # another with crm.requisite.update. Create an owner-scoped copy
-                # instead; otherwise crm.requisite.link.register rejects the deal.
-                xml_id = scoped_xml_id
-                existing_id = None
-                owner_conflicts_repaired += 1
-            else:
-                xml_id = base_xml_id
-                existing_id = None
-
             fields = self._copy_standard_fields(
                 "requisite", row,
                 excluded={"ID", "ENTITY_ID", "ENTITY_TYPE_ID", "PRESET_ID", "XML_ID"},
@@ -2638,6 +2630,9 @@ class MigrationProject:
                 "PRESET_ID": int(target_preset),
                 "XML_ID": xml_id,
             })
+            existing_id = existing_by_key.get((xml_id, source_entity_type, text(target_entity)))
+            if not existing_id:
+                existing_id = existing_by_xml.get(xml_id)
             if existing_id:
                 key = f"ru{index}"
                 commands.append((key, "crm.requisite.update", {"id": existing_id, "fields": fields}))
@@ -2673,8 +2668,6 @@ class MigrationProject:
                     payload=fields, route="REQUISITE",
                 )
         self.report.maps["requisites"].update(req_map)
-        if owner_conflicts_repaired:
-            self.report.extra["requisite_owner_conflicts_repaired"] = owner_conflicts_repaired
 
         existing_addresses = self.client.list_all(
             "crm.address.list",
