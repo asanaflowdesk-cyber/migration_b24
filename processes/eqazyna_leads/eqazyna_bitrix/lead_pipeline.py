@@ -145,40 +145,87 @@ class LeadPipeline:
         self._lead_generation_encoded_value = matches[0]
 
     def _resolve_requisite_preset_id(self, presets: list[dict[str, Any]]) -> int:
-        """Resolve a company requisite preset without relying on portal-specific IDs.
+        """Resolve the legal-entity requisite preset for the company card.
 
-        Preset IDs differ between Bitrix24 installations. A configured ID is used when
-        it exists. If it is stale or absent, the first active company preset returned
-        by Bitrix24 (already ordered by SORT and ID) is selected automatically.
+        ``crm.requisite.preset.list.ENTITY_TYPE_ID`` is normally ``8`` because
+        it describes a requisite preset. Company ownership is specified later in
+        ``crm.requisite.add`` with ``ENTITY_TYPE_ID=4``.
         """
-        candidates: list[dict[str, Any]] = []
-        for preset in presets:
-            preset_id = str(preset.get("ID") or "").strip()
-            entity_type = str(preset.get("ENTITY_TYPE_ID") or "").strip()
-            active = str(preset.get("ACTIVE") or "Y").upper()
-            if preset_id.isdigit() and entity_type in {"", "4"} and active != "N":
-                candidates.append(preset)
-
+        candidates = [
+            preset
+            for preset in presets
+            if str(preset.get("ID") or "").strip().isdigit()
+            and str(preset.get("ACTIVE") or "Y").upper() != "N"
+        ]
         if not candidates:
-            raise BitrixError("Не найден активный шаблон реквизитов для компаний.")
+            raise BitrixError("Не найден активный шаблон реквизитов.")
 
         requested = str(self.config.requisite_preset_id or "").strip()
         requested_is_auto = requested.casefold() in {"", "auto", "0", "none", "null"}
         if not requested_is_auto:
             for preset in candidates:
-                if str(preset.get("ID") or "") == requested:
+                if str(preset.get("ID") or "").strip() == requested:
                     return int(requested)
 
-        selected = candidates[0]
+        # Prefer the reserved Kazakhstan legal-entity preset when it is present.
+        reserved_xml_ids = {
+            "#CRM_REQUISITE_PRESET_DEF_KZ_LEGALENTITY#",
+            "#CRM_REQUISITE_PRESET_DEF_RU_LEGALENTITY#",
+        }
+        xml_matches = [
+            preset
+            for preset in candidates
+            if str(preset.get("XML_ID") or "").strip().upper() in reserved_xml_ids
+        ]
+        if len(xml_matches) == 1:
+            selected = xml_matches[0]
+        else:
+            legal_labels = {
+                "юр лицо",
+                "юридическое лицо",
+                "организация",
+                "legal entity",
+                "company",
+            }
+            label_matches = []
+            for preset in candidates:
+                normalized_name = self._normalise_preset_name(preset.get("NAME"))
+                is_legal = (
+                    normalized_name in legal_labels
+                    or normalized_name.startswith("организация ")
+                    or normalized_name.startswith("юр лицо ")
+                    or normalized_name.startswith("юридическое лицо ")
+                )
+                if is_legal:
+                    label_matches.append(preset)
+            if len(label_matches) == 1:
+                selected = label_matches[0]
+            else:
+                available = [
+                    f"{preset.get('ID')}:{preset.get('NAME')}" for preset in candidates
+                ]
+                raise BitrixError(
+                    "Не удалось однозначно определить шаблон реквизитов юридического лица. "
+                    f"Доступно: {available}"
+                )
+
         selected_id = int(str(selected.get("ID")))
-        if not requested_is_auto:
+        if not requested_is_auto and str(selected_id) != requested:
             selected_name = str(selected.get("NAME") or "").strip()
             suffix = f" ({selected_name})" if selected_name else ""
             self.validation_warnings.append(
                 f"PRESET_ID={requested} в коробке не найден; "
-                f"автоматически выбран шаблон PRESET_ID={selected_id}{suffix}."
+                f"автоматически выбран шаблон "
+                f"PRESET_ID={selected_id}{suffix}."
             )
         return selected_id
+
+    @staticmethod
+    def _normalise_preset_name(value: Any) -> str:
+        text = str(value or "").casefold().replace("ё", "е")
+        text = text.replace("юр.", "юр ").replace("физ.", "физ ")
+        text = re.sub(r"[^0-9a-zа-я]+", " ", text, flags=re.IGNORECASE)
+        return " ".join(text.split())
 
     @property
     def requisite_preset_id(self) -> int | None:

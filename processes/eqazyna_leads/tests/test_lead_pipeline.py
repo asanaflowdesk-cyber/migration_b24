@@ -89,7 +89,7 @@ class FakeClient:
     def list_requisite_presets(self):
         if self.requisite_presets is not None:
             return self.requisite_presets
-        return [{"ID": "1", "ENTITY_TYPE_ID": "4", "ACTIVE": "Y"}]
+        return [{"ID": "3", "ENTITY_TYPE_ID": "8", "NAME": "Юр. лицо", "XML_ID": "#CRM_REQUISITE_PRESET_DEF_KZ_LEGALENTITY#", "ACTIVE": "Y"}]
 
     def find_lead_by_origin(self, origin_id, originator_id="EQAZYNA_LEAD", extra_select=None):
         assert origin_id == "123456789012"
@@ -396,3 +396,36 @@ def test_dry_run_reads_but_never_writes():
     assert client.created_requisite_fields is None
     assert client.created_address_fields is None
     assert client.timeline == []
+
+
+def test_requisite_preset_entity_type_8_is_valid_for_company_requisites():
+    client = FakeClient(
+        requisite_presets=[
+            {
+                "ID": "3",
+                "ENTITY_TYPE_ID": "8",
+                "COUNTRY_ID": "6",
+                "NAME": "Юр. лицо",
+                "XML_ID": "#CRM_REQUISITE_PRESET_DEF_KZ_LEGALENTITY#",
+                "ACTIVE": "Y",
+            }
+        ]
+    )
+
+    result = pipeline(client, requisite_preset_id="3")
+
+    assert result.requisite_preset_id == 3
+
+
+def test_auto_preset_prefers_legal_entity_and_not_person_or_ip():
+    client = FakeClient(
+        requisite_presets=[
+            {"ID": "1", "ENTITY_TYPE_ID": "8", "NAME": "ИП", "XML_ID": "#CRM_REQUISITE_PRESET_DEF_KZ_INDIVIDUAL#", "ACTIVE": "Y"},
+            {"ID": "3", "ENTITY_TYPE_ID": "8", "NAME": "Юр. лицо", "XML_ID": "#CRM_REQUISITE_PRESET_DEF_KZ_LEGALENTITY#", "ACTIVE": "Y"},
+            {"ID": "5", "ENTITY_TYPE_ID": "8", "NAME": "Физ. лицо", "XML_ID": "#CRM_REQUISITE_PRESET_DEF_KZ_PERSON#", "ACTIVE": "Y"},
+        ]
+    )
+
+    result = pipeline(client, requisite_preset_id="auto")
+
+    assert result.requisite_preset_id == 3

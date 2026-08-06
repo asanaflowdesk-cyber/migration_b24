@@ -115,14 +115,19 @@ class BitrixClient:
         return result if isinstance(result, dict) else {}
 
     def list_requisite_presets(self) -> list[dict[str, Any]]:
+        # Preset.ENTITY_TYPE_ID describes the preset object itself and is normally 8
+        # (requisite). It does not mean that the future requisite owner is a company
+        # (4) or a contact (3), so filtering presets by ENTITY_TYPE_ID=4 returns an
+        # empty list on standard Bitrix24 installations.
         result = self.call(
             "crm.requisite.preset.list",
             {
                 "order": {"SORT": "ASC", "ID": "ASC"},
-                "filter": {"ENTITY_TYPE_ID": 4},
+                "filter": {},
                 "select": [
                     "ID",
                     "NAME",
+                    "XML_ID",
                     "ACTIVE",
                     "SORT",
                     "ENTITY_TYPE_ID",
