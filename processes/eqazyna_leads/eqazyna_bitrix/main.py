@@ -101,8 +101,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--requisite-preset-id",
-        default=os.getenv("BITRIX_REQUISITE_PRESET_ID", "1"),
-        help="Company requisite preset ID in the target Bitrix24",
+        default=os.getenv("BITRIX_REQUISITE_PRESET_ID", "auto"),
+        help="Company requisite preset ID in the target Bitrix24; auto = detect automatically",
     )
     parser.add_argument(
         "--source-id",
@@ -250,6 +250,11 @@ def main() -> int:
             f"requisite_preset={args.requisite_preset_id}, dry_run={args.dry_run}"
         )
         lead_pipeline.validate()
+        resolved_preset = getattr(lead_pipeline, "requisite_preset_id", None)
+        if resolved_preset is not None:
+            print(f"    Resolved company requisite preset: {resolved_preset}")
+        for warning in getattr(lead_pipeline, "validation_warnings", []):
+            print(f"    WARNING: {warning}")
 
     print("[3/4] Processing Bitrix24 leads")
     results: list[ProcessResult] = []

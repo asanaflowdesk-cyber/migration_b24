@@ -48,6 +48,7 @@ class FakeClient:
         address=None,
         field_type="string",
         field_items=None,
+        requisite_presets=None,
     ):
         self.lead = lead
         self.company = company
@@ -56,6 +57,7 @@ class FakeClient:
         self.address = address
         self.field_type = field_type
         self.field_items = field_items
+        self.requisite_presets = requisite_presets
 
         self.created_lead_fields = None
         self.updated_lead_fields = None
@@ -85,6 +87,8 @@ class FakeClient:
         }
 
     def list_requisite_presets(self):
+        if self.requisite_presets is not None:
+            return self.requisite_presets
         return [{"ID": "1", "ENTITY_TYPE_ID": "4", "ACTIVE": "Y"}]
 
     def find_lead_by_origin(self, origin_id, originator_id="EQAZYNA_LEAD", extra_select=None):
@@ -342,6 +346,41 @@ def test_enumeration_field_resolves_label_to_internal_id():
     assert result.action == "created_lead"
     assert client.created_lead_fields[FIELD] == "42"
 
+
+
+def test_missing_configured_requisite_preset_falls_back_to_active_company_preset():
+    client = FakeClient(
+        requisite_presets=[
+            {
+                "ID": "7",
+                "NAME": "Организация Казахстан",
+                "ENTITY_TYPE_ID": "4",
+                "ACTIVE": "Y",
+            }
+        ]
+    )
+
+    result = pipeline(client, requisite_preset_id="3")
+
+    assert result.requisite_preset_id == 7
+    assert result.validation_warnings == [
+        "PRESET_ID=3 в коробке не найден; автоматически выбран шаблон "
+        "PRESET_ID=7 (Организация Казахстан)."
+    ]
+
+
+def test_existing_configured_requisite_preset_is_used_without_warning():
+    client = FakeClient(
+        requisite_presets=[
+            {"ID": "3", "ENTITY_TYPE_ID": "4", "ACTIVE": "Y"},
+            {"ID": "7", "ENTITY_TYPE_ID": "4", "ACTIVE": "Y"},
+        ]
+    )
+
+    result = pipeline(client, requisite_preset_id="3")
+
+    assert result.requisite_preset_id == 3
+    assert result.validation_warnings == []
 
 def test_dry_run_reads_but_never_writes():
     client = FakeClient()

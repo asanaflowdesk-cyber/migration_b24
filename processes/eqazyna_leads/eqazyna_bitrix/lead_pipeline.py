@@ -20,7 +20,7 @@ DEFAULT_LEAD_GENERATION_FIELD = "UF_CRM_1785917145255"
 DEFAULT_LEAD_GENERATION_VALUE = "ГПО Недропользователя"
 DEFAULT_ORIGINATOR_ID = "EQAZYNA_LEAD"
 DEFAULT_COMPANY_ORIGINATOR_ID = "EQAZYNA"
-DEFAULT_REQUISITE_PRESET_ID = "1"
+DEFAULT_REQUISITE_PRESET_ID = "auto"
 
 
 @dataclass(slots=True)
@@ -65,6 +65,7 @@ class LeadPipeline:
             int(configured_preset) if configured_preset.isdigit() else None
         )
         self._requisite_bin_field = "RQ_BIN"
+        self.validation_warnings: list[str] = []
         self._available_requisite_fields: set[str] = {
             "RQ_BIN",
             "RQ_COMPANY_NAME",
@@ -144,22 +145,44 @@ class LeadPipeline:
         self._lead_generation_encoded_value = matches[0]
 
     def _resolve_requisite_preset_id(self, presets: list[dict[str, Any]]) -> int:
+        """Resolve a company requisite preset without relying on portal-specific IDs.
+
+        Preset IDs differ between Bitrix24 installations. A configured ID is used when
+        it exists. If it is stale or absent, the first active company preset returned
+        by Bitrix24 (already ordered by SORT and ID) is selected automatically.
+        """
+        candidates: list[dict[str, Any]] = []
+        for preset in presets:
+            preset_id = str(preset.get("ID") or "").strip()
+            entity_type = str(preset.get("ENTITY_TYPE_ID") or "").strip()
+            active = str(preset.get("ACTIVE") or "Y").upper()
+            if preset_id.isdigit() and entity_type in {"", "4"} and active != "N":
+                candidates.append(preset)
+
+        if not candidates:
+            raise BitrixError("Не найден активный шаблон реквизитов для компаний.")
+
         requested = str(self.config.requisite_preset_id or "").strip()
-        if requested:
-            for preset in presets:
+        requested_is_auto = requested.casefold() in {"", "auto", "0", "none", "null"}
+        if not requested_is_auto:
+            for preset in candidates:
                 if str(preset.get("ID") or "") == requested:
                     return int(requested)
-            raise BitrixError(
-                f"Шаблон реквизитов PRESET_ID={requested} не найден для компаний."
-            )
 
-        for preset in presets:
-            preset_id = str(preset.get("ID") or "")
-            entity_type = str(preset.get("ENTITY_TYPE_ID") or "")
-            active = str(preset.get("ACTIVE") or "Y").upper()
-            if preset_id.isdigit() and entity_type == "4" and active != "N":
-                return int(preset_id)
-        raise BitrixError("Не найден активный шаблон реквизитов для компаний.")
+        selected = candidates[0]
+        selected_id = int(str(selected.get("ID")))
+        if not requested_is_auto:
+            selected_name = str(selected.get("NAME") or "").strip()
+            suffix = f" ({selected_name})" if selected_name else ""
+            self.validation_warnings.append(
+                f"PRESET_ID={requested} в коробке не найден; "
+                f"автоматически выбран шаблон PRESET_ID={selected_id}{suffix}."
+            )
+        return selected_id
+
+    @property
+    def requisite_preset_id(self) -> int | None:
+        return self._requisite_preset_id
 
     @staticmethod
     def _normalise_label(value: Any) -> str:
