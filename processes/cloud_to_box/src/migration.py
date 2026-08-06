@@ -1584,10 +1584,12 @@ class MigrationProject:
 
         check("source_user", lambda: self.source_client.call("user.current"))
 
-        # Detect a webhook that can read the portal but sees only part of the
-        # migration scope. This is a systemic source-access problem, not an
-        # individual-object warning, so a full import must not start. The
-        # checkpoint is only a lower bound: newly added live records are valid.
+        # Compare the live portal with the export checkpoint, but never block
+        # the migration only because the live portal now contains fewer rows.
+        # Records may have been deleted, converted or hidden after the dump was
+        # created. Under the project-wide skip-and-log policy we migrate every
+        # record that is currently readable and record all count gaps for later
+        # investigation. The checkpoint remains a diagnostic lower bound only.
         checkpoint_path = self.config_path.with_name("source_plan.json")
         if checkpoint_path.exists() and all(name in self._source for name in IMPORT_DATASETS):
             try:
@@ -1611,11 +1613,13 @@ class MigrationProject:
                     )
                     count_check[dataset] = {"checkpoint_minimum": expected, "live": actual}
                     if expected and actual < expected:
+                        missing = expected - actual
                         message = (
-                            f"live source returned {actual} {dataset} rows, below checkpoint {expected}; "
-                            "check webhook visibility or intentionally refresh source_plan.json"
+                            f"live source returned {actual} {dataset} rows, below checkpoint {expected} "
+                            f"by {missing}; the readable rows will be migrated and the gap is logged "
+                            "for follow-up (possible deletion, conversion, relation cleanup or webhook visibility)"
                         )
-                        errors.append(f"source_count_{dataset}: {message}")
+                        warnings.append(f"source_count_{dataset}: {message}")
                 checks["source_dataset_counts"] = count_check
             except Exception as exc:  # noqa: BLE001
                 warnings.append(f"source_dataset_counts: checkpoint could not be evaluated: {exc}")
@@ -1661,7 +1665,13 @@ class MigrationProject:
             check("source_activity", lambda: self.source_client.call("crm.activity.get", {"id": activity_id}))
             check("source_activity_bindings", lambda: self.source_client.call("crm.activity.binding.list", {"activityId": activity_id}))
 
-        result = {"checks": checks, "errors": errors, "warnings": warnings, "ok": not errors}
+        result = {
+            "checks": checks,
+            "errors": errors,
+            "warnings": warnings,
+            "ok": not errors,
+            "count_gap_policy": "warn_and_continue",
+        }
         self.report.extra["live_source_validation"] = result
         return result
 

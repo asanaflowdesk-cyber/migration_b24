@@ -249,6 +249,23 @@ def test_live_source_unreadable_comments_are_non_blocking(tmp_path: Path) -> Non
     assert str(result["checks"]["source_task_comments"]).startswith("WARN:")
 
 
+
+
+def test_live_source_count_gaps_are_warnings_and_do_not_block(tmp_path: Path) -> None:
+    p = project(tmp_path)
+    p.source_client = _UnreadableCommentsSourceClient()
+    p._source = {name: [] for name in (
+        "Users", "Companies", "Contacts", "Leads", "Deals", "Deal_UserFields",
+        "Contact_Companies", "Lead_Contacts", "Deal_Contacts",
+        "Requisites", "Addresses", "Requisite_Presets", "Requisite_Links",
+        "Tasks", "CRM_Activities",
+    )}
+    result = p.validate_live_source()
+    assert result["ok"] is True
+    assert result["errors"] == []
+    assert result["count_gap_policy"] == "warn_and_continue"
+    assert any(warning.startswith("source_count_Companies:") for warning in result["warnings"])
+
 def test_missing_task_comments_are_reported_as_warning(tmp_path: Path) -> None:
     p = project(tmp_path)
     p.source_client = object()
