@@ -114,7 +114,7 @@ jobs:
           BITRIX_LEAD_GENERATION_VALUE: "ГПО Недропользователя"
           BITRIX_ORIGINATOR_ID: "EQAZYNA_LEAD"
           BITRIX_COMPANY_ORIGINATOR_ID: "EQAZYNA"
-          BITRIX_REQUISITE_PRESET_ID: ${{ vars.BITRIX_REQUISITE_PRESET_ID || 'auto' }}
+          BITRIX_REQUISITE_PRESET_ID: ${{ vars.BITRIX_REQUISITE_PRESET_ID || '1' }}
           BITRIX_SOURCE_ID: "OTHER"
           BITRIX_SOURCE_DESCRIPTION: "e-Qazyna Minerals. ГПО недропользователи"
           EQAZYNA_REQUEST_TIMEOUT: ${{ vars.EQAZYNA_REQUEST_TIMEOUT || '15' }}
