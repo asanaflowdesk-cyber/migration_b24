@@ -17,7 +17,7 @@ from .region import detect_city, detect_region
 
 EGOV_URL = os.getenv("EGOV_API_URL", "https://data.egov.kz/api/v4/gbd_ul/v1")
 EGOV_RESULT_SIZE = int(os.getenv("EGOV_RESULT_SIZE", "20"))
-EGOV_MIN_NAME_MATCH = int(os.getenv("EGOV_MIN_NAME_MATCH", "75"))
+EGOV_MIN_NAME_MATCH = int(os.getenv("EGOV_MIN_NAME_MATCH", "60"))
 # OKED/TPI is diagnostic only. It does NOT participate in trusted-match filtering.
 ALLOWED_OKED_PREFIXES = tuple(
     p.strip() for p in os.getenv("EGOV_ALLOWED_OKED_PREFIXES", "05,07,08,09").split(",") if p.strip()

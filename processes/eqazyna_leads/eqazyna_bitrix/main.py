@@ -20,7 +20,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "e-Qazyna Minerals -> eGov -> Bitrix24. "
-            "One BIN creates a complete CRM bundle: lead, company, requisite and director contact."
+            "One application creates one lead; company, requisite and director contact are shared by BIN."
         )
     )
     parser.add_argument(
@@ -74,7 +74,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--assigned-by-id",
         default=os.getenv("BITRIX_ASSIGNED_BY_ID") or None,
-        help="Optional responsible user ID for newly created leads",
+        help="Fallback responsible user ID only when the manager pool is empty",
+    )
+    parser.add_argument(
+        "--manager-ids",
+        default=os.getenv(
+            "BITRIX_MANAGER_IDS",
+            "22,23,16,17,18,38,44,39,40,19,15",
+        ),
+        help="Approved manager IDs used for history inheritance and random least-loaded distribution",
+    )
+    parser.add_argument(
+        "--failure-reason-field",
+        default=os.getenv("BITRIX_LEAD_FAILURE_REASON_FIELD", "STATUS_DESCRIPTION"),
+        help="Lead field copied together with a failed stage",
     )
     parser.add_argument(
         "--overwrite-assigned-by-on-update",
@@ -158,6 +171,20 @@ def _build_enrichment_map(
         print(f"    eGov {idx}/{len(unique)} {bin_number} {name[:70]}")
         result[key] = egov.get_company(bin_number, name)
     return result
+
+
+def _parse_manager_ids(raw: str | None) -> tuple[int, ...]:
+    values: list[int] = []
+    for token in str(raw or "").split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if not token.isdigit() or int(token) <= 0:
+            raise SystemExit(f"--manager-ids contains an invalid user ID: {token!r}")
+        manager_id = int(token)
+        if manager_id not in values:
+            values.append(manager_id)
+    return tuple(values)
 
 
 def _parse_min_created_date(raw: str | None):
@@ -249,6 +276,18 @@ def main() -> int:
                 source_description=args.source_description,
                 dry_run=args.dry_run,
                 validate_custom_field=not args.skip_field_validation,
+                manager_ids=_parse_manager_ids(
+                    getattr(
+                        args,
+                        "manager_ids",
+                        "22,23,16,17,18,38,44,39,40,19,15",
+                    )
+                ),
+                failure_reason_field=getattr(
+                    args,
+                    "failure_reason_field",
+                    "STATUS_DESCRIPTION",
+                ),
             ),
         )
         print(
@@ -262,6 +301,14 @@ def main() -> int:
         resolved_preset = getattr(lead_pipeline, "requisite_preset_id", None)
         if resolved_preset is not None:
             print(f"    Resolved company requisite preset: {resolved_preset}")
+        print(
+            "    Manager pool: "
+            f"{getattr(args, 'manager_ids', '22,23,16,17,18,38,44,39,40,19,15')}"
+        )
+        print(
+            "    Failure reason field: "
+            f"{getattr(args, 'failure_reason_field', 'STATUS_DESCRIPTION')}"
+        )
         for warning in getattr(lead_pipeline, "validation_warnings", []):
             print(f"    WARNING: {warning}")
 
@@ -283,7 +330,8 @@ def main() -> int:
         else:
             print(
                 f"    {result.action}: lead={result.lead_id} company={result.company_id} "
-                f"contact={result.contact_id} requisite={result.requisite_id}"
+                f"contact={result.contact_id} requisite={result.requisite_id} "
+                f"assigned={result.assigned_by_id} status={result.status_id}"
             )
             if result.warning:
                 print(f"    WARNING: {result.warning}")

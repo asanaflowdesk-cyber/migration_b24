@@ -48,7 +48,11 @@ class BitrixClient:
             }
         )
 
-    def call(self, method: str, payload: dict[str, Any] | None = None) -> Any:
+    def _request_data(
+        self,
+        method: str,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         url = self.webhook_url + method + ".json"
         payload = payload or {}
         last_error: Exception | None = None
@@ -85,7 +89,7 @@ class BitrixClient:
 
                 if self.polite_delay_seconds:
                     time.sleep(self.polite_delay_seconds)
-                return data.get("result")
+                return data if isinstance(data, dict) else {"result": data}
             except BitrixError:
                 raise
             except (requests.RequestException, OSError) as exc:
@@ -95,6 +99,29 @@ class BitrixClient:
                 time.sleep(min(20.0, 1.5**attempt))
 
         raise BitrixError(f"{method}: request failed after retries: {last_error}")
+
+    def call(self, method: str, payload: dict[str, Any] | None = None) -> Any:
+        return self._request_data(method, payload).get("result")
+
+    def list_all(
+        self,
+        method: str,
+        payload: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        base = dict(payload or {})
+        start = int(base.pop("start", 0) or 0)
+        rows: list[dict[str, Any]] = []
+        while True:
+            request_payload = {**base, "start": start}
+            data = self._request_data(method, request_payload)
+            result = data.get("result")
+            if isinstance(result, list):
+                rows.extend(row for row in result if isinstance(row, dict))
+            next_value = data.get("next")
+            if next_value in (None, ""):
+                break
+            start = int(next_value)
+        return rows
 
     # ---------- field metadata ----------
 
@@ -113,6 +140,39 @@ class BitrixClient:
     def get_requisite_fields(self) -> dict[str, Any]:
         result = self.call("crm.requisite.fields")
         return result if isinstance(result, dict) else {}
+
+    def list_lead_statuses(self) -> list[dict[str, Any]]:
+        result = self.call(
+            "crm.status.list",
+            {
+                "order": {"SORT": "ASC", "ID": "ASC"},
+                "filter": {"ENTITY_ID": "STATUS"},
+                "select": [
+                    "ID",
+                    "STATUS_ID",
+                    "NAME",
+                    "SEMANTICS",
+                    "SORT",
+                ],
+            },
+        )
+        return result if isinstance(result, list) else []
+
+    def count_open_leads_for_manager(
+        self,
+        manager_id: int,
+        terminal_status_ids: set[str] | None = None,
+    ) -> int:
+        terminal = {str(value) for value in (terminal_status_ids or set()) if str(value)}
+        rows = self.list_all(
+            "crm.lead.list",
+            {
+                "order": {"ID": "ASC"},
+                "filter": {"ASSIGNED_BY_ID": int(manager_id)},
+                "select": ["ID", "STATUS_ID"],
+            },
+        )
+        return sum(1 for row in rows if str(row.get("STATUS_ID") or "") not in terminal)
 
     def discover_company_requisite_preset_id(self) -> int | None:
         """Return the preset already used by company requisites in the box.
@@ -180,6 +240,10 @@ class BitrixClient:
             "ID",
             "TITLE",
             "STATUS_ID",
+            "STATUS_DESCRIPTION",
+            "STATUS_SEMANTIC_ID",
+            "DATE_CREATE",
+            "DATE_MODIFY",
             "ASSIGNED_BY_ID",
             "COMPANY_ID",
             "CONTACT_ID",
@@ -226,6 +290,200 @@ class BitrixClient:
         )
         if isinstance(legacy_result, list) and legacy_result:
             return legacy_result[0]
+        return None
+
+    def find_lead_by_application(
+        self,
+        doc_number: str,
+        bin_number: str,
+        originator_id: str = "EQAZYNA_LEAD",
+        extra_select: list[str] | None = None,
+    ) -> dict[str, Any] | None:
+        """Find an existing lead for one exact e-Qazyna application.
+
+        New parser records use ORIGIN_ID equal to the application number.
+        Legacy parser records are also detected by the old composite origin,
+        title or comments so an already loaded application is never created
+        twice.
+        """
+        select = [
+            "ID",
+            "TITLE",
+            "STATUS_ID",
+            "STATUS_DESCRIPTION",
+            "STATUS_SEMANTIC_ID",
+            "DATE_CREATE",
+            "DATE_MODIFY",
+            "ASSIGNED_BY_ID",
+            "COMPANY_ID",
+            "CONTACT_ID",
+            "COMPANY_TITLE",
+            "NAME",
+            "LAST_NAME",
+            "SECOND_NAME",
+            "COMMENTS",
+            "PHONE",
+            "ADDRESS",
+            "ADDRESS_CITY",
+            "ADDRESS_REGION",
+            "ORIGINATOR_ID",
+            "ORIGIN_ID",
+        ]
+        for field_name in extra_select or []:
+            if field_name and field_name not in select:
+                select.append(field_name)
+
+        doc_number = str(doc_number or "").strip()
+        bin_number = str(bin_number or "").strip()
+        if not doc_number:
+            return None
+
+        exact_queries = [
+            {"ORIGINATOR_ID": originator_id, "ORIGIN_ID": doc_number},
+            {"ORIGINATOR_ID": originator_id, "ORIGIN_ID": f"eQazyna|{doc_number}|{bin_number}"},
+            {"ORIGINATOR_ID": "EQAZYNA", "ORIGIN_ID": f"eQazyna|{doc_number}|{bin_number}"},
+        ]
+        for filter_fields in exact_queries:
+            result = self.call(
+                "crm.lead.list",
+                {
+                    "order": {"ID": "DESC"},
+                    "filter": filter_fields,
+                    "select": select,
+                },
+            )
+            if isinstance(result, list) and result:
+                return result[0]
+
+        # Compatibility with old consolidated leads where one lead contained
+        # several application blocks and ORIGIN_ID was the BIN.
+        fuzzy_queries = [
+            {"%TITLE": doc_number},
+            {"%COMMENTS": f"Номер заявки: {doc_number}"},
+            {"%COMMENTS": f"eQazyna|{doc_number}|{bin_number}"},
+        ]
+        for filter_fields in fuzzy_queries:
+            result = self.call(
+                "crm.lead.list",
+                {
+                    "order": {"ID": "DESC"},
+                    "filter": filter_fields,
+                    "select": select,
+                },
+            )
+            if isinstance(result, list) and result:
+                return result[0]
+        return None
+
+    def find_latest_lead_for_company(
+        self,
+        company_id: str | int,
+        extra_select: list[str] | None = None,
+    ) -> dict[str, Any] | None:
+        select = [
+            "ID",
+            "TITLE",
+            "STATUS_ID",
+            "STATUS_DESCRIPTION",
+            "STATUS_SEMANTIC_ID",
+            "DATE_CREATE",
+            "DATE_MODIFY",
+            "ASSIGNED_BY_ID",
+            "COMPANY_ID",
+            "CONTACT_ID",
+            "COMMENTS",
+            "ORIGINATOR_ID",
+            "ORIGIN_ID",
+        ]
+        for field_name in extra_select or []:
+            if field_name and field_name not in select:
+                select.append(field_name)
+        result = self.call(
+            "crm.lead.list",
+            {
+                "order": {"DATE_MODIFY": "DESC", "ID": "DESC"},
+                "filter": {"COMPANY_ID": int(company_id)},
+                "select": select,
+            },
+        )
+        return result[0] if isinstance(result, list) and result else None
+
+    def find_latest_lead_for_contact(
+        self,
+        contact_id: str | int,
+        extra_select: list[str] | None = None,
+    ) -> dict[str, Any] | None:
+        select = [
+            "ID",
+            "TITLE",
+            "STATUS_ID",
+            "STATUS_DESCRIPTION",
+            "STATUS_SEMANTIC_ID",
+            "DATE_CREATE",
+            "DATE_MODIFY",
+            "ASSIGNED_BY_ID",
+            "COMPANY_ID",
+            "CONTACT_ID",
+            "COMMENTS",
+            "ORIGINATOR_ID",
+            "ORIGIN_ID",
+        ]
+        for field_name in extra_select or []:
+            if field_name and field_name not in select:
+                select.append(field_name)
+        result = self.call(
+            "crm.lead.list",
+            {
+                "order": {"DATE_MODIFY": "DESC", "ID": "DESC"},
+                "filter": {"CONTACT_ID": int(contact_id)},
+                "select": select,
+            },
+        )
+        return result[0] if isinstance(result, list) and result else None
+
+    def find_latest_lead_by_bin(
+        self,
+        bin_number: str,
+        extra_select: list[str] | None = None,
+    ) -> dict[str, Any] | None:
+        """Fallback for legacy leads not linked to a company."""
+        select = [
+            "ID",
+            "TITLE",
+            "STATUS_ID",
+            "STATUS_DESCRIPTION",
+            "STATUS_SEMANTIC_ID",
+            "DATE_CREATE",
+            "DATE_MODIFY",
+            "ASSIGNED_BY_ID",
+            "COMPANY_ID",
+            "CONTACT_ID",
+            "COMMENTS",
+            "ORIGINATOR_ID",
+            "ORIGIN_ID",
+        ]
+        for field_name in extra_select or []:
+            if field_name and field_name not in select:
+                select.append(field_name)
+        bin_number = str(bin_number or "").strip()
+        if not bin_number:
+            return None
+        queries = [
+            {"ORIGINATOR_ID": "EQAZYNA_LEAD", "ORIGIN_ID": bin_number},
+            {"ORIGINATOR_ID": "EQAZYNA", "%ORIGIN_ID": bin_number},
+            {"%COMMENTS": f"БИН: {bin_number}"},
+        ]
+        for filter_fields in queries:
+            result = self.call(
+                "crm.lead.list",
+                {
+                    "order": {"DATE_MODIFY": "DESC", "ID": "DESC"},
+                    "filter": filter_fields,
+                    "select": select,
+                },
+            )
+            if isinstance(result, list) and result:
+                return result[0]
         return None
 
     def create_lead(self, fields: dict[str, Any]) -> str:

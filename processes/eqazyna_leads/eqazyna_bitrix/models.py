@@ -60,6 +60,10 @@ class ProcessResult:
     address_action: str | None = None
     assigned_by_id: int | None = None
     assignment_reason: str | None = None
+    status_id: str | None = None
+    status_reason: str | None = None
+    failure_reason: str | None = None
+    status_reference_lead_id: str | None = None
     warning: str | None = None
     error: str | None = None
 
@@ -97,6 +101,10 @@ class ProcessResult:
             "address_action": self.address_action,
             "assigned_by_id": self.assigned_by_id,
             "assignment_reason": self.assignment_reason,
+            "status_id": self.status_id,
+            "status_reason": self.status_reason,
+            "failure_reason": self.failure_reason,
+            "status_reference_lead_id": self.status_reference_lead_id,
             "warning": self.warning,
             "error": self.error,
             "source_url": self.app.source_url,

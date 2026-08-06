@@ -77,3 +77,58 @@ def test_discover_company_requisite_preset_uses_most_common_existing_value():
 
     assert client.discover_company_requisite_preset_id() == 1
     assert session.calls[0][1]["filter"] == {"ENTITY_TYPE_ID": 4}
+
+
+def test_find_lead_by_application_prefers_exact_application_origin():
+    session = FakeSession(
+        [[
+            {
+                "ID": "902",
+                "ORIGINATOR_ID": "EQAZYNA_LEAD",
+                "ORIGIN_ID": "47408-NEA",
+            }
+        ]]
+    )
+    client = BitrixClient(
+        "https://box.example.invalid/rest/1/token",
+        polite_delay_seconds=0,
+        session=session,
+    )
+
+    lead = client.find_lead_by_application("47408-NEA", "123456789012")
+
+    assert lead["ID"] == "902"
+    assert len(session.calls) == 1
+    assert session.calls[0][1]["filter"] == {
+        "ORIGINATOR_ID": "EQAZYNA_LEAD",
+        "ORIGIN_ID": "47408-NEA",
+    }
+
+
+def test_find_lead_by_application_falls_back_to_legacy_comment():
+    session = FakeSession(
+        [
+            [],
+            [],
+            [],
+            [],
+            [
+                {
+                    "ID": "903",
+                    "COMMENTS": "Номер заявки: 47408-NEA",
+                }
+            ],
+        ]
+    )
+    client = BitrixClient(
+        "https://box.example.invalid/rest/1/token",
+        polite_delay_seconds=0,
+        session=session,
+    )
+
+    lead = client.find_lead_by_application("47408-NEA", "123456789012")
+
+    assert lead["ID"] == "903"
+    assert session.calls[-1][1]["filter"] == {
+        "%COMMENTS": "Номер заявки: 47408-NEA",
+    }
