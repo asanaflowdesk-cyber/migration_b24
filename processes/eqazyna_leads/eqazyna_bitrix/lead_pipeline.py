@@ -23,7 +23,7 @@ DEFAULT_LEAD_GENERATION_VALUE = "ГПО Недропользователя"
 DEFAULT_ORIGINATOR_ID = "EQAZYNA_LEAD"
 DEFAULT_COMPANY_ORIGINATOR_ID = "EQAZYNA"
 DEFAULT_REQUISITE_PRESET_ID = "1"
-DEFAULT_FAILURE_REASON_FIELD = "STATUS_DESCRIPTION"
+DEFAULT_FAILURE_REASON_FIELD = "UF_CRM_1785508658316"
 DEFAULT_MANAGER_IDS = (22, 23, 16, 17, 18, 38, 44, 39, 40, 19, 15)
 
 
@@ -94,6 +94,12 @@ class LeadPipeline:
             )
         )
         self._manager_loads: dict[int, int] = {}
+        # Entities created earlier in the same run must be reused even in dry_run.
+        # This keeps the preview identical to apply and prevents one director
+        # from receiving different managers across several applications.
+        self._run_companies_by_bin: dict[str, dict[str, Any]] = {}
+        self._run_contacts_by_key: dict[str, dict[str, Any]] = {}
+        self._run_requisites_by_bin: dict[str, dict[str, Any]] = {}
         self._failed_status_ids: set[str] = {"JUNK"}
         self._terminal_status_ids: set[str] = {"JUNK", "CONVERTED"}
         self._random = (
@@ -371,6 +377,8 @@ class LeadPipeline:
                     preferred_assigned_by_id=inherited_assigned_by_id,
                     force_assigned_by=force_entity_assignment,
                 )
+                if company.record:
+                    self._run_companies_by_bin[app.bin] = company.record
                 if company.warning:
                     warnings.append(company.warning)
             except Exception as exc:  # noqa: BLE001 - lead must still be created
@@ -386,6 +394,9 @@ class LeadPipeline:
                     preferred_assigned_by_id=inherited_assigned_by_id,
                     force_assigned_by=force_entity_assignment,
                 )
+                contact_key = self._director_cache_key(app, enrichment)
+                if contact.record and contact_key:
+                    self._run_contacts_by_key[contact_key] = contact.record
                 if contact.warning:
                     warnings.append(contact.warning)
             except Exception as exc:  # noqa: BLE001 - lead must still be created
@@ -415,6 +426,8 @@ class LeadPipeline:
             # parser result.
             try:
                 requisite = self._ensure_requisite(app, enrichment, company.entity_id)
+                if requisite.record:
+                    self._run_requisites_by_bin[app.bin] = requisite.record
                 if requisite.warning:
                     warnings.append(requisite.warning)
             except Exception as exc:  # noqa: BLE001 - non-blocking by design
@@ -454,6 +467,9 @@ class LeadPipeline:
             )
 
     def _find_existing_company(self, app: Application) -> dict[str, Any] | None:
+        planned = self._run_companies_by_bin.get(app.bin)
+        if planned:
+            return planned
         company = self.client.find_company_by_origin(
             app.bin,
             originator_id=self.config.company_originator_id,
@@ -484,6 +500,9 @@ class LeadPipeline:
         enrichment: CompanyEnrichment,
         company: dict[str, Any] | None,
     ) -> dict[str, Any] | None:
+        cache_key = self._director_cache_key(app, enrichment)
+        if cache_key and cache_key in self._run_contacts_by_key:
+            return self._run_contacts_by_key[cache_key]
         company_id = str((company or {}).get("ID") or "")
         person = self._split_director_name(enrichment.director)
         if not company_id.isdigit() or person is None:
@@ -495,6 +514,17 @@ class LeadPipeline:
             name,
             second_name,
         )
+
+    def _director_cache_key(
+        self,
+        app: Application,
+        enrichment: CompanyEnrichment,
+    ) -> str | None:
+        person = self._split_director_name(enrichment.director)
+        if person is None:
+            return None
+        normalized = "|".join(self._normalise_label(value) for value in person)
+        return f"{app.bin}|{normalized}"
 
     def _find_contact_reference_lead(
         self,
@@ -671,6 +701,8 @@ class LeadPipeline:
             company_id = str(company.get("ID") or "")
             if not company_id:
                 raise BitrixError("crm.company.list вернул компанию без ID")
+            if company.get("_EQAZYNA_PLANNED"):
+                return EntityOutcome(company_id, "dry_run_reuse_planned_company", company)
             changed = self._only_changed_fields(company, desired)
             if self.config.dry_run:
                 return EntityOutcome(
@@ -685,7 +717,9 @@ class LeadPipeline:
             return EntityOutcome(company_id, "company_unchanged", company)
 
         if self.config.dry_run:
-            return EntityOutcome("DRY_RUN_COMPANY", "dry_run_create_company", desired)
+            company_id = f"DRY_RUN_COMPANY:{app.bin}"
+            record = {"ID": company_id, "_EQAZYNA_PLANNED": True, **desired}
+            return EntityOutcome(company_id, "dry_run_create_company", record)
 
         company_id = self.client.create_company(desired)
         return EntityOutcome(company_id, "created_company", {"ID": company_id, **desired})
@@ -731,12 +765,23 @@ class LeadPipeline:
         enrichment: CompanyEnrichment,
         company_id: str | None,
     ) -> EntityOutcome:
+        planned = self._run_requisites_by_bin.get(app.bin)
+        if planned:
+            return EntityOutcome(
+                str(planned.get("ID") or "") or None,
+                "dry_run_reuse_planned_requisite" if self.config.dry_run else "reused_run_requisite",
+                planned,
+                address_action="address_reused_in_run",
+            )
         if not company_id:
             return EntityOutcome(None, "requisite_skipped", warning="Реквизит не создан: отсутствует компания")
-        if company_id == "DRY_RUN_COMPANY":
+        if company_id.startswith("DRY_RUN_COMPANY"):
+            requisite_id = f"DRY_RUN_REQUISITE:{app.bin}"
+            record = {"ID": requisite_id, "_EQAZYNA_PLANNED": True}
             return EntityOutcome(
-                "DRY_RUN_REQUISITE",
+                requisite_id,
                 "dry_run_create_requisite",
+                record,
                 address_action=(
                     "dry_run_create_address" if enrichment.legal_address else "address_skipped_no_value"
                 ),
@@ -869,9 +914,12 @@ class LeadPipeline:
                     else None
                 ),
             )
+        if existing_contact and existing_contact.get("_EQAZYNA_PLANNED"):
+            contact_id = str(existing_contact.get("ID") or "")
+            return EntityOutcome(contact_id or None, "dry_run_reuse_planned_contact", existing_contact)
         if not company_id:
             return EntityOutcome(None, "contact_skipped", warning="Контакт не создан: отсутствует компания")
-        if company_id == "DRY_RUN_COMPANY":
+        if company_id.startswith("DRY_RUN_COMPANY"):
             desired = self._contact_fields(
                 app,
                 enrichment,
@@ -879,10 +927,13 @@ class LeadPipeline:
                 person,
                 None,
             )
-            desired["COMPANY_ID"] = "DRY_RUN_COMPANY"
+            desired["COMPANY_ID"] = company_id
             if preferred_assigned_by_id:
                 desired["ASSIGNED_BY_ID"] = preferred_assigned_by_id
-            return EntityOutcome("DRY_RUN_CONTACT", "dry_run_create_contact", desired)
+            contact_key = self._director_cache_key(app, enrichment) or app.bin
+            contact_id = f"DRY_RUN_CONTACT:{contact_key}"
+            record = {"ID": contact_id, "_EQAZYNA_PLANNED": True, **desired}
+            return EntityOutcome(contact_id, "dry_run_create_contact", record)
 
         last_name, name, second_name = person
         contact = existing_contact or self.client.find_director_contact(
@@ -904,6 +955,8 @@ class LeadPipeline:
             contact_id = str(contact.get("ID") or "")
             if not contact_id:
                 raise BitrixError("crm.contact.list вернул контакт без ID")
+            if contact.get("_EQAZYNA_PLANNED"):
+                return EntityOutcome(contact_id, "dry_run_reuse_planned_contact", contact)
             changed = self._only_changed_fields(contact, desired)
             if self.config.dry_run:
                 return EntityOutcome(
@@ -917,7 +970,10 @@ class LeadPipeline:
             return EntityOutcome(contact_id, "contact_unchanged", contact)
 
         if self.config.dry_run:
-            return EntityOutcome("DRY_RUN_CONTACT", "dry_run_create_contact", desired)
+            contact_key = self._director_cache_key(app, enrichment) or app.bin
+            contact_id = f"DRY_RUN_CONTACT:{contact_key}"
+            record = {"ID": contact_id, "_EQAZYNA_PLANNED": True, **desired}
+            return EntityOutcome(contact_id, "dry_run_create_contact", record)
         contact_id = self.client.create_contact(desired)
         return EntityOutcome(contact_id, "created_contact", {"ID": contact_id, **desired})
 

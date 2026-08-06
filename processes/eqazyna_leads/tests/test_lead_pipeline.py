@@ -9,6 +9,7 @@ from eqazyna_bitrix.models import Application, CompanyEnrichment
 
 FIELD = "UF_CRM_1785917145255"
 VALUE = "ГПО Недропользователя"
+FAILURE_FIELD = "UF_CRM_1785508658316"
 
 
 def application(doc_number: str = "APP-1") -> Application:
@@ -130,19 +131,19 @@ class FakeClient:
     def find_latest_lead_for_company(self, company_id, extra_select=None):
         assert str(company_id) == "601"
         assert FIELD in (extra_select or [])
-        assert "STATUS_DESCRIPTION" in (extra_select or [])
+        assert FAILURE_FIELD in (extra_select or [])
         return self.lead
 
     def find_latest_lead_for_contact(self, contact_id, extra_select=None):
         assert str(contact_id) == "801"
         assert FIELD in (extra_select or [])
-        assert "STATUS_DESCRIPTION" in (extra_select or [])
+        assert FAILURE_FIELD in (extra_select or [])
         return self.contact_lead
 
     def find_latest_lead_by_bin(self, bin_number, extra_select=None):
         assert bin_number == "123456789012"
         assert FIELD in (extra_select or [])
-        assert "STATUS_DESCRIPTION" in (extra_select or [])
+        assert FAILURE_FIELD in (extra_select or [])
         return self.lead
 
     def create_lead(self, fields):
@@ -322,7 +323,7 @@ def test_failed_previous_company_lead_inherits_stage_reason_but_not_company_owne
         "TITLE": "ТОО Тест Недра. e-Qazyna № APP-1",
         "STATUS_ID": "JUNK",
         "STATUS_SEMANTIC_ID": "F",
-        "STATUS_DESCRIPTION": "Клиент отказался",
+        FAILURE_FIELD: "Клиент отказался",
         "DATE_MODIFY": "2026-08-05T10:00:00+05:00",
         "ASSIGNED_BY_ID": "999",
         "COMPANY_ID": "601",
@@ -346,7 +347,7 @@ def test_failed_previous_company_lead_inherits_stage_reason_but_not_company_owne
     assert result.status_reference_lead_id == "77"
     assert client.created_lead_fields["ASSIGNED_BY_ID"] == 44
     assert client.created_lead_fields["STATUS_ID"] == "JUNK"
-    assert client.created_lead_fields["STATUS_DESCRIPTION"] == "Клиент отказался"
+    assert client.created_lead_fields[FAILURE_FIELD] == "Клиент отказался"
     assert client.created_lead_fields["ORIGIN_ID"] == "APP-2"
     assert client.created_lead_fields["TITLE"].endswith("e-Qazyna № APP-2")
 
@@ -597,7 +598,7 @@ def test_latest_related_lead_controls_failed_stage_and_reason():
         "ID": "91",
         "STATUS_ID": "JUNK",
         "STATUS_SEMANTIC_ID": "F",
-        "STATUS_DESCRIPTION": "Не дозвонились",
+        FAILURE_FIELD: "Не дозвонились",
         "ASSIGNED_BY_ID": "16",
         "COMPANY_ID": "601",
         "DATE_MODIFY": "2026-08-05T14:00:00+05:00",
@@ -616,7 +617,7 @@ def test_latest_related_lead_controls_failed_stage_and_reason():
     assert result.status_id == "JUNK"
     assert result.failure_reason == "Не дозвонились"
     assert result.status_reference_lead_id == "91"
-    assert client.created_lead_fields["STATUS_DESCRIPTION"] == "Не дозвонились"
+    assert client.created_lead_fields[FAILURE_FIELD] == "Не дозвонились"
 
 
 def test_newer_active_lead_means_new_stage_even_when_older_lead_failed():
@@ -645,7 +646,7 @@ def test_newer_active_lead_means_new_stage_even_when_older_lead_failed():
         "ID": "91",
         "STATUS_ID": "JUNK",
         "STATUS_SEMANTIC_ID": "F",
-        "STATUS_DESCRIPTION": "Клиент отказался",
+        FAILURE_FIELD: "Клиент отказался",
         "ASSIGNED_BY_ID": "16",
         "COMPANY_ID": "601",
         "DATE_MODIFY": "2026-08-05T14:00:00+05:00",
@@ -662,7 +663,7 @@ def test_newer_active_lead_means_new_stage_even_when_older_lead_failed():
     assert result.status_id == "NEW"
     assert result.status_reason == "default_new"
     assert result.failure_reason is None
-    assert "STATUS_DESCRIPTION" not in client.created_lead_fields
+    assert FAILURE_FIELD not in client.created_lead_fields
 
 
 def test_distribution_is_random_only_between_least_loaded_managers_and_assigns_bundle():
@@ -721,3 +722,47 @@ def test_director_contact_owner_outside_approved_pool_is_ignored():
     assert result.assignment_reason == "least_loaded_random"
     assert client.updated_company_fields["ASSIGNED_BY_ID"] == 44
     assert client.updated_contact_fields["ASSIGNED_BY_ID"] == 44
+
+
+def test_dry_run_reuses_planned_contact_owner_for_same_director_and_bin():
+    client = FakeClient()
+    parser = pipeline(client, dry_run=True, random_seed=3)
+
+    first = parser.process(application("APP-1"), enrichment())
+    second = parser.process(application("APP-2"), enrichment())
+
+    assert first.action == "dry_run_create_lead"
+    assert second.action == "dry_run_create_lead"
+    assert first.assigned_by_id == second.assigned_by_id
+    assert first.assignment_reason == "least_loaded_random"
+    assert second.assignment_reason == "director_contact_owner"
+    assert first.company_action == "dry_run_create_company"
+    assert second.company_action == "dry_run_reuse_planned_company"
+    assert first.contact_action == "dry_run_create_contact"
+    assert second.contact_action == "dry_run_reuse_planned_contact"
+    assert first.requisite_action == "dry_run_create_requisite"
+    assert second.requisite_action == "dry_run_reuse_planned_requisite"
+
+
+def test_failure_reason_uses_migrated_lead_enumeration_field():
+    company = {
+        "ID": "601",
+        "TITLE": "ТОО Тест Недра",
+        "ORIGINATOR_ID": "EQAZYNA",
+        "ORIGIN_ID": "123456789012",
+    }
+    previous = {
+        "ID": "77",
+        "STATUS_ID": "JUNK",
+        "STATUS_SEMANTIC_ID": "F",
+        FAILURE_FIELD: "901",
+        "COMPANY_ID": "601",
+        "DATE_MODIFY": "2026-08-05T10:00:00+05:00",
+    }
+    client = FakeClient(company=company, lead=previous)
+
+    result = pipeline(client).process(application("APP-2"), enrichment())
+
+    assert result.status_id == "JUNK"
+    assert result.failure_reason == "901"
+    assert client.created_lead_fields[FAILURE_FIELD] == "901"

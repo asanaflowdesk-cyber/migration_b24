@@ -86,7 +86,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--failure-reason-field",
-        default=os.getenv("BITRIX_LEAD_FAILURE_REASON_FIELD", "STATUS_DESCRIPTION"),
+        default=os.getenv("BITRIX_LEAD_FAILURE_REASON_FIELD", "UF_CRM_1785508658316"),
         help="Lead field copied together with a failed stage",
     )
     parser.add_argument(
@@ -286,7 +286,7 @@ def main() -> int:
                 failure_reason_field=getattr(
                     args,
                     "failure_reason_field",
-                    "STATUS_DESCRIPTION",
+                    "UF_CRM_1785508658316",
                 ),
             ),
         )
@@ -307,7 +307,7 @@ def main() -> int:
         )
         print(
             "    Failure reason field: "
-            f"{getattr(args, 'failure_reason_field', 'STATUS_DESCRIPTION')}"
+            f"{getattr(args, 'failure_reason_field', 'UF_CRM_1785508658316')}"
         )
         for warning in getattr(lead_pipeline, "validation_warnings", []):
             print(f"    WARNING: {warning}")
