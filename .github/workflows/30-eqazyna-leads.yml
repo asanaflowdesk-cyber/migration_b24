@@ -40,9 +40,9 @@ on:
         default: ""
         type: string
       upload_logs:
-        description: "Выгрузить Excel/JSON в artifact"
+        description: "Устаревший параметр: журнал теперь загружается всегда"
         required: true
-        default: false
+        default: true
         type: boolean
       confirm:
         description: "Для apply введите IMPORT_EQAZYNA_LEADS"
@@ -150,8 +150,14 @@ jobs:
           if errorlevel 1 exit /b 1
           dir output
 
+      - name: Показать подробный журнал
+        if: ${{ always() }}
+        run: |
+          chcp 65001 >nul
+          if exist output\eqazyna_bitrix_leads_journal.txt type output\eqazyna_bitrix_leads_journal.txt
+
       - name: Загрузить журнал запуска
-        if: ${{ always() && inputs.upload_logs }}
+        if: ${{ always() }}
         uses: actions/upload-artifact@v6
         with:
           name: 30-eqazyna-leads-${{ github.run_number }}
