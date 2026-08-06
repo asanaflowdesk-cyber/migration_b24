@@ -51,6 +51,13 @@ class ProcessResult:
     enrichment: CompanyEnrichment
     action: str
     lead_id: str | None = None
+    company_id: str | None = None
+    contact_id: str | None = None
+    requisite_id: str | None = None
+    company_action: str | None = None
+    contact_action: str | None = None
+    requisite_action: str | None = None
+    address_action: str | None = None
     assigned_by_id: int | None = None
     assignment_reason: str | None = None
     warning: str | None = None
@@ -81,6 +88,13 @@ class ProcessResult:
             "city": self.enrichment.city,
             "action": self.action,
             "lead_id": self.lead_id,
+            "company_id": self.company_id,
+            "contact_id": self.contact_id,
+            "requisite_id": self.requisite_id,
+            "company_action": self.company_action,
+            "contact_action": self.contact_action,
+            "requisite_action": self.requisite_action,
+            "address_action": self.address_action,
             "assigned_by_id": self.assigned_by_id,
             "assignment_reason": self.assignment_reason,
             "warning": self.warning,

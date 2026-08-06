@@ -12,7 +12,7 @@ class FakeSettings:
     polite_delay_seconds = 0
     bitrix_polite_delay_seconds = 0
     egov_polite_delay_seconds = 0
-    egov_api_key = None
+    egov_api_key = "test-key"
     bitrix_webhook_url = "https://bitrix.example.invalid/webhook/"
     bitrix_tls_verify = True
 
@@ -100,8 +100,10 @@ def test_main_processes_each_application_once(monkeypatch, tmp_path):
             assigned_by_id="36",
             overwrite_assigned_by_on_update=False,
             lead_generation_field="UF_CRM_1785917145255",
-            lead_generation_value="ГПО недропользователя",
+            lead_generation_value="ГПО Недропользователя",
             originator_id="EQAZYNA_LEAD",
+            company_originator_id="EQAZYNA",
+            requisite_preset_id="1",
             source_id="OTHER",
             source_description="e-Qazyna Minerals — ГПО недропользователи",
             skip_field_validation=False,

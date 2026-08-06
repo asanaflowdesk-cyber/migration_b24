@@ -44,7 +44,7 @@ class BitrixClient:
             {
                 "Accept": "application/json",
                 "Content-Type": "application/json",
-                "User-Agent": "migration-b24-eqazyna-leads/1.0",
+                "User-Agent": "migration-b24-eqazyna-leads/2.0",
             }
         )
 
@@ -96,9 +96,43 @@ class BitrixClient:
 
         raise BitrixError(f"{method}: request failed after retries: {last_error}")
 
+    # ---------- field metadata ----------
+
     def get_lead_fields(self) -> dict[str, Any]:
         result = self.call("crm.lead.fields")
         return result if isinstance(result, dict) else {}
+
+    def get_company_fields(self) -> dict[str, Any]:
+        result = self.call("crm.company.fields")
+        return result if isinstance(result, dict) else {}
+
+    def get_contact_fields(self) -> dict[str, Any]:
+        result = self.call("crm.contact.fields")
+        return result if isinstance(result, dict) else {}
+
+    def get_requisite_fields(self) -> dict[str, Any]:
+        result = self.call("crm.requisite.fields")
+        return result if isinstance(result, dict) else {}
+
+    def list_requisite_presets(self) -> list[dict[str, Any]]:
+        result = self.call(
+            "crm.requisite.preset.list",
+            {
+                "order": {"SORT": "ASC", "ID": "ASC"},
+                "filter": {"ENTITY_TYPE_ID": 4},
+                "select": [
+                    "ID",
+                    "NAME",
+                    "ACTIVE",
+                    "SORT",
+                    "ENTITY_TYPE_ID",
+                    "COUNTRY_ID",
+                ],
+            },
+        )
+        return result if isinstance(result, list) else []
+
+    # ---------- leads ----------
 
     def find_lead_by_origin(
         self,
@@ -106,22 +140,23 @@ class BitrixClient:
         originator_id: str = "EQAZYNA_LEAD",
         extra_select: list[str] | None = None,
     ) -> dict[str, Any] | None:
-        """Find the canonical lead and then a migrated legacy e-Qazyna lead.
-
-        The historical cloud parser stored one deal per application using
-        ORIGINATOR_ID=EQAZYNA and ORIGIN_ID=eQazyna|<document>|<BIN>. During
-        migration those values are preserved on the new leads. The current
-        parser maintains one lead per BIN, so it first searches the canonical
-        marker and then falls back to the legacy marker containing the BIN.
-        """
+        """Find canonical lead, then a migrated legacy e-Qazyna lead."""
         select = [
             "ID",
             "TITLE",
             "STATUS_ID",
             "ASSIGNED_BY_ID",
+            "COMPANY_ID",
+            "CONTACT_ID",
             "COMPANY_TITLE",
+            "NAME",
+            "LAST_NAME",
+            "SECOND_NAME",
             "COMMENTS",
             "PHONE",
+            "ADDRESS",
+            "ADDRESS_CITY",
+            "ADDRESS_REGION",
             "ORIGINATOR_ID",
             "ORIGIN_ID",
         ]
@@ -179,6 +214,217 @@ class BitrixClient:
                 "params": {"REGISTER_SONET_EVENT": "N"},
             },
         )
+
+    # ---------- companies ----------
+
+    def get_company(self, company_id: str | int) -> dict[str, Any] | None:
+        result = self.call("crm.company.get", {"id": int(company_id)})
+        return result if isinstance(result, dict) else None
+
+    def find_company_by_origin(
+        self,
+        origin_id: str,
+        originator_id: str = "EQAZYNA",
+    ) -> dict[str, Any] | None:
+        result = self.call(
+            "crm.company.list",
+            {
+                "order": {"ID": "ASC"},
+                "filter": {
+                    "ORIGINATOR_ID": originator_id,
+                    "ORIGIN_ID": origin_id,
+                },
+                "select": [
+                    "ID",
+                    "TITLE",
+                    "ASSIGNED_BY_ID",
+                    "COMMENTS",
+                    "PHONE",
+                    "ADDRESS",
+                    "ADDRESS_CITY",
+                    "ADDRESS_REGION",
+                    "ADDRESS_PROVINCE",
+                    "ADDRESS_COUNTRY",
+                    "ORIGINATOR_ID",
+                    "ORIGIN_ID",
+                ],
+            },
+        )
+        return result[0] if isinstance(result, list) and result else None
+
+    def find_company_by_bin(
+        self,
+        bin_number: str,
+        bin_field: str = "RQ_BIN",
+    ) -> dict[str, Any] | None:
+        requisites = self.call(
+            "crm.requisite.list",
+            {
+                "order": {"ID": "ASC"},
+                "filter": {"ENTITY_TYPE_ID": 4, bin_field: bin_number},
+                "select": ["*"],
+            },
+        )
+        if not isinstance(requisites, list):
+            return None
+        for requisite in requisites:
+            company_id = requisite.get("ENTITY_ID") if isinstance(requisite, dict) else None
+            if company_id not in (None, ""):
+                company = self.get_company(company_id)
+                if company:
+                    return company
+        return None
+
+    def create_company(self, fields: dict[str, Any]) -> str:
+        result = self.call(
+            "crm.company.add",
+            {
+                "fields": fields,
+                "params": {"REGISTER_SONET_EVENT": "N"},
+            },
+        )
+        if result in (None, ""):
+            raise BitrixError("crm.company.add returned an empty company ID")
+        return str(result)
+
+    def update_company(self, company_id: str, fields: dict[str, Any]) -> None:
+        self.call(
+            "crm.company.update",
+            {
+                "id": int(company_id),
+                "fields": fields,
+                "params": {"REGISTER_SONET_EVENT": "N"},
+            },
+        )
+
+    # ---------- contacts ----------
+
+    def find_director_contact(
+        self,
+        company_id: str | int,
+        last_name: str,
+        name: str,
+        second_name: str = "",
+    ) -> dict[str, Any] | None:
+        filter_fields: dict[str, Any] = {
+            "COMPANY_ID": int(company_id),
+            "LAST_NAME": last_name,
+            "NAME": name,
+        }
+        if second_name:
+            filter_fields["SECOND_NAME"] = second_name
+        result = self.call(
+            "crm.contact.list",
+            {
+                "order": {"ID": "ASC"},
+                "filter": filter_fields,
+                "select": [
+                    "ID",
+                    "NAME",
+                    "LAST_NAME",
+                    "SECOND_NAME",
+                    "POST",
+                    "COMPANY_ID",
+                    "ASSIGNED_BY_ID",
+                    "COMMENTS",
+                    "ORIGINATOR_ID",
+                    "ORIGIN_ID",
+                ],
+            },
+        )
+        return result[0] if isinstance(result, list) and result else None
+
+    def create_contact(self, fields: dict[str, Any]) -> str:
+        result = self.call(
+            "crm.contact.add",
+            {
+                "fields": fields,
+                "params": {"REGISTER_SONET_EVENT": "N"},
+            },
+        )
+        if result in (None, ""):
+            raise BitrixError("crm.contact.add returned an empty contact ID")
+        return str(result)
+
+    def update_contact(self, contact_id: str, fields: dict[str, Any]) -> None:
+        self.call(
+            "crm.contact.update",
+            {
+                "id": int(contact_id),
+                "fields": fields,
+                "params": {"REGISTER_SONET_EVENT": "N"},
+            },
+        )
+
+    # ---------- requisites and addresses ----------
+
+    def find_company_requisite(
+        self,
+        company_id: str | int,
+        bin_number: str,
+        bin_field: str = "RQ_BIN",
+    ) -> dict[str, Any] | None:
+        result = self.call(
+            "crm.requisite.list",
+            {
+                "order": {"ID": "ASC"},
+                "filter": {
+                    "ENTITY_TYPE_ID": 4,
+                    "ENTITY_ID": int(company_id),
+                },
+                "select": ["*"],
+            },
+        )
+        if not isinstance(result, list):
+            return None
+        wanted = str(bin_number or "").strip()
+        expected_xml = f"EQAZYNA-REQ-{wanted}"
+        for row in result:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get(bin_field) or "").strip() == wanted:
+                return row
+            if str(row.get("XML_ID") or "").strip() == expected_xml:
+                return row
+        return None
+
+    def create_requisite(self, fields: dict[str, Any]) -> str:
+        result = self.call("crm.requisite.add", {"fields": fields})
+        if result in (None, ""):
+            raise BitrixError("crm.requisite.add returned an empty requisite ID")
+        return str(result)
+
+    def update_requisite(self, requisite_id: str, fields: dict[str, Any]) -> None:
+        self.call(
+            "crm.requisite.update",
+            {"id": int(requisite_id), "fields": fields},
+        )
+
+    def find_requisite_address(
+        self,
+        requisite_id: str | int,
+        address_type_id: int = 1,
+    ) -> dict[str, Any] | None:
+        result = self.call(
+            "crm.address.list",
+            {
+                "order": {"TYPE_ID": "ASC"},
+                "filter": {
+                    "ENTITY_TYPE_ID": 8,
+                    "ENTITY_ID": int(requisite_id),
+                    "TYPE_ID": int(address_type_id),
+                },
+            },
+        )
+        return result[0] if isinstance(result, list) and result else None
+
+    def create_address(self, fields: dict[str, Any]) -> None:
+        self.call("crm.address.add", {"fields": fields})
+
+    def update_address(self, fields: dict[str, Any]) -> None:
+        self.call("crm.address.update", {"fields": fields})
+
+    # ---------- timeline ----------
 
     def add_timeline_comment(
         self,

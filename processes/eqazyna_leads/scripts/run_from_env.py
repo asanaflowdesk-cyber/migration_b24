@@ -47,9 +47,13 @@ def main() -> int:
         "--lead-generation-field",
         value("BITRIX_LEAD_GENERATION_FIELD", "UF_CRM_1785917145255"),
         "--lead-generation-value",
-        value("BITRIX_LEAD_GENERATION_VALUE", "ГПО недропользователя"),
+        value("BITRIX_LEAD_GENERATION_VALUE", "ГПО Недропользователя"),
         "--originator-id",
         value("BITRIX_ORIGINATOR_ID", "EQAZYNA_LEAD"),
+        "--company-originator-id",
+        value("BITRIX_COMPANY_ORIGINATOR_ID", "EQAZYNA"),
+        "--requisite-preset-id",
+        value("BITRIX_REQUISITE_PRESET_ID", "1"),
         "--source-id",
         value("BITRIX_SOURCE_ID", "OTHER"),
         "--source-description",
@@ -68,8 +72,6 @@ def main() -> int:
     elif mode != "apply":
         raise SystemExit(f"Unknown INPUT_MODE: {mode!r}")
 
-    if is_true("INPUT_NO_EGOV"):
-        args.append("--no-egov")
     if page_list:
         args.extend(["--page-list", page_list])
 

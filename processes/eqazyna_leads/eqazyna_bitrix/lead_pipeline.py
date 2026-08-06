@@ -1,27 +1,35 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
 
 from common.naming import short_organization_name
 
 from .bitrix_client import BitrixClient, BitrixError
-from .formatter import build_lead_comment, build_lead_title, build_timeline_comment
+from .formatter import (
+    build_company_summary,
+    build_lead_comment,
+    build_lead_title,
+    build_timeline_comment,
+)
 from .models import Application, CompanyEnrichment, ProcessResult
 
 
 DEFAULT_LEAD_GENERATION_FIELD = "UF_CRM_1785917145255"
-DEFAULT_LEAD_GENERATION_VALUE = "ГПО недропользователя"
+DEFAULT_LEAD_GENERATION_VALUE = "ГПО Недропользователя"
 DEFAULT_ORIGINATOR_ID = "EQAZYNA_LEAD"
+DEFAULT_COMPANY_ORIGINATOR_ID = "EQAZYNA"
+DEFAULT_REQUISITE_PRESET_ID = "1"
 
 
 @dataclass(slots=True)
 class LeadPipelineConfig:
-    """Configuration for the lead-only e-Qazyna integration.
+    """Create and maintain a complete e-Qazyna CRM bundle.
 
-    The parser intentionally does not create companies, contacts, requisites or
-    deals. One lead is maintained per BIN and each new e-Qazyna application is
-    appended to the lead history.
+    One BIN is represented by one lead, one company, one company requisite and,
+    when a valid director name is available, one linked director contact.
+    Existing lead stage and responsible user are preserved on updates.
     """
 
     lead_status_id: str = "NEW"
@@ -30,10 +38,21 @@ class LeadPipelineConfig:
     lead_generation_field: str = DEFAULT_LEAD_GENERATION_FIELD
     lead_generation_value: str = DEFAULT_LEAD_GENERATION_VALUE
     originator_id: str = DEFAULT_ORIGINATOR_ID
+    company_originator_id: str = DEFAULT_COMPANY_ORIGINATOR_ID
+    requisite_preset_id: str | None = DEFAULT_REQUISITE_PRESET_ID
     source_id: str = "OTHER"
     source_description: str = "e-Qazyna Minerals. ГПО недропользователи"
     dry_run: bool = False
     validate_custom_field: bool = True
+
+
+@dataclass(slots=True)
+class EntityOutcome:
+    entity_id: str | None
+    action: str
+    record: dict[str, Any] | None = None
+    warning: str | None = None
+    address_action: str | None = None
 
 
 class LeadPipeline:
@@ -41,17 +60,41 @@ class LeadPipeline:
         self.client = client
         self.config = config
         self._lead_generation_encoded_value: str = config.lead_generation_value
+        configured_preset = str(config.requisite_preset_id or "").strip()
+        self._requisite_preset_id: int | None = (
+            int(configured_preset) if configured_preset.isdigit() else None
+        )
+        self._requisite_bin_field = "RQ_BIN"
+        self._available_requisite_fields: set[str] = {
+            "RQ_BIN",
+            "RQ_COMPANY_NAME",
+            "RQ_COMPANY_FULL_NAME",
+            "RQ_DIRECTOR",
+            "RQ_OKED",
+        }
+
+    # ---------- preflight ----------
 
     def validate(self) -> None:
-        """Fail before processing if the target custom field is unavailable.
+        """Validate the target CRM structure before any write operation."""
+        if self.config.validate_custom_field:
+            self._validate_lead_generation_field()
 
-        Bitrix silently ignores unknown fields in some update scenarios. A
-        preflight check is therefore safer than discovering the problem after a
-        successful-looking run.
-        """
-        if not self.config.validate_custom_field:
-            return
+        requisite_fields = self.client.get_requisite_fields()
+        self._available_requisite_fields = set(requisite_fields)
+        if "RQ_BIN" in requisite_fields:
+            self._requisite_bin_field = "RQ_BIN"
+        elif "RQ_INN" in requisite_fields:
+            self._requisite_bin_field = "RQ_INN"
+        else:
+            raise BitrixError(
+                "В коробке не найдено поле БИН/ИИН реквизита: ожидалось RQ_BIN или RQ_INN."
+            )
 
+        presets = self.client.list_requisite_presets()
+        self._requisite_preset_id = self._resolve_requisite_preset_id(presets)
+
+    def _validate_lead_generation_field(self) -> None:
         fields = self.client.get_lead_fields()
         field_meta = fields.get(self.config.lead_generation_field)
         if not isinstance(field_meta, dict):
@@ -100,12 +143,32 @@ class LeadPipeline:
             )
         self._lead_generation_encoded_value = matches[0]
 
+    def _resolve_requisite_preset_id(self, presets: list[dict[str, Any]]) -> int:
+        requested = str(self.config.requisite_preset_id or "").strip()
+        if requested:
+            for preset in presets:
+                if str(preset.get("ID") or "") == requested:
+                    return int(requested)
+            raise BitrixError(
+                f"Шаблон реквизитов PRESET_ID={requested} не найден для компаний."
+            )
+
+        for preset in presets:
+            preset_id = str(preset.get("ID") or "")
+            entity_type = str(preset.get("ENTITY_TYPE_ID") or "")
+            active = str(preset.get("ACTIVE") or "Y").upper()
+            if preset_id.isdigit() and entity_type == "4" and active != "N":
+                return int(preset_id)
+        raise BitrixError("Не найден активный шаблон реквизитов для компаний.")
 
     @staticmethod
     def _normalise_label(value: Any) -> str:
         return " ".join(str(value or "").casefold().replace("ё", "е").split())
 
+    # ---------- public processing ----------
+
     def process(self, app: Application, enrichment: CompanyEnrichment) -> ProcessResult:
+        warnings: list[str] = []
         try:
             lead = self.client.find_lead_by_origin(
                 app.bin,
@@ -113,14 +176,370 @@ class LeadPipeline:
                 extra_select=[self.config.lead_generation_field],
             )
 
-            if lead:
-                return self._update_existing_lead(lead, app, enrichment)
-            return self._create_lead(app, enrichment)
-        except Exception as exc:  # noqa: BLE001 - log error per application
-            return ProcessResult(app, enrichment, action="error", error=str(exc))
+            company = self._ensure_company(app, enrichment, lead)
+            if company.warning:
+                warnings.append(company.warning)
 
-    def _create_lead(self, app: Application, enrichment: CompanyEnrichment) -> ProcessResult:
-        fields = self._create_fields(app, enrichment)
+            requisite = self._ensure_requisite(app, enrichment, company.entity_id)
+            if requisite.warning:
+                warnings.append(requisite.warning)
+
+            contact = self._ensure_director_contact(
+                app,
+                enrichment,
+                company.entity_id,
+            )
+            if contact.warning:
+                warnings.append(contact.warning)
+
+            if enrichment.error:
+                warnings.append(f"eGov: {enrichment.error}")
+
+            if lead:
+                lead_result = self._update_existing_lead(
+                    lead,
+                    app,
+                    enrichment,
+                    company.entity_id,
+                    contact.entity_id,
+                )
+            else:
+                lead_result = self._create_lead(
+                    app,
+                    enrichment,
+                    company.entity_id,
+                    contact.entity_id,
+                )
+
+            if lead_result.warning:
+                warnings.append(lead_result.warning)
+            lead_result.warning = self._join_warnings(warnings)
+            lead_result.company_id = company.entity_id
+            lead_result.contact_id = contact.entity_id
+            lead_result.requisite_id = requisite.entity_id
+            lead_result.company_action = company.action
+            lead_result.contact_action = contact.action
+            lead_result.requisite_action = requisite.action
+            lead_result.address_action = requisite.address_action
+            return lead_result
+        except Exception as exc:  # noqa: BLE001 - report error per application
+            return ProcessResult(
+                app,
+                enrichment,
+                action="error",
+                warning=self._join_warnings(warnings),
+                error=str(exc),
+            )
+
+    # ---------- company ----------
+
+    def _ensure_company(
+        self,
+        app: Application,
+        enrichment: CompanyEnrichment,
+        lead: dict[str, Any] | None,
+    ) -> EntityOutcome:
+        company: dict[str, Any] | None = self.client.find_company_by_origin(
+            app.bin,
+            originator_id=self.config.company_originator_id,
+        )
+        if company is None:
+            company = self.client.find_company_by_bin(
+                app.bin,
+                bin_field=self._requisite_bin_field,
+            )
+        if company is None:
+            lead_company_id = str((lead or {}).get("COMPANY_ID") or "")
+            if lead_company_id.isdigit():
+                company = self.client.get_company(lead_company_id)
+
+        desired = self._company_fields(app, enrichment, company)
+        assigned_by_id = self._configured_assigned_by_id()
+        if assigned_by_id and company is None:
+            desired["ASSIGNED_BY_ID"] = assigned_by_id
+
+        if company:
+            company_id = str(company.get("ID") or "")
+            if not company_id:
+                raise BitrixError("crm.company.list вернул компанию без ID")
+            changed = self._only_changed_fields(company, desired)
+            if self.config.dry_run:
+                return EntityOutcome(
+                    company_id,
+                    "dry_run_update_company" if changed else "company_unchanged",
+                    company,
+                )
+            if changed:
+                self.client.update_company(company_id, changed)
+                company = {**company, **changed}
+                return EntityOutcome(company_id, "updated_company", company)
+            return EntityOutcome(company_id, "company_unchanged", company)
+
+        if self.config.dry_run:
+            return EntityOutcome("DRY_RUN_COMPANY", "dry_run_create_company", desired)
+
+        company_id = self.client.create_company(desired)
+        return EntityOutcome(company_id, "created_company", {"ID": company_id, **desired})
+
+    def _company_fields(
+        self,
+        app: Application,
+        enrichment: CompanyEnrichment,
+        current: dict[str, Any] | None,
+    ) -> dict[str, object]:
+        short_name = short_organization_name(enrichment.name or app.applicant_name)
+        current_comments = str((current or {}).get("COMMENTS") or "")
+        comments = self._append_marked_comment_once(
+            current_comments,
+            f"EQAZYNA_MASTER_DATA:{app.bin}",
+            build_company_summary(app, enrichment),
+        )
+        fields: dict[str, object] = {
+            "TITLE": short_name,
+            "OPENED": "Y",
+            "COMMENTS": comments,
+            "ORIGINATOR_ID": self.config.company_originator_id,
+            "ORIGIN_ID": app.bin,
+        }
+        phone = self._merge_multifield((current or {}).get("PHONE"), enrichment.phone)
+        if phone:
+            fields["PHONE"] = phone
+        if enrichment.legal_address:
+            fields["ADDRESS"] = enrichment.legal_address
+        if enrichment.city:
+            fields["ADDRESS_CITY"] = enrichment.city
+        if enrichment.region:
+            fields["ADDRESS_REGION"] = enrichment.region
+            fields["ADDRESS_PROVINCE"] = enrichment.region
+        fields["ADDRESS_COUNTRY"] = "Казахстан"
+        return fields
+
+    # ---------- requisite and address ----------
+
+    def _ensure_requisite(
+        self,
+        app: Application,
+        enrichment: CompanyEnrichment,
+        company_id: str | None,
+    ) -> EntityOutcome:
+        if not company_id:
+            return EntityOutcome(None, "requisite_skipped", warning="Реквизит не создан: отсутствует компания")
+        if company_id == "DRY_RUN_COMPANY":
+            return EntityOutcome(
+                "DRY_RUN_REQUISITE",
+                "dry_run_create_requisite",
+                address_action=(
+                    "dry_run_create_address" if enrichment.legal_address else "address_skipped_no_value"
+                ),
+            )
+
+        requisite = self.client.find_company_requisite(
+            company_id,
+            app.bin,
+            bin_field=self._requisite_bin_field,
+        )
+        desired = self._requisite_fields(app, enrichment, company_id)
+        if requisite:
+            requisite_id = str(requisite.get("ID") or "")
+            if not requisite_id:
+                raise BitrixError("crm.requisite.list вернул реквизит без ID")
+            changed = self._only_changed_fields(requisite, desired)
+            if self.config.dry_run:
+                action = "dry_run_update_requisite" if changed else "requisite_unchanged"
+            else:
+                if changed:
+                    self.client.update_requisite(requisite_id, changed)
+                    action = "updated_requisite"
+                else:
+                    action = "requisite_unchanged"
+        else:
+            if self.config.dry_run:
+                requisite_id = "DRY_RUN_REQUISITE"
+                action = "dry_run_create_requisite"
+            else:
+                requisite_id = self.client.create_requisite(desired)
+                action = "created_requisite"
+
+        address_action: str | None = None
+        warning: str | None = None
+        if enrichment.legal_address:
+            try:
+                address_action = self._ensure_requisite_address(requisite_id, enrichment)
+            except Exception as exc:  # noqa: BLE001 - requisite remains valid
+                warning = f"Адрес реквизита не сохранён: {exc}"
+        else:
+            address_action = "address_skipped_no_value"
+
+        return EntityOutcome(
+            requisite_id,
+            action,
+            requisite,
+            warning=warning,
+            address_action=address_action,
+        )
+
+    def _requisite_fields(
+        self,
+        app: Application,
+        enrichment: CompanyEnrichment,
+        company_id: str,
+    ) -> dict[str, object]:
+        if self._requisite_preset_id is None:
+            raise BitrixError("Не выполнена проверка шаблона реквизитов")
+        full_name = str(enrichment.name or app.applicant_name or "").strip()
+        short_name = short_organization_name(full_name)
+        fields: dict[str, object] = {
+            "ENTITY_TYPE_ID": 4,
+            "ENTITY_ID": int(company_id),
+            "PRESET_ID": self._requisite_preset_id,
+            "NAME": f"БИН {app.bin}. {full_name or short_name}",
+            "ACTIVE": "Y",
+            "ADDRESS_ONLY": "N",
+            "SORT": 500,
+            "XML_ID": f"EQAZYNA-REQ-{app.bin}",
+            "ORIGINATOR_ID": self.config.company_originator_id,
+            self._requisite_bin_field: app.bin,
+        }
+        optional = {
+            "RQ_COMPANY_NAME": short_name,
+            "RQ_COMPANY_FULL_NAME": full_name,
+            "RQ_DIRECTOR": enrichment.director,
+            "RQ_OKED": enrichment.oked,
+        }
+        for field_name, value in optional.items():
+            if value and field_name in self._available_requisite_fields:
+                fields[field_name] = value
+        return fields
+
+    def _ensure_requisite_address(
+        self,
+        requisite_id: str,
+        enrichment: CompanyEnrichment,
+    ) -> str:
+        if requisite_id == "DRY_RUN_REQUISITE":
+            return "dry_run_create_address"
+        existing = self.client.find_requisite_address(requisite_id, 1)
+        fields: dict[str, object] = {
+            "ENTITY_TYPE_ID": 8,
+            "ENTITY_ID": int(requisite_id),
+            "TYPE_ID": 1,
+            "ADDRESS_1": enrichment.legal_address or "",
+            "CITY": enrichment.city or "",
+            "REGION": enrichment.region or "",
+            "PROVINCE": enrichment.region or "",
+            "COUNTRY": "Казахстан",
+            "COUNTRY_CODE": "KZ",
+        }
+        if self.config.dry_run:
+            return "dry_run_update_address" if existing else "dry_run_create_address"
+        if existing:
+            self.client.update_address(fields)
+            return "updated_address"
+        self.client.create_address(fields)
+        return "created_address"
+
+    # ---------- director contact ----------
+
+    def _ensure_director_contact(
+        self,
+        app: Application,
+        enrichment: CompanyEnrichment,
+        company_id: str | None,
+    ) -> EntityOutcome:
+        person = self._split_director_name(enrichment.director)
+        if person is None:
+            return EntityOutcome(
+                None,
+                "contact_skipped_no_valid_fio",
+                warning=(
+                    "Контакт руководителя не создан: eGov не вернул полноценное ФИО"
+                    if enrichment.director
+                    else None
+                ),
+            )
+        if not company_id:
+            return EntityOutcome(None, "contact_skipped", warning="Контакт не создан: отсутствует компания")
+        if company_id == "DRY_RUN_COMPANY":
+            return EntityOutcome("DRY_RUN_CONTACT", "dry_run_create_contact")
+
+        last_name, name, second_name = person
+        contact = self.client.find_director_contact(
+            company_id,
+            last_name,
+            name,
+            second_name,
+        )
+        desired = self._contact_fields(app, enrichment, company_id, person, contact)
+        assigned_by_id = self._configured_assigned_by_id()
+        if assigned_by_id and contact is None:
+            desired["ASSIGNED_BY_ID"] = assigned_by_id
+
+        if contact:
+            contact_id = str(contact.get("ID") or "")
+            if not contact_id:
+                raise BitrixError("crm.contact.list вернул контакт без ID")
+            changed = self._only_changed_fields(contact, desired)
+            if self.config.dry_run:
+                return EntityOutcome(
+                    contact_id,
+                    "dry_run_update_contact" if changed else "contact_unchanged",
+                    contact,
+                )
+            if changed:
+                self.client.update_contact(contact_id, changed)
+                return EntityOutcome(contact_id, "updated_contact", {**contact, **changed})
+            return EntityOutcome(contact_id, "contact_unchanged", contact)
+
+        if self.config.dry_run:
+            return EntityOutcome("DRY_RUN_CONTACT", "dry_run_create_contact", desired)
+        contact_id = self.client.create_contact(desired)
+        return EntityOutcome(contact_id, "created_contact", {"ID": contact_id, **desired})
+
+    def _contact_fields(
+        self,
+        app: Application,
+        enrichment: CompanyEnrichment,
+        company_id: str,
+        person: tuple[str, str, str],
+        current: dict[str, Any] | None,
+    ) -> dict[str, object]:
+        last_name, name, second_name = person
+        current_comments = str((current or {}).get("COMMENTS") or "")
+        contact_comment = "\n".join(
+            [
+                "Руководитель организации из data.egov.kz",
+                f"Исходное ФИО: {enrichment.director}",
+                f"БИН компании: {app.bin}",
+                "Источник: e-Qazyna / eGov",
+            ]
+        )
+        comments = self._append_marked_comment_once(
+            current_comments,
+            f"EQAZYNA_DIRECTOR:{app.bin}",
+            contact_comment,
+        )
+        fields: dict[str, object] = {
+            "LAST_NAME": last_name,
+            "NAME": name,
+            "POST": "Руководитель",
+            "COMPANY_ID": int(company_id),
+            "OPENED": "Y",
+            "COMMENTS": comments,
+        }
+        if second_name:
+            fields["SECOND_NAME"] = second_name
+        return fields
+
+    # ---------- lead ----------
+
+    def _create_lead(
+        self,
+        app: Application,
+        enrichment: CompanyEnrichment,
+        company_id: str | None,
+        contact_id: str | None,
+    ) -> ProcessResult:
+        fields = self._create_fields(app, enrichment, company_id, contact_id)
         assigned_by_id = self._configured_assigned_by_id()
 
         if self.config.dry_run:
@@ -128,7 +547,7 @@ class LeadPipeline:
                 app,
                 enrichment,
                 action="dry_run_create_lead",
-                lead_id="DRY_RUN",
+                lead_id="DRY_RUN_LEAD",
                 assigned_by_id=assigned_by_id,
                 assignment_reason="configured_on_create" if assigned_by_id else None,
             )
@@ -150,6 +569,8 @@ class LeadPipeline:
         lead: dict[str, Any],
         app: Application,
         enrichment: CompanyEnrichment,
+        company_id: str | None,
+        contact_id: str | None,
     ) -> ProcessResult:
         lead_id = str(lead.get("ID") or "")
         if not lead_id:
@@ -157,12 +578,15 @@ class LeadPipeline:
 
         existing_comments = str(lead.get("COMMENTS") or "")
         new_application = app.application_key not in existing_comments
-        fields = self._update_fields(app, enrichment, existing_comments)
+        fields = self._update_fields(
+            app,
+            enrichment,
+            existing_comments,
+            company_id,
+            contact_id,
+            lead,
+        )
 
-        # Leads created from the cloud dump may still have the legacy marker
-        # EQAZYNA / eQazyna|<document>|<BIN>. Canonicalise one matched lead so
-        # all later parser runs find it directly by BIN and do not create a new
-        # duplicate after the migration.
         if (
             str(lead.get("ORIGINATOR_ID") or "") != self.config.originator_id
             or str(lead.get("ORIGIN_ID") or "") != app.bin
@@ -208,7 +632,13 @@ class LeadPipeline:
             warning=warning,
         )
 
-    def _create_fields(self, app: Application, enrichment: CompanyEnrichment) -> dict[str, object]:
+    def _create_fields(
+        self,
+        app: Application,
+        enrichment: CompanyEnrichment,
+        company_id: str | None,
+        contact_id: str | None,
+    ) -> dict[str, object]:
         fields: dict[str, object] = {
             "TITLE": build_lead_title(app, enrichment),
             "COMPANY_TITLE": short_organization_name(enrichment.name or app.applicant_name),
@@ -221,9 +651,7 @@ class LeadPipeline:
             "SOURCE_DESCRIPTION": self.config.source_description,
             self.config.lead_generation_field: self._lead_generation_encoded_value,
         }
-        phone = self._phone_multifield(enrichment)
-        if phone:
-            fields["PHONE"] = phone
+        self._add_lead_master_links(fields, enrichment, company_id, contact_id)
         assigned_by_id = self._configured_assigned_by_id()
         if assigned_by_id:
             fields["ASSIGNED_BY_ID"] = assigned_by_id
@@ -234,23 +662,54 @@ class LeadPipeline:
         app: Application,
         enrichment: CompanyEnrichment,
         existing_comments: str,
+        company_id: str | None,
+        contact_id: str | None,
+        current: dict[str, Any],
     ) -> dict[str, object]:
-        # STATUS_ID is deliberately not updated. A daily parser must not return
-        # a qualified/closed lead to the first stage.
+        # Existing status and responsible are deliberately preserved.
         fields: dict[str, object] = {
             "TITLE": build_lead_title(app, enrichment),
             "COMPANY_TITLE": short_organization_name(enrichment.name or app.applicant_name),
             "COMMENTS": build_lead_comment(app, enrichment, existing_comments),
             self.config.lead_generation_field: self._lead_generation_encoded_value,
         }
-        phone = self._phone_multifield(enrichment)
-        if phone:
-            fields["PHONE"] = phone
+        self._add_lead_master_links(fields, enrichment, company_id, contact_id, current)
         if self.config.overwrite_assigned_by_on_update:
             assigned_by_id = self._configured_assigned_by_id()
             if assigned_by_id:
                 fields["ASSIGNED_BY_ID"] = assigned_by_id
         return fields
+
+    def _add_lead_master_links(
+        self,
+        fields: dict[str, object],
+        enrichment: CompanyEnrichment,
+        company_id: str | None,
+        contact_id: str | None,
+        current: dict[str, Any] | None = None,
+    ) -> None:
+        if company_id and company_id.isdigit():
+            fields["COMPANY_ID"] = int(company_id)
+        if contact_id and contact_id.isdigit():
+            fields["CONTACT_ID"] = int(contact_id)
+        person = self._split_director_name(enrichment.director)
+        if person:
+            last_name, name, second_name = person
+            fields["LAST_NAME"] = last_name
+            fields["NAME"] = name
+            if second_name:
+                fields["SECOND_NAME"] = second_name
+        phone = self._merge_multifield((current or {}).get("PHONE"), enrichment.phone)
+        if phone:
+            fields["PHONE"] = phone
+        if enrichment.legal_address:
+            fields["ADDRESS"] = enrichment.legal_address
+        if enrichment.city:
+            fields["ADDRESS_CITY"] = enrichment.city
+        if enrichment.region:
+            fields["ADDRESS_REGION"] = enrichment.region
+
+    # ---------- generic helpers ----------
 
     def _only_changed_fields(
         self,
@@ -260,7 +719,7 @@ class LeadPipeline:
         changed: dict[str, object] = {}
         for field_name, value in desired.items():
             current_value = current.get(field_name)
-            if field_name == "PHONE":
+            if field_name in {"PHONE", "EMAIL", "WEB", "IM"}:
                 if self._normalise_multifield(current_value) != self._normalise_multifield(value):
                     changed[field_name] = value
                 continue
@@ -277,10 +736,64 @@ class LeadPipeline:
             if not isinstance(item, dict):
                 continue
             field_value = str(item.get("VALUE") or "").strip()
-            value_type = str(item.get("VALUE_TYPE") or "").strip().upper()
+            value_type = str(item.get("VALUE_TYPE") or "WORK").strip().upper()
             if field_value:
                 result.append((field_value, value_type))
-        return sorted(result)
+        return sorted(set(result))
+
+    def _merge_multifield(
+        self,
+        current: Any,
+        new_value: str | None,
+    ) -> list[dict[str, str]] | None:
+        values = self._normalise_multifield(current)
+        candidate = str(new_value or "").strip()
+        if candidate and all(value != candidate for value, _ in values):
+            values.append((candidate, "WORK"))
+        if not values:
+            return None
+        return [
+            {"VALUE": value, "VALUE_TYPE": value_type or "WORK"}
+            for value, value_type in sorted(set(values))
+        ]
+
+    @staticmethod
+    def _append_marked_comment_once(
+        current: str,
+        marker: str,
+        block: str,
+    ) -> str:
+        marker_line = f"[[{marker}]]"
+        current = str(current or "").strip()
+        if marker_line in current:
+            return current[:65000]
+        addition = f"{block.rstrip()}\n{marker_line}"
+        if current:
+            return f"{current}\n\n{addition}"[:65000]
+        return addition[:65000]
+
+    @staticmethod
+    def _split_director_name(value: str | None) -> tuple[str, str, str] | None:
+        raw = re.sub(r"\s+", " ", str(value or "")).strip(" .,-")
+        if not raw:
+            return None
+        lowered = raw.casefold().replace("ё", "е")
+        invalid = {
+            "не найден",
+            "не найдено",
+            "нет данных",
+            "без имени",
+            "руководитель",
+            "директор",
+            "null",
+            "none",
+        }
+        if lowered in invalid:
+            return None
+        parts = [part for part in raw.split(" ") if part]
+        if len(parts) < 2:
+            return None
+        return parts[0], parts[1], " ".join(parts[2:])
 
     def _safe_add_timeline_comment(
         self,
@@ -315,10 +828,10 @@ class LeadPipeline:
             return None
 
     @staticmethod
-    def _phone_multifield(enrichment: CompanyEnrichment) -> list[dict[str, str]] | None:
-        if not enrichment.phone:
-            return None
-        value = str(enrichment.phone).strip()
-        if not value:
-            return None
-        return [{"VALUE": value, "VALUE_TYPE": "WORK"}]
+    def _join_warnings(values: list[str]) -> str | None:
+        unique: list[str] = []
+        for value in values:
+            cleaned = str(value or "").strip()
+            if cleaned and cleaned not in unique:
+                unique.append(cleaned)
+        return " | ".join(unique) if unique else None

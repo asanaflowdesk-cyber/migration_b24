@@ -19,8 +19,8 @@ from .settings import Settings, env_bool
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "e-Qazyna Minerals → eGov → Bitrix24 leads. "
-            "One lead per BIN; companies and deals are not created."
+            "e-Qazyna Minerals -> eGov -> Bitrix24. "
+            "One BIN creates a complete CRM bundle: lead, company, requisite and director contact."
         )
     )
     parser.add_argument(
@@ -88,11 +88,21 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--lead-generation-value",
-        default=os.getenv("BITRIX_LEAD_GENERATION_VALUE", "ГПО недропользователя"),
+        default=os.getenv("BITRIX_LEAD_GENERATION_VALUE", "ГПО Недропользователя"),
     )
     parser.add_argument(
         "--originator-id",
         default=os.getenv("BITRIX_ORIGINATOR_ID", "EQAZYNA_LEAD"),
+    )
+    parser.add_argument(
+        "--company-originator-id",
+        default=os.getenv("BITRIX_COMPANY_ORIGINATOR_ID", "EQAZYNA"),
+        help="Originator marker used by migrated and new e-Qazyna companies",
+    )
+    parser.add_argument(
+        "--requisite-preset-id",
+        default=os.getenv("BITRIX_REQUISITE_PRESET_ID", "1"),
+        help="Company requisite preset ID in the target Bitrix24",
     )
     parser.add_argument(
         "--source-id",
@@ -162,6 +172,8 @@ def _parse_min_created_date(raw: str | None):
 def main() -> int:
     args = parse_args()
     settings = Settings.from_env()
+    if args.push_bitrix and not args.no_egov and not settings.egov_api_key:
+        raise SystemExit("EGOV_API_KEY is required for Bitrix24 write and dry-run modes")
     statuses = [status.strip() for status in args.statuses.split(",") if status.strip()]
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     xlsx_path = args.out or f"exports/eqazyna_bitrix_leads_{timestamp}.xlsx"
@@ -222,6 +234,8 @@ def main() -> int:
                 lead_generation_field=args.lead_generation_field,
                 lead_generation_value=args.lead_generation_value,
                 originator_id=args.originator_id,
+                company_originator_id=args.company_originator_id,
+                requisite_preset_id=args.requisite_preset_id,
                 source_id=args.source_id,
                 source_description=args.source_description,
                 dry_run=args.dry_run,
@@ -232,7 +246,8 @@ def main() -> int:
             "    Bitrix lead mode: "
             f"field={args.lead_generation_field}, "
             f"value={args.lead_generation_value!r}, "
-            f"originator={args.originator_id}, dry_run={args.dry_run}"
+            f"originator={args.originator_id}, company_originator={args.company_originator_id}, "
+            f"requisite_preset={args.requisite_preset_id}, dry_run={args.dry_run}"
         )
         lead_pipeline.validate()
 
@@ -252,7 +267,10 @@ def main() -> int:
         if result.error:
             print(f"    ERROR: {result.error}")
         else:
-            print(f"    {result.action}: lead={result.lead_id}")
+            print(
+                f"    {result.action}: lead={result.lead_id} company={result.company_id} "
+                f"contact={result.contact_id} requisite={result.requisite_id}"
+            )
             if result.warning:
                 print(f"    WARNING: {result.warning}")
         results.append(result)
