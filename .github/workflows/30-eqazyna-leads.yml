@@ -117,7 +117,9 @@ jobs:
           BITRIX_REQUISITE_PRESET_ID: ${{ vars.BITRIX_REQUISITE_PRESET_ID || '1' }}
           BITRIX_SOURCE_ID: "OTHER"
           BITRIX_SOURCE_DESCRIPTION: "e-Qazyna Minerals. ГПО недропользователи"
-          EQAZYNA_REQUEST_TIMEOUT: ${{ vars.EQAZYNA_REQUEST_TIMEOUT || '15' }}
+          EQAZYNA_REQUEST_TIMEOUT: ${{ vars.EQAZYNA_REQUEST_TIMEOUT || '60' }}
+          EQAZYNA_MAX_RETRIES: ${{ vars.EQAZYNA_MAX_RETRIES || '4' }}
+          EQAZYNA_RETRY_BASE_SLEEP_SECONDS: ${{ vars.EQAZYNA_RETRY_BASE_SLEEP_SECONDS || '3' }}
           BITRIX_REQUEST_TIMEOUT: ${{ vars.BITRIX_REQUEST_TIMEOUT || '45' }}
           EGOV_REQUEST_TIMEOUT: ${{ vars.EGOV_REQUEST_TIMEOUT || '25' }}
           INPUT_MODE: ${{ inputs.mode }}
