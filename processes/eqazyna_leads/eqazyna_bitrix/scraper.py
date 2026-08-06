@@ -120,20 +120,29 @@ class PageLog:
 
 @dataclass(slots=True)
 class EqazynaScraper:
-    timeout: int = 10
+    timeout: int = 60
     polite_delay_seconds: float = 0.2
-    max_retries: int = 1
-    retry_base_sleep_seconds: float = 1.0
+    max_retries: int = 4
+    retry_base_sleep_seconds: float = 3.0
     continue_on_page_error: bool = True
     max_consecutive_page_errors: int = 1
     session: requests.Session | None = None
     page_logs: list[PageLog] = field(default_factory=list)
     failed_pages: list[int] = field(default_factory=list)
+    _owns_session: bool = field(init=False, repr=False, default=False)
 
     def __post_init__(self) -> None:
+        self.timeout = max(1, int(self.timeout))
+        self.max_retries = max(1, int(self.max_retries))
+        self.retry_base_sleep_seconds = max(0.0, float(self.retry_base_sleep_seconds))
+        self._owns_session = self.session is None
         if self.session is None:
             self.session = requests.Session()
-        self.session.headers.update(
+        self._configure_session(self.session)
+
+    @staticmethod
+    def _configure_session(session: requests.Session) -> None:
+        session.headers.update(
             {
                 "User-Agent": (
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -145,8 +154,18 @@ class EqazynaScraper:
                 "Cache-Control": "no-cache",
                 "Pragma": "no-cache",
                 "Connection": "close",
+                "Referer": BASE_URL,
+                "Upgrade-Insecure-Requests": "1",
             }
         )
+
+    def _reset_owned_session(self) -> None:
+        if not self._owns_session:
+            return
+        if self.session is not None:
+            self.session.close()
+        self.session = requests.Session()
+        self._configure_session(self.session)
 
     def build_url(self, page: int, doc_type: str | None, statuses: Iterable[str]) -> str:
         params: list[tuple[str, str]] = [
@@ -176,27 +195,41 @@ class EqazynaScraper:
     def fetch_page(self, page: int, doc_type: str | None, statuses: Iterable[str]) -> tuple[str, str]:
         url = self.build_url(page, doc_type, statuses)
         last_error: Exception | None = None
+        connect_timeout = min(15, self.timeout)
+        request_timeout = (connect_timeout, self.timeout)
+
         for attempt in range(1, self.max_retries + 1):
             try:
-                response = self.session.get(url, timeout=self.timeout, allow_redirects=True)
+                assert self.session is not None
+                response = self.session.get(
+                    url,
+                    timeout=request_timeout,
+                    allow_redirects=True,
+                )
                 response.raise_for_status()
                 if not response.encoding:
-                    response.encoding = "utf-8"
+                    response.encoding = response.apparent_encoding or "utf-8"
                 html = response.text or ""
                 if not _looks_like_registry_page(html):
                     preview = clean_text(make_soup(html).get_text(" "))[:500]
-                    raise RuntimeError(f"page does not look like registry; preview={preview!r}")
+                    raise RuntimeError(
+                        f"page does not look like registry; preview={preview!r}"
+                    )
                 return html, url
-            except requests.RequestException as exc:
+            except (requests.RequestException, RuntimeError) as exc:
                 last_error = exc
                 print(
                     f"    WARN: e-Qazyna page {page} failed on attempt "
                     f"{attempt}/{self.max_retries}: {exc}"
                 )
                 if attempt < self.max_retries:
-                    sleep_for = self.retry_base_sleep_seconds
-                    print(f"    sleep {sleep_for:.1f}s")
+                    # The public registry intermittently leaves a connection hanging.
+                    # Recreate only internally owned sessions before the next attempt.
+                    self._reset_owned_session()
+                    sleep_for = min(30.0, self.retry_base_sleep_seconds * (2 ** (attempt - 1)))
+                    print(f"    retry in {sleep_for:.1f}s; url={url}")
                     time.sleep(sleep_for)
+
         raise last_error or RuntimeError(f"e-Qazyna page {page} failed")
 
     @staticmethod

@@ -180,10 +180,17 @@ def main() -> int:
     json_path = args.json_out or f"exports/eqazyna_bitrix_leads_{timestamp}.json"
     min_created_date = _parse_min_created_date(args.min_created_date)
 
+    eqazyna_max_retries = int(getattr(settings, "eqazyna_max_retries", 4))
+    eqazyna_retry_base_sleep_seconds = float(
+        getattr(settings, "eqazyna_retry_base_sleep_seconds", 3.0)
+    )
+
     print(
         "[1/4] Scraping e-Qazyna: "
         f"page_start={args.page_start}, pages={args.pages}, page_list={args.page_list!r}, "
         f"timeout={settings.eqazyna_request_timeout}, "
+        f"retries={eqazyna_max_retries}, "
+        f"retry_base_sleep={eqazyna_retry_base_sleep_seconds}, "
         f"max_consecutive_page_errors={args.max_consecutive_page_errors}, "
         f"doc_type={args.doc_type!r}, statuses={statuses}, "
         f"min_created_date={min_created_date}"
@@ -191,6 +198,8 @@ def main() -> int:
     scraper = EqazynaScraper(
         timeout=settings.eqazyna_request_timeout,
         polite_delay_seconds=settings.polite_delay_seconds,
+        max_retries=eqazyna_max_retries,
+        retry_base_sleep_seconds=eqazyna_retry_base_sleep_seconds,
         continue_on_page_error=not args.strict_page_errors,
         max_consecutive_page_errors=args.max_consecutive_page_errors,
     )

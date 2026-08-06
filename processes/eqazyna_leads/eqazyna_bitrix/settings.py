@@ -17,7 +17,9 @@ class Settings:
     bitrix_webhook_url: str | None
     bitrix_verify_ssl: bool
     bitrix_ca_bundle: str | None
-    eqazyna_request_timeout: int = 15
+    eqazyna_request_timeout: int = 60
+    eqazyna_max_retries: int = 4
+    eqazyna_retry_base_sleep_seconds: float = 3.0
     bitrix_request_timeout: int = 45
     egov_request_timeout: int = 25
     polite_delay_seconds: float = 0.2
@@ -39,7 +41,11 @@ class Settings:
             ),
             bitrix_verify_ssl=env_bool("BITRIX_VERIFY_SSL", True),
             bitrix_ca_bundle=os.getenv("BITRIX_CA_BUNDLE") or None,
-            eqazyna_request_timeout=int(os.getenv("EQAZYNA_REQUEST_TIMEOUT", "15")),
+            eqazyna_request_timeout=int(os.getenv("EQAZYNA_REQUEST_TIMEOUT", "60")),
+            eqazyna_max_retries=int(os.getenv("EQAZYNA_MAX_RETRIES", "4")),
+            eqazyna_retry_base_sleep_seconds=float(
+                os.getenv("EQAZYNA_RETRY_BASE_SLEEP_SECONDS", "3")
+            ),
             bitrix_request_timeout=int(os.getenv("BITRIX_REQUEST_TIMEOUT", "45")),
             egov_request_timeout=int(os.getenv("EGOV_REQUEST_TIMEOUT", "25")),
             polite_delay_seconds=float(
