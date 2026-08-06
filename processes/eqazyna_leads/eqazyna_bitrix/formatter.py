@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+from common.naming import build_eqazyna_title, short_organization_name
+
 from .models import Application, CompanyEnrichment, utc_now_iso
 from .search_links import build_search_links
 
 
 def build_lead_title(app: Application, enrichment: CompanyEnrichment) -> str:
     name = enrichment.name or app.applicant_name
-    return f"e-Qazyna лид — {name}"[:250]
+    return build_eqazyna_title(name, app.doc_number)
 
 
 def build_lead_comment(
@@ -26,7 +28,7 @@ def build_lead_comment(
 
 
 def build_company_summary(app: Application, enrichment: CompanyEnrichment) -> str:
-    name = enrichment.name or app.applicant_name
+    name = short_organization_name(enrichment.name or app.applicant_name)
     links = build_search_links(app.bin, name, enrichment.city or enrichment.region)
     return "\n".join(
         [
@@ -69,7 +71,7 @@ def build_application_block(app: Application) -> str:
 
 
 def build_timeline_comment(app: Application, enrichment: CompanyEnrichment) -> str:
-    name = enrichment.name or app.applicant_name
+    name = short_organization_name(enrichment.name or app.applicant_name)
     return "\n".join(
         [
             "Новая заявка e-Qazyna",
@@ -88,5 +90,5 @@ def build_timeline_comment(app: Application, enrichment: CompanyEnrichment) -> s
 
 def _activity_line(enrichment: CompanyEnrichment) -> str:
     if enrichment.oked and enrichment.activity:
-        return f"{enrichment.oked} — {enrichment.activity}"
+        return f"{enrichment.oked}. {enrichment.activity}"
     return enrichment.activity or enrichment.oked or "не найдено"

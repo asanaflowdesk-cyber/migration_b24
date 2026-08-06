@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from common.naming import short_organization_name
+
 from .bitrix_client import BitrixClient, BitrixError
 from .formatter import build_lead_comment, build_lead_title, build_timeline_comment
 from .models import Application, CompanyEnrichment, ProcessResult
@@ -29,7 +31,7 @@ class LeadPipelineConfig:
     lead_generation_value: str = DEFAULT_LEAD_GENERATION_VALUE
     originator_id: str = DEFAULT_ORIGINATOR_ID
     source_id: str = "OTHER"
-    source_description: str = "e-Qazyna Minerals — ГПО недропользователи"
+    source_description: str = "e-Qazyna Minerals. ГПО недропользователи"
     dry_run: bool = False
     validate_custom_field: bool = True
 
@@ -38,6 +40,7 @@ class LeadPipeline:
     def __init__(self, client: BitrixClient, config: LeadPipelineConfig) -> None:
         self.client = client
         self.config = config
+        self._lead_generation_encoded_value: str = config.lead_generation_value
 
     def validate(self) -> None:
         """Fail before processing if the target custom field is unavailable.
@@ -57,12 +60,50 @@ class LeadPipeline:
                 f"{self.config.lead_generation_field}. Проверьте код поля в коробке."
             )
 
-        field_type = str(field_meta.get("type") or field_meta.get("TYPE") or "").strip().lower()
-        if field_type and field_type not in {"string", "text"}:
+        field_type = str(
+            field_meta.get("type")
+            or field_meta.get("TYPE")
+            or field_meta.get("userTypeId")
+            or field_meta.get("USER_TYPE_ID")
+            or ""
+        ).strip().lower()
+        if field_type in {"", "string", "text"}:
+            self._lead_generation_encoded_value = self.config.lead_generation_value
+            return
+        if field_type not in {"enumeration", "list"}:
             raise BitrixError(
-                f"Поле {self.config.lead_generation_field} имеет тип {field_type!r}, "
-                "а интеграция ожидает текстовое поле."
+                f"Поле {self.config.lead_generation_field} имеет неподдерживаемый тип {field_type!r}."
             )
+
+        options: list[dict[str, Any]] = []
+        for key in ("items", "ITEMS", "list", "LIST", "values", "VALUES"):
+            raw = field_meta.get(key)
+            if isinstance(raw, list):
+                options.extend(item for item in raw if isinstance(item, dict))
+        wanted = self._normalise_label(self.config.lead_generation_value)
+        matches: list[str] = []
+        for item in options:
+            label = item.get("VALUE") or item.get("value") or item.get("NAME") or item.get("name")
+            option_id = item.get("ID") or item.get("id") or item.get("VALUE_ID") or item.get("valueId")
+            if option_id not in (None, "") and self._normalise_label(label) == wanted:
+                matches.append(str(option_id))
+        matches = list(dict.fromkeys(matches))
+        if len(matches) != 1:
+            available = [
+                str(item.get("VALUE") or item.get("value") or item.get("NAME") or item.get("name") or "")
+                for item in options
+            ]
+            reason = "не найдено" if not matches else "найдено несколько совпадений"
+            raise BitrixError(
+                f"В списке {self.config.lead_generation_field} значение "
+                f"{self.config.lead_generation_value!r} {reason}. Доступно: {available}"
+            )
+        self._lead_generation_encoded_value = matches[0]
+
+
+    @staticmethod
+    def _normalise_label(value: Any) -> str:
+        return " ".join(str(value or "").casefold().replace("ё", "е").split())
 
     def process(self, app: Application, enrichment: CompanyEnrichment) -> ProcessResult:
         try:
@@ -170,7 +211,7 @@ class LeadPipeline:
     def _create_fields(self, app: Application, enrichment: CompanyEnrichment) -> dict[str, object]:
         fields: dict[str, object] = {
             "TITLE": build_lead_title(app, enrichment),
-            "COMPANY_TITLE": enrichment.name or app.applicant_name,
+            "COMPANY_TITLE": short_organization_name(enrichment.name or app.applicant_name),
             "STATUS_ID": self.config.lead_status_id or "NEW",
             "OPENED": "Y",
             "COMMENTS": build_lead_comment(app, enrichment),
@@ -178,7 +219,7 @@ class LeadPipeline:
             "ORIGIN_ID": app.bin,
             "SOURCE_ID": self.config.source_id,
             "SOURCE_DESCRIPTION": self.config.source_description,
-            self.config.lead_generation_field: self.config.lead_generation_value,
+            self.config.lead_generation_field: self._lead_generation_encoded_value,
         }
         phone = self._phone_multifield(enrichment)
         if phone:
@@ -198,9 +239,9 @@ class LeadPipeline:
         # a qualified/closed lead to the first stage.
         fields: dict[str, object] = {
             "TITLE": build_lead_title(app, enrichment),
-            "COMPANY_TITLE": enrichment.name or app.applicant_name,
+            "COMPANY_TITLE": short_organization_name(enrichment.name or app.applicant_name),
             "COMMENTS": build_lead_comment(app, enrichment, existing_comments),
-            self.config.lead_generation_field: self.config.lead_generation_value,
+            self.config.lead_generation_field: self._lead_generation_encoded_value,
         }
         phone = self._phone_multifield(enrichment)
         if phone:

@@ -9,7 +9,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
-from common.bitrix import BitrixClient, BitrixError
+from common.bitrix import BitrixClient
+from common.naming import (
+    build_compact_crm_title,
+    extract_eqazyna_client_hint,
+    extract_eqazyna_document_number,
+    short_organization_name,
+)
 from .dump_reader import DumpReader
 from .live_source import LiveCloudSource
 from .file_transfer import FileTransfer
@@ -26,6 +32,12 @@ READONLY_KEYS = {
 HELPER_SUFFIXES = ("_NAME", "_EMAIL", "_DEPARTMENTS")
 CRM_OWNER_TYPES = {1: "lead", 2: "deal", 3: "contact", 4: "company"}
 CRM_REF_PREFIX = {"L": 1, "D": 2, "C": 3, "CO": 4}
+IMPORT_DATASETS = (
+    "Users", "Companies", "Contacts", "Leads", "Deals", "Deal_UserFields",
+    "Contact_Companies", "Lead_Contacts", "Deal_Contacts",
+    "Requisites", "Addresses", "Requisite_Presets", "Requisite_Links",
+    "Tasks", "CRM_Activities",
+)
 
 
 def text(value: Any) -> str:
@@ -212,13 +224,54 @@ def migration_marker(source_type: str, source_id: Any, target_type: str) -> str:
     return f"[[B24MIGRATION:{source_type.upper()}:{source_id}:{target_type.upper()}]]"
 
 
+def parse_markers(value: Any) -> list[tuple[str, str, str]]:
+    return [match.groups() for match in MARKER_RE.finditer(text(value))]
+
+
 def parse_marker(value: Any) -> tuple[str, str, str] | None:
-    match = MARKER_RE.search(text(value))
-    return match.groups() if match else None
+    markers = parse_markers(value)
+    return markers[0] if markers else None
 
 
 def bool_y(value: Any) -> bool:
     return text(value).strip().upper() in {"Y", "YES", "TRUE", "1"}
+
+
+BIN_RE = re.compile(r"(?<!\d)(\d{12})(?!\d)")
+GENERIC_CONTACT_NAMES = {
+    "", "без имени", "не указано", "не указан", "руководитель",
+    "контакт", "нет данных", "unknown",
+}
+
+
+def extract_bin(row: Mapping[str, Any]) -> str:
+    for value in (row.get("ORIGIN_ID"), row.get("COMMENTS"), row.get("SOURCE_DESCRIPTION")):
+        match = BIN_RE.search(text(value))
+        if match:
+            return match.group(1)
+    return ""
+
+
+def _multifield_values(value: Any) -> set[str]:
+    result: set[str] = set()
+    if not isinstance(value, list):
+        return result
+    for item in value:
+        raw = item.get("VALUE") if isinstance(item, Mapping) else item
+        normalized = re.sub(r"[^0-9a-zа-я@.+]+", "", normalize_text(raw), flags=re.IGNORECASE)
+        if normalized:
+            result.add(normalized)
+    return result
+
+
+def is_director_contact(row: Mapping[str, Any]) -> bool:
+    role = f"{normalize_text(row.get('POST'))} {normalize_text(row.get('COMMENTS'))}"
+    return "руководител" in role or "director" in role
+
+
+def is_generic_contact(row: Mapping[str, Any]) -> bool:
+    display = normalize_text(contact_display_name(row))
+    return display in GENERIC_CONTACT_NAMES or len(normalize_name_tokens(display)) < 2
 
 
 def source_is_eqazyna(row: Mapping[str, Any]) -> bool:
@@ -255,7 +308,8 @@ class MigrationProject:
     ):
         self.source_dump = Path(source_dump)
         self._reader = DumpReader(self.source_dump)
-        self.config = json.loads(Path(config_path).read_text(encoding="utf-8"))
+        self.config_path = Path(config_path)
+        self.config = json.loads(self.config_path.read_text(encoding="utf-8"))
         self.users_path = Path(users_path) if users_path else None
         self.report = Report(output_dir)
         self.client = target_client
@@ -266,7 +320,7 @@ class MigrationProject:
         self._source_origins: dict[str, str] = {}
         self.report.extra["source_registry"] = {
             "primary": "live_cloud_api" if source_client else "dump",
-            "dump_role": "checkpoint and dataset-level fallback",
+            "dump_role": "offline plan/verification checkpoint; never mixed into a live import",
             "excel_role": "human-readable audit only; not used as migration source",
         }
         self._target_fields: dict[str, dict[str, Any]] = {}
@@ -367,7 +421,13 @@ class MigrationProject:
         self.report.add("read_source", dataset, "", dataset, "", "WARN", message)
 
     def load_source(self, *datasets: str) -> None:
-        """Load source data directly from cloud, with dump fallback per dataset."""
+        """Load source datasets without mixing live and exported snapshots.
+
+        Import runs use the cloud portal exclusively. Falling back to an old dump
+        for only one failed dataset can silently combine records from different
+        moments in time and break relations. Offline plan/map/verify commands may
+        still read the exported dump when no source webhook is supplied.
+        """
         needed = [name for name in datasets if name not in self._source]
         if not needed:
             return
@@ -380,16 +440,20 @@ class MigrationProject:
             if self._live_source is not None:
                 try:
                     rows = self._live_source.rows(name)
-                    self._source[name] = rows
-                    self._source_origins[name] = "live_cloud_api"
-                    LOG.info("Source %-22s LIVE %s rows", name, len(rows))
-                    continue
                 except Exception as exc:  # noqa: BLE001
-                    self._source_warning(name, f"live dataset unavailable; dump fallback used: {exc}")
+                    self.report.add(
+                        "read_source", name, "", name, "", "ERROR",
+                        f"live dataset unavailable; import snapshot not created: {exc}",
+                    )
+                    raise RuntimeError(f"Live source dataset {name} is unavailable: {exc}") from exc
+                self._source[name] = rows
+                self._source_origins[name] = "live_cloud_api"
+                LOG.info("Source %-22s LIVE %s rows", name, len(rows))
+                continue
 
             rows = self._reader.rows(name)
             self._source[name] = rows
-            self._source_origins[name] = "dump_fallback" if self.source_client else "dump"
+            self._source_origins[name] = "dump"
             LOG.info("Source %-22s DUMP %s rows", name, len(rows))
 
         self.report.extra["source_mode"] = "direct_cloud_api" if self.source_client else "dump"
@@ -780,9 +844,7 @@ class MigrationProject:
     def _enriched_crm_title(self, row: Mapping[str, Any], fallback: str) -> str:
         original = text(row.get("TITLE")).strip() or fallback
         client = self._source_client_label(row)
-        if not client or normalize_text(client) in normalize_text(original):
-            return original
-        return f"{client} — {original}"
+        return build_compact_crm_title(client, original, fallback)
 
     def _select_sample_task_rows(
         self,
@@ -893,6 +955,317 @@ class MigrationProject:
     def _source_loss_reason_value(self, source_enum_id: Any) -> str:
         return self._source_enum_id_to_value.get(text(source_enum_id), "")
 
+    @staticmethod
+    def _duplicate_identity_keys(entity: str, row: Mapping[str, Any]) -> set[str]:
+        keys = {
+            "MARKER:" + ":".join(marker)
+            for marker in (
+                parse_markers(row.get("COMMENTS"))
+                + parse_markers(row.get("ADDITIONAL_INFO"))
+            )
+        }
+        if entity == "company":
+            bin_number = extract_bin(row)
+            if bin_number:
+                keys.add(f"BIN:{bin_number}")
+            return keys
+
+        if entity != "contact":
+            return keys
+
+        display_name = contact_display_name(row)
+        name_tokens = normalize_name_tokens(display_name)
+        director = is_director_contact(row)
+        generic = is_generic_contact(row)
+        company_id = text(row.get("COMPANY_ID"))
+        if director and len(name_tokens) >= 2 and company_id:
+            # Full FIO is a duplicate key only inside the same company. The
+            # same person name in two unrelated companies is not safe to merge.
+            keys.add(f"DIRECTOR:{company_id}:" + "|".join(name_tokens))
+
+        # A nameless card is merged with a named director only on an exact
+        # phone/email match. A generic name alone is never enough.
+        if director or generic:
+            for value in _multifield_values(row.get("PHONE")):
+                keys.add(f"PHONE:{value}")
+            for value in _multifield_values(row.get("EMAIL")):
+                keys.add(f"EMAIL:{value}")
+        return keys
+
+    @staticmethod
+    def _duplicate_primary(entity: str, rows: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
+        def score(row: Mapping[str, Any]) -> tuple[int, int, int]:
+            marker_score = 100 if parse_markers(row.get("COMMENTS")) else 0
+            if entity == "company":
+                identity_score = 30 if extract_bin(row) else 0
+            else:
+                identity_score = 30 if not is_generic_contact(row) else 0
+                identity_score += min(10, len(normalize_name_tokens(contact_display_name(row))))
+            filled = sum(1 for value in row.values() if value not in (None, "", [], {}))
+            row_id = int(text(row.get("ID")) or 0)
+            return marker_score + identity_score, filled, -row_id
+
+        return max(rows, key=score)
+
+    def _target_duplicate_groups(
+        self,
+        entity: str,
+        *,
+        marker_only: bool = False,
+    ) -> list[list[dict[str, Any]]]:
+        if not self.client or not hasattr(self.client, "list_all"):
+            return []
+        if entity == "company":
+            select = ["ID", "TITLE", "COMMENTS", "ORIGINATOR_ID", "ORIGIN_ID", "PHONE", "EMAIL"]
+        elif entity == "contact":
+            select = [
+                "ID", "NAME", "LAST_NAME", "SECOND_NAME", "POST", "COMMENTS",
+                "COMPANY_ID", "PHONE", "EMAIL",
+            ]
+        else:
+            return []
+
+        rows = self.client.list_all(
+            f"crm.{entity}.list",
+            {"select": select, "order": {"ID": "ASC"}},
+        )
+        if len(rows) < 2:
+            return []
+
+        parent = list(range(len(rows)))
+
+        def find(index: int) -> int:
+            while parent[index] != index:
+                parent[index] = parent[parent[index]]
+                index = parent[index]
+            return index
+
+        def union(left: int, right: int) -> None:
+            left_root, right_root = find(left), find(right)
+            if left_root != right_root:
+                parent[right_root] = left_root
+
+        seen: dict[str, int] = {}
+        for index, row in enumerate(rows):
+            keys = self._duplicate_identity_keys(entity, row)
+            if marker_only:
+                keys = {key for key in keys if key.startswith("MARKER:")}
+            for key in keys:
+                if key in seen:
+                    union(index, seen[key])
+                else:
+                    seen[key] = index
+
+        if entity == "contact" and not marker_only:
+            # A nameless/one-word contact is attached to the only full-FIO
+            # director of the same company. If there is more than one director,
+            # no guess is made.
+            by_company: dict[str, list[int]] = defaultdict(list)
+            for index, row in enumerate(rows):
+                company_id = text(row.get("COMPANY_ID"))
+                if company_id:
+                    by_company[company_id].append(index)
+            for indexes in by_company.values():
+                directors = [
+                    index for index in indexes
+                    if is_director_contact(rows[index]) and not is_generic_contact(rows[index])
+                ]
+                generics = [index for index in indexes if is_generic_contact(rows[index])]
+                if len(directors) == 1:
+                    for generic_index in generics:
+                        union(directors[0], generic_index)
+
+        grouped: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        for index, row in enumerate(rows):
+            grouped[find(index)].append(row)
+        return [group for group in grouped.values() if len(group) > 1]
+
+    def consolidate_target_duplicates(
+        self,
+        *,
+        dry_run: bool,
+        marker_only: bool = False,
+    ) -> None:
+        """Merge duplicate company/director cards before rebuilding relations.
+
+        Company duplicates use BIN or the exact migration marker. Contact
+        duplicates use the exact marker, exact director FIO, or an exact
+        phone/email match involving a nameless/director card.
+        """
+        if not self.client:
+            return
+        entity_type_ids = {"contact": 3, "company": 4}
+        summary: dict[str, int] = {"company_groups": 0, "contact_groups": 0}
+
+        for entity in ("company", "contact"):
+            groups = self._target_duplicate_groups(entity, marker_only=marker_only)
+            summary[f"{entity}_groups"] = len(groups)
+            for group in groups:
+                primary = self._duplicate_primary(entity, group)
+                primary_id = int(primary["ID"])
+                other_ids = sorted(
+                    int(row["ID"]) for row in group if int(row["ID"]) != primary_id
+                )
+                entity_ids = [primary_id, *other_ids]
+                label = text(primary.get("TITLE")) or contact_display_name(primary)
+                source_id = ",".join(str(value) for value in entity_ids)
+                if dry_run:
+                    self.report.add(
+                        f"merge_{entity}_duplicates", entity.upper(), source_id,
+                        entity.upper(), primary_id, "DRY_RUN",
+                        f"main={primary_id}; remove={other_ids}; {label}",
+                    )
+                    continue
+                try:
+                    result = self.client.call(
+                        "crm.entity.mergeBatch",
+                        {"params": {"entityTypeId": entity_type_ids[entity], "entityIds": entity_ids}},
+                    ) or {}
+                    status = text(result.get("STATUS") if isinstance(result, Mapping) else "")
+                    if status != "SUCCESS":
+                        raise RuntimeError(f"merge status={status or result}")
+                    deleted = result.get("ENTITY_IDS", other_ids) if isinstance(result, Mapping) else other_ids
+                    self.report.add(
+                        f"merge_{entity}_duplicates", entity.upper(), source_id,
+                        entity.upper(), primary_id, "OK", f"deleted={deleted}; {label}",
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    manual_path = f"/crm/{entity}/merge/?id=" + ",".join(str(value) for value in entity_ids)
+                    self.report.add(
+                        f"merge_{entity}_duplicates", entity.upper(), source_id,
+                        entity.upper(), primary_id, "ERROR",
+                        f"{exc}; manual={manual_path}",
+                    )
+        summary["marker_only"] = int(marker_only)
+        self.report.extra["target_duplicate_consolidation"] = summary
+
+    def normalize_existing_target_titles(
+        self,
+        *,
+        dry_run: bool,
+        full_cleanup: bool,
+    ) -> None:
+        """Rename already-created migration/e-Qazyna cards to compact titles.
+
+        Limited apply runs intentionally do not perform a portal-wide cleanup.
+        Their selected source objects are still renamed by ``_batch_create``.
+        A full apply and every dry-run inspect all managed target cards.
+        """
+        summary = {
+            "company_updates": 0,
+            "lead_updates": 0,
+            "deal_updates": 0,
+            "skipped_limited_apply": int(not full_cleanup),
+        }
+        self.report.extra["target_title_normalization"] = summary
+        if not full_cleanup or not self.client or not hasattr(self.client, "list_all"):
+            return
+
+        company_rows = self.client.list_all(
+            "crm.company.list",
+            {
+                "select": ["ID", "TITLE", "COMMENTS", "ORIGINATOR_ID", "ORIGIN_ID"],
+                "order": {"ID": "ASC"},
+            },
+        )
+        company_titles: dict[str, str] = {}
+        changes: dict[str, list[tuple[int, dict[str, Any], str]]] = {
+            "company": [],
+            "lead": [],
+            "deal": [],
+        }
+
+        for row in company_rows:
+            target_id = int(text(row.get("ID")) or 0)
+            old_title = text(row.get("TITLE")).strip()
+            managed = bool(parse_markers(row.get("COMMENTS"))) or normalize_text(
+                row.get("ORIGINATOR_ID")
+            ).startswith("eqazyna")
+            new_title = short_organization_name(old_title) if managed else old_title
+            company_titles[str(target_id)] = new_title or old_title
+            if target_id and new_title and new_title != old_title:
+                changes["company"].append((target_id, {"TITLE": new_title}, old_title))
+
+        for entity in ("lead", "deal"):
+            select = [
+                "ID", "TITLE", "COMPANY_ID", "COMMENTS",
+                "ORIGINATOR_ID", "ORIGIN_ID",
+            ]
+            if entity == "lead":
+                select.append("COMPANY_TITLE")
+            else:
+                select.append("ADDITIONAL_INFO")
+            rows = self.client.list_all(
+                f"crm.{entity}.list",
+                {"select": select, "order": {"ID": "ASC"}},
+            )
+            for row in rows:
+                target_id = int(text(row.get("ID")) or 0)
+                old_title = text(row.get("TITLE")).strip()
+                originator = normalize_text(row.get("ORIGINATOR_ID"))
+                is_eqazyna = "e-qazyna" in normalize_text(old_title) or originator.startswith("eqazyna")
+                if not target_id or not is_eqazyna:
+                    continue
+
+                company_id = text(row.get("COMPANY_ID"))
+                client_name = company_titles.get(company_id, "")
+                if not client_name:
+                    client_name = short_organization_name(row.get("COMPANY_TITLE"))
+                if not client_name:
+                    client_name = extract_eqazyna_client_hint(old_title)
+
+                document_number = extract_eqazyna_document_number(old_title)
+                source_title = (
+                    f"e-Qazyna № {document_number}" if document_number else "e-Qazyna"
+                )
+                new_title = build_compact_crm_title(
+                    client_name, source_title, source_title
+                )
+                fields: dict[str, Any] = {}
+                if new_title and new_title != old_title:
+                    fields["TITLE"] = new_title
+                if entity == "lead" and text(row.get("COMPANY_TITLE")):
+                    compact_company_title = short_organization_name(row.get("COMPANY_TITLE"))
+                    if compact_company_title != text(row.get("COMPANY_TITLE")).strip():
+                        fields["COMPANY_TITLE"] = compact_company_title
+                if fields:
+                    changes[entity].append((target_id, fields, old_title))
+
+        for entity, entity_changes in changes.items():
+            summary[f"{entity}_updates"] = len(entity_changes)
+            if dry_run:
+                for target_id, fields, old_title in entity_changes:
+                    self.report.add(
+                        f"normalize_{entity}_title", entity.upper(), target_id,
+                        entity.upper(), target_id, "DRY_RUN",
+                        f"{old_title} -> {fields.get('TITLE', old_title)}",
+                    )
+                continue
+
+            commands: list[tuple[str, str, Mapping[str, Any]]] = []
+            contexts: dict[str, tuple[int, dict[str, Any], str]] = {}
+            for index, (target_id, fields, old_title) in enumerate(entity_changes):
+                key = f"{entity[0]}{index}"
+                commands.append(
+                    (key, f"crm.{entity}.update", {"id": target_id, "fields": fields})
+                )
+                contexts[key] = (target_id, fields, old_title)
+            for success, errors in self.client.batch_chunks(commands, size=35):
+                for key in success:
+                    target_id, fields, old_title = contexts[key]
+                    self.report.add(
+                        f"normalize_{entity}_title", entity.upper(), target_id,
+                        entity.upper(), target_id, "OK",
+                        f"{old_title} -> {fields.get('TITLE', old_title)}",
+                    )
+                for key, error in errors.items():
+                    target_id, fields, old_title = contexts[key]
+                    self.report.add(
+                        f"normalize_{entity}_title", entity.upper(), target_id,
+                        entity.upper(), target_id, "ERROR",
+                        f"{error}; {old_title} -> {fields.get('TITLE', old_title)}",
+                    )
+
     def _existing_markers(self, entity: str) -> dict[tuple[str, str, str], int]:
         method = f"crm.{entity}.list"
         select = ["ID", "COMMENTS"]
@@ -901,9 +1274,11 @@ class MigrationProject:
         rows = self.client.list_all(method, {"select": select, "order": {"ID": "ASC"}}) if self.client else []
         result: dict[tuple[str, str, str], int] = {}
         for row in rows:
-            marker = parse_marker(row.get("COMMENTS")) or parse_marker(row.get("ADDITIONAL_INFO"))
-            if marker:
-                result[marker] = int(row["ID"])
+            markers = parse_markers(row.get("COMMENTS")) + parse_markers(row.get("ADDITIONAL_INFO"))
+            for marker in markers:
+                # Keep the oldest/main card when a failed previous run left two
+                # cards carrying the same migration marker.
+                result.setdefault(marker, int(row["ID"]))
         return result
 
     def _batch_create(self, entity: str, prepared: list[tuple[str, dict[str, Any]]], *, dry_run: bool, max_items: int = 0) -> dict[str, int]:
@@ -1034,6 +1409,9 @@ class MigrationProject:
             if not responsible:
                 continue
             fields = self._copy_standard_fields("company", row, excluded={"ASSIGNED_BY_ID", "COMMENTS", "SOURCE_ID"})
+            compact_title = short_organization_name(row.get("TITLE"))
+            if compact_title:
+                fields["TITLE"] = compact_title
             fields["ASSIGNED_BY_ID"] = responsible
             if "SOURCE_ID" in self._target_fields["company"]:
                 fields["SOURCE_ID"] = self._target_source_id(row)
@@ -1206,6 +1584,43 @@ class MigrationProject:
 
         check("source_user", lambda: self.source_client.call("user.current"))
 
+        # Detect a webhook that can read the portal but sees only part of the
+        # migration scope. This is a systemic source-access problem, not an
+        # individual-object warning, so a full import must not start. The
+        # checkpoint is only a lower bound: newly added live records are valid.
+        checkpoint_path = self.config_path.with_name("source_plan.json")
+        if checkpoint_path.exists() and all(name in self._source for name in IMPORT_DATASETS):
+            try:
+                checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+                expected_counts = dict(checkpoint.get("source_counts") or {})
+                expected_counts["Addresses"] = int(
+                    checkpoint.get("expected_unique_addresses")
+                    or expected_counts.get("Addresses")
+                    or 0
+                )
+                count_check: dict[str, Any] = {}
+                for dataset in (
+                    "Companies", "Contacts", "Deals", "Requisites", "Addresses",
+                    "Contact_Companies", "Deal_Contacts", "Tasks", "CRM_Activities",
+                ):
+                    expected = int(expected_counts.get(dataset) or 0)
+                    actual = (
+                        len(self._unique_source_addresses())
+                        if dataset == "Addresses"
+                        else len(self._source.get(dataset, []))
+                    )
+                    count_check[dataset] = {"checkpoint_minimum": expected, "live": actual}
+                    if expected and actual < expected:
+                        message = (
+                            f"live source returned {actual} {dataset} rows, below checkpoint {expected}; "
+                            "check webhook visibility or intentionally refresh source_plan.json"
+                        )
+                        errors.append(f"source_count_{dataset}: {message}")
+                checks["source_dataset_counts"] = count_check
+            except Exception as exc:  # noqa: BLE001
+                warnings.append(f"source_dataset_counts: checkpoint could not be evaluated: {exc}")
+                checks["source_dataset_counts"] = f"WARN: {exc}"
+
         first_task = next((row for row in self._source["Tasks"] if text(row.get("id")).isdigit()), None)
         if first_task:
             task_id = int(first_task["id"])
@@ -1256,7 +1671,16 @@ class MigrationProject:
         if not self.client:
             raise RuntimeError("Target Bitrix client is required")
         if not self.source_client:
-            raise RuntimeError("SOURCE_BITRIX_WEBHOOK_URL is required for tasks, comments, checklists and files")
+            raise RuntimeError("SOURCE_BITRIX_WEBHOOK_URL is required for direct cloud-to-box import")
+
+        # Freeze one coherent source snapshot before any target write. This avoids
+        # reading companies at one moment and relations/tasks from a later state.
+        self.load_source(*IMPORT_DATASETS)
+        self.report.extra["source_snapshot"] = {
+            "captured_at": datetime.now().astimezone().isoformat(),
+            "datasets": {name: len(self._source.get(name, [])) for name in IMPORT_DATASETS},
+            "origins": dict(self._source_origins),
+        }
         self.discover_target()
         validation = self.validate_target()
         if not validation["ok"]:
@@ -1264,6 +1688,18 @@ class MigrationProject:
         source_validation = self.validate_live_source()
         if not source_validation["ok"]:
             raise RuntimeError(f"Live cloud validation failed: {json.dumps(source_validation, ensure_ascii=False)}")
+
+        # Clean up duplicates left by previous test runs before any relation is
+        # rebuilt. In dry-run this only records the planned merge groups.
+        self.consolidate_target_duplicates(
+            dry_run=dry_run,
+            marker_only=(not dry_run and max_items > 0),
+        )
+        self.normalize_existing_target_titles(
+            dry_run=dry_run,
+            full_cleanup=(dry_run or max_items == 0),
+        )
+
         self.report.extra["best_effort_policy"] = {
             "enabled": True,
             "non_blocking": [
@@ -1476,20 +1912,12 @@ class MigrationProject:
         self.load_source("Requisites", "Addresses", "Requisite_Presets")
         target_presets = self.client.list_all(
             "crm.requisite.preset.list",
-            {"select": ["ID", "NAME", "XML_ID", "ENTITY_TYPE_ID"]},
+            {"select": ["ID", "NAME", "XML_ID", "ENTITY_TYPE_ID", "COUNTRY_ID"]},
         )
-        preset_by_xml = {
-            text(row.get("XML_ID")): int(row["ID"])
-            for row in target_presets
-            if row.get("XML_ID") and text(row.get("ID")).isdigit()
-        }
-        preset_by_name = {
-            normalize_text(row.get("NAME")): int(row["ID"])
-            for row in target_presets
-            if row.get("NAME") and text(row.get("ID")).isdigit()
-        }
         source_presets = {text(row.get("ID")): row for row in self._source["Requisite_Presets"]}
-        rows = self._source["Requisites"][:max_items] if max_items else self._source["Requisites"]
+        rows = self._source["Requisites"]
+        if max_items and not self._sample_scope:
+            rows = rows[:max_items]
         req_map: dict[str, int] = {}
         for index, row in enumerate(rows):
             old_id = text(row.get("ID"))
@@ -1562,7 +1990,10 @@ class MigrationProject:
                 details={"preset_id": target_preset},
             )
 
-        address_rows = self._source["Addresses"][:max_items] if max_items else self._source["Addresses"]
+        unique_addresses = self._unique_source_addresses()
+        address_rows = unique_addresses
+        if max_items and not self._sample_scope:
+            address_rows = address_rows[:max_items]
         for index, row in enumerate(address_rows):
             old_req = text(row.get("ENTITY_ID"))
             if text(row.get("ENTITY_TYPE_ID")) != "8" or old_req not in req_map:
@@ -1577,7 +2008,7 @@ class MigrationProject:
                 "ENTITY_TYPE_ID": 8,
                 "TYPE_ID": int(row.get("TYPE_ID") or 1),
             })
-            source_address_id = text(row.get("ID")) or f"{old_req}:{row.get('TYPE_ID')}:{index}"
+            source_address_id = text(row.get("ID")) or f"{old_req}:{row.get('TYPE_ID')}"
             target_address_id = -(index + 1)
             self.report.maps["addresses"][source_address_id] = target_address_id
             self.report.add("create_address", "ADDRESS", source_address_id, "ADDRESS", target_address_id, "DRY_RUN", text(fields.get("ADDRESS_1")))
@@ -1614,37 +2045,46 @@ class MigrationProject:
         lead_map: Mapping[str, int],
         deal_map: Mapping[str, int],
         task_map: Mapping[str, int],
-    ) -> tuple[dict[str, Any], list[str]]:
+    ) -> tuple[dict[str, Any], list[str], list[str]]:
         old_id = text(row.get("id"))
-        problems: list[str] = []
+        blocking: list[str] = []
+        warnings: list[str] = []
         created_by = self._context_user_target(row.get("createdBy"), "task", user_map)
         responsible = self._context_user_target(row.get("responsibleId"), "task", user_map)
-        accomplices = [
-            self._context_user_target(source_user, "task", user_map)
-            for source_user in (row.get("accomplices") or [])
-        ]
-        auditors = [
-            self._context_user_target(source_user, "task", user_map)
-            for source_user in (row.get("auditors") or [])
-        ]
         if not created_by:
-            problems.append(f"unmapped creator {text(row.get('createdBy'))}")
+            blocking.append(f"unmapped creator {text(row.get('createdBy'))}")
         if not responsible:
-            problems.append(f"unmapped responsible {text(row.get('responsibleId'))}")
-        if any(value is None for value in accomplices):
-            problems.append("one or more accomplices are not mapped")
-        if any(value is None for value in auditors):
-            problems.append("one or more auditors are not mapped")
+            blocking.append(f"unmapped responsible {text(row.get('responsibleId'))}")
+
+        accomplices: list[int] = []
+        for source_user in row.get("accomplices") or []:
+            target_user = self._context_user_target(source_user, "task", user_map)
+            if target_user:
+                accomplices.append(target_user)
+            else:
+                warnings.append(f"unmapped accomplice {text(source_user)} omitted")
+
+        auditors: list[int] = []
+        for source_user in row.get("auditors") or []:
+            target_user = self._context_user_target(source_user, "task", user_map)
+            if target_user:
+                auditors.append(target_user)
+            else:
+                warnings.append(f"unmapped auditor {text(source_user)} omitted")
+
         parent_old = text(row.get("parentId"))
-        if parent_old not in {"", "0"} and parent_old not in task_map:
-            problems.append(f"parent task {parent_old} was not mapped")
+        parent_target = task_map.get(parent_old) if parent_old not in {"", "0"} else None
+        if parent_old not in {"", "0"} and not parent_target:
+            warnings.append(f"parent task {parent_old} not mapped; imported as top-level task")
+
         crm_refs: list[str] = []
         for reference in row.get("ufCrmTask") or []:
             mapped = self._map_crm_ref(text(reference), company_map, contact_map, lead_map, deal_map)
             if mapped:
                 crm_refs.append(mapped)
             else:
-                problems.append(f"unresolved CRM link {text(reference)}")
+                warnings.append(f"unresolved CRM link {text(reference)} omitted")
+
         description = text(row.get("description"))
         if row.get("closedDate"):
             description = append_text(description, f"Исходная дата завершения: {text(row.get('closedDate'))}")
@@ -1655,8 +2095,8 @@ class MigrationProject:
             "DESCRIPTION_IN_BBCODE": text(row.get("descriptionInBbcode")) or "Y",
             "CREATED_BY": created_by,
             "RESPONSIBLE_ID": responsible,
-            "ACCOMPLICES": [value for value in accomplices if value],
-            "AUDITORS": [value for value in auditors if value],
+            "ACCOMPLICES": accomplices,
+            "AUDITORS": auditors,
             "PRIORITY": text(row.get("priority")) or "1",
             "ALLOW_CHANGE_DEADLINE": text(row.get("allowChangeDeadline")) or "N",
             "ALLOW_TIME_TRACKING": text(row.get("allowTimeTracking")) or "N",
@@ -1676,13 +2116,13 @@ class MigrationProject:
         }.items():
             if row.get(source_key) not in (None, ""):
                 fields[target_key] = row.get(source_key)
-        if parent_old not in {"", "0"} and parent_old in task_map:
-            fields["PARENT_ID"] = task_map[parent_old]
+        if parent_target:
+            fields["PARENT_ID"] = parent_target
         if crm_refs:
             fields["UF_CRM_TASK"] = crm_refs
         if row.get("ufTaskWebdavFiles"):
             fields["SOURCE_FILE_REFERENCES"] = row.get("ufTaskWebdavFiles")
-        return fields, problems
+        return fields, blocking, warnings
 
     def _activity_registry_fields(
         self,
@@ -1700,7 +2140,7 @@ class MigrationProject:
             activity, company_map, contact_map, lead_map, deal_map
         )
         if unresolved_bindings:
-            problems.append(f"unresolved CRM bindings: {unresolved_bindings}")
+            warnings.append(f"unresolved CRM bindings omitted: {unresolved_bindings}")
         if not bindings:
             problems.append("no mapped CRM owner/binding")
         responsible = self._context_user_target(activity.get("RESPONSIBLE_ID"), "crm", user_map)
@@ -1784,10 +2224,10 @@ class MigrationProject:
                 self.report.add("create_task", "TASK", old_id, "TASK", "", "SKIP", skip_reason)
                 continue
 
-            fields, blocking_problems = self._task_registry_fields(
+            fields, blocking_problems, registry_warnings = self._task_registry_fields(
                 row, user_map, company_map, contact_map, lead_map, deal_map, task_map
             )
-            warnings_for_row: list[str] = []
+            warnings_for_row: list[str] = list(registry_warnings)
             for source_file in row.get("ufTaskWebdavFiles") or []:
                 raw = text(source_file).removeprefix("n")
                 try:
@@ -2044,134 +2484,184 @@ class MigrationProject:
                 source_id, kind, target_id = context[key]
                 self.report.add("set_crm_contacts", kind, source_id, kind, target_id, "ERROR", text(err))
 
+    @staticmethod
+    def _address_source_key(row: Mapping[str, Any]) -> tuple[str, ...]:
+        """Semantic address identity used to remove exact API/page duplicates."""
+        return tuple(
+            text(row.get(code))
+            for code in (
+                "ENTITY_TYPE_ID", "ENTITY_ID", "TYPE_ID", "ADDRESS_1", "ADDRESS_2",
+                "CITY", "POSTAL_CODE", "REGION", "PROVINCE", "COUNTRY", "COUNTRY_CODE",
+            )
+        )
+
+    def _unique_source_addresses(self) -> list[dict[str, Any]]:
+        unique: list[dict[str, Any]] = []
+        seen: set[tuple[str, ...]] = set()
+        for row in self._source.get("Addresses", []):
+            key = self._address_source_key(row)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(dict(row))
+        duplicate_count = len(self._source.get("Addresses", [])) - len(unique)
+        if duplicate_count:
+            self.report.extra["source_address_duplicates_removed"] = duplicate_count
+        return unique
+
     def import_requisites(self, company_map: Mapping[str, int], contact_map: Mapping[str, int]) -> None:
         self.load_source("Requisites", "Addresses", "Requisite_Presets")
-        target_presets = self.client.list_all("crm.requisite.preset.list", {"select": ["ID", "NAME", "XML_ID", "ENTITY_TYPE_ID"]})
-        preset_by_xml = {text(x.get("XML_ID")): int(x["ID"]) for x in target_presets if x.get("XML_ID")}
-        preset_by_name = {normalize_text(x.get("NAME")): int(x["ID"]) for x in target_presets if x.get("NAME")}
-        source_preset = {text(x.get("ID")): x for x in self._source["Requisite_Presets"]}
-        target_existing = self.client.list_all("crm.requisite.list", {"select": ["ID", "XML_ID", "ENTITY_TYPE_ID", "ENTITY_ID"]})
-        existing_by_xml = {text(x.get("XML_ID")): int(x["ID"]) for x in target_existing if x.get("XML_ID")}
+        target_presets = self.client.list_all(
+            "crm.requisite.preset.list",
+            {"select": ["ID", "NAME", "XML_ID", "ENTITY_TYPE_ID", "COUNTRY_ID"]},
+        )
+        source_presets = {text(row.get("ID")): row for row in self._source["Requisite_Presets"]}
+        target_existing = self.client.list_all(
+            "crm.requisite.list",
+            {"select": ["ID", "XML_ID", "ENTITY_TYPE_ID", "ENTITY_ID", "PRESET_ID"]},
+        )
+        existing_by_key = {
+            (text(row.get("XML_ID")), text(row.get("ENTITY_TYPE_ID")), text(row.get("ENTITY_ID"))): int(row["ID"])
+            for row in target_existing
+            if row.get("XML_ID") and text(row.get("ID")).isdigit()
+        }
+        existing_by_xml = {
+            text(row.get("XML_ID")): int(row["ID"])
+            for row in target_existing
+            if row.get("XML_ID") and text(row.get("ID")).isdigit()
+        }
+
         req_map: dict[str, int] = dict(self.report.maps["requisites"])
-        commands = []; context = {}
+        commands: list[tuple[str, str, Mapping[str, Any]]] = []
+        context: dict[str, tuple[str, str, dict[str, Any], int | None]] = {}
         for index, row in enumerate(self._source["Requisites"]):
-            old_id = text(row.get("ID")); source_entity_type = text(row.get("ENTITY_TYPE_ID")); old_entity = text(row.get("ENTITY_ID"))
-            target_entity = company_map.get(old_entity) if source_entity_type == "4" else contact_map.get(old_entity) if source_entity_type == "3" else None
+            old_id = text(row.get("ID"))
+            source_entity_type = text(row.get("ENTITY_TYPE_ID"))
+            old_entity = text(row.get("ENTITY_ID"))
+            target_entity = (
+                company_map.get(old_entity) if source_entity_type == "4"
+                else contact_map.get(old_entity) if source_entity_type == "3"
+                else None
+            )
             if not target_entity:
+                self.report.add(
+                    "prepare_requisite", "REQUISITE", old_id, "REQUISITE", "", "SKIP",
+                    f"owner {source_entity_type}:{old_entity} was not mapped",
+                )
                 continue
+
             xml_id = text(row.get("XML_ID")) or f"B24MIG_REQ_{old_id}"
-            src_preset = source_preset.get(text(row.get("PRESET_ID")), {})
+            source_preset = source_presets.get(text(row.get("PRESET_ID")), {})
             target_preset, preset_match = resolve_requisite_preset(
-                src_preset,
-                source_entity_type,
-                target_presets,
+                source_preset, source_entity_type, target_presets
             )
             if not target_preset:
                 self.report.add(
-                    "create_requisite",
-                    "REQUISITE",
-                    old_id,
-                    "REQUISITE",
-                    "",
-                    "SKIP",
-                    f"target preset not resolved: {src_preset.get('NAME')}; {preset_match}",
+                    "prepare_requisite", "REQUISITE", old_id, "REQUISITE", "", "SKIP",
+                    f"target preset not resolved: {source_preset.get('NAME')}; {preset_match}",
                 )
                 continue
-            fields = self._copy_standard_fields("requisite", row, excluded={"ENTITY_ID", "ENTITY_TYPE_ID", "PRESET_ID", "XML_ID"})
-            fields.update({"ENTITY_ID": target_entity, "ENTITY_TYPE_ID": int(source_entity_type), "PRESET_ID": target_preset, "XML_ID": xml_id})
-            if xml_id in existing_by_xml:
-                req_map[old_id] = existing_by_xml[xml_id]
-                self.report.add("create_requisite", "REQUISITE", old_id, "REQUISITE", req_map[old_id], "SKIP", "XML_ID exists")
-                self.report.add_transfer(
-                    operation="update_requisite",
-                    source_type="REQUISITE",
-                    source_id=old_id,
-                    target_type="REQUISITE",
-                    target_id=req_map[old_id],
-                    status="OK",
-                    payload=fields,
-                    route="REQUISITE",
-                )
-                continue
-            key = f"r{index}"; commands.append((key, "crm.requisite.add", {"fields": fields})); context[key] = (old_id, fields)
+
+            fields = self._copy_standard_fields(
+                "requisite", row,
+                excluded={"ID", "ENTITY_ID", "ENTITY_TYPE_ID", "PRESET_ID", "XML_ID"},
+            )
+            fields.update({
+                "ENTITY_ID": int(target_entity),
+                "ENTITY_TYPE_ID": int(source_entity_type),
+                "PRESET_ID": int(target_preset),
+                "XML_ID": xml_id,
+            })
+            existing_id = existing_by_key.get((xml_id, source_entity_type, text(target_entity)))
+            if not existing_id:
+                existing_id = existing_by_xml.get(xml_id)
+            if existing_id:
+                key = f"ru{index}"
+                commands.append((key, "crm.requisite.update", {"id": existing_id, "fields": fields}))
+                context[key] = (old_id, "update_requisite", fields, existing_id)
+            else:
+                key = f"ra{index}"
+                commands.append((key, "crm.requisite.add", {"fields": fields}))
+                context[key] = (old_id, "create_requisite", fields, None)
+
         for success, errors in self.client.batch_chunks(commands, size=30):
-            for key, raw_target in success.items():
-                old_id, fields = context[key]
-                target_id = extract_id(raw_target)
+            for key, raw_result in success.items():
+                old_id, operation, fields, existing_id = context[key]
+                target_id = existing_id or extract_id(raw_result)
                 if not target_id:
-                    self.report.add("create_requisite", "REQUISITE", old_id, "REQUISITE", "", "ERROR", f"Bitrix returned no target ID: {raw_target}")
+                    self.report.add(
+                        operation, "REQUISITE", old_id, "REQUISITE", "", "ERROR",
+                        f"Bitrix returned no target ID: {raw_result}",
+                    )
                     continue
-                req_map[old_id] = target_id
-                self.report.add("create_requisite", "REQUISITE", old_id, "REQUISITE", target_id, "OK", "")
+                req_map[old_id] = int(target_id)
+                self.report.add(operation, "REQUISITE", old_id, "REQUISITE", target_id, "OK", "")
                 self.report.add_transfer(
-                    operation="create_requisite",
-                    source_type="REQUISITE",
-                    source_id=old_id,
-                    target_type="REQUISITE",
-                    target_id=target_id,
-                    status="OK",
-                    payload=fields,
-                    route="REQUISITE",
+                    operation=operation, source_type="REQUISITE", source_id=old_id,
+                    target_type="REQUISITE", target_id=target_id, status="OK",
+                    payload=fields, route="REQUISITE",
                 )
-            for key, err in errors.items():
-                old_id, fields = context[key]
-                self.report.add("create_requisite", "REQUISITE", old_id, "REQUISITE", "", "SKIP", text(err))
+            for key, error in errors.items():
+                old_id, operation, fields, existing_id = context[key]
+                self.report.add(operation, "REQUISITE", old_id, "REQUISITE", existing_id or "", "SKIP", text(error))
                 self.report.add_transfer(
-                    operation="create_requisite",
-                    source_type="REQUISITE",
-                    source_id=old_id,
-                    target_type="REQUISITE",
-                    target_id="",
-                    status="SKIP",
-                    payload=fields,
-                    route="REQUISITE",
+                    operation=operation, source_type="REQUISITE", source_id=old_id,
+                    target_type="REQUISITE", target_id=existing_id or "", status="SKIP",
+                    payload=fields, route="REQUISITE",
                 )
         self.report.maps["requisites"].update(req_map)
-        existing_addresses = self.client.list_all("crm.address.list", {"order": {"ENTITY_ID": "ASC"}})
-        address_index = {(text(x.get("ENTITY_ID")), text(x.get("TYPE_ID")), normalize_text(x.get("ADDRESS_1")), normalize_text(x.get("CITY"))) for x in existing_addresses}
-        commands = []; context = {}
-        for index, row in enumerate(self._source["Addresses"]):
+
+        existing_addresses = self.client.list_all(
+            "crm.address.list",
+            {"order": {"ENTITY_ID": "ASC", "TYPE_ID": "ASC"}, "filter": {"ENTITY_TYPE_ID": 8}},
+        )
+        existing_address_keys = {
+            (text(row.get("ENTITY_ID")), text(row.get("TYPE_ID")))
+            for row in existing_addresses
+        }
+        address_commands: list[tuple[str, str, Mapping[str, Any]]] = []
+        address_context: dict[str, tuple[str, str, str, dict[str, Any], int]] = {}
+        for index, row in enumerate(self._unique_source_addresses()):
             old_req = text(row.get("ENTITY_ID"))
             if text(row.get("ENTITY_TYPE_ID")) != "8" or old_req not in req_map:
                 continue
-            target_req = req_map[old_req]
-            key_tuple = (text(target_req), text(row.get("TYPE_ID")), normalize_text(row.get("ADDRESS_1")), normalize_text(row.get("CITY")))
-            if key_tuple in address_index:
-                continue
-            fields = self._copy_standard_fields("address", row, excluded={"ENTITY_ID", "ENTITY_TYPE_ID", "ANCHOR_ID", "ANCHOR_TYPE_ID", "LOC_ADDR_ID"})
-            fields.update({"ENTITY_ID": target_req, "ENTITY_TYPE_ID": 8, "TYPE_ID": int(row.get("TYPE_ID") or 1)})
-            key = f"a{index}"
-            commands.append((key, "crm.address.add", {"fields": fields}))
-            context[key] = (text(row.get("ID")) or f"{old_req}:{row.get('TYPE_ID')}:{index}", old_req, fields)
-        for success, errors in self.client.batch_chunks(commands, size=30):
-            for key, raw_target in success.items():
-                old_address, old_req, fields = context[key]
-                target_id = extract_id(raw_target)
-                if target_id:
-                    self.report.maps["addresses"][old_address] = target_id
-                self.report.add("create_address", "ADDRESS", old_address, "ADDRESS", target_id or "", "OK", f"requisite {old_req}")
+            target_req = int(req_map[old_req])
+            address_type = int(row.get("TYPE_ID") or 1)
+            fields = self._copy_standard_fields(
+                "address", row,
+                excluded={"ID", "ENTITY_ID", "ENTITY_TYPE_ID", "ANCHOR_ID", "ANCHOR_TYPE_ID", "LOC_ADDR_ID"},
+            )
+            fields.update({"ENTITY_ID": target_req, "ENTITY_TYPE_ID": 8, "TYPE_ID": address_type})
+            source_address_id = text(row.get("ID")) or f"{old_req}:{address_type}"
+            composite_target_id = target_req * 100 + address_type
+            existing_key = (text(target_req), text(address_type))
+            if existing_key in existing_address_keys:
+                method = "crm.address.update"
+                operation = "update_address"
+            else:
+                method = "crm.address.add"
+                operation = "create_address"
+            key = f"addr{index}"
+            address_commands.append((key, method, {"fields": fields}))
+            address_context[key] = (source_address_id, old_req, operation, fields, composite_target_id)
+
+        for success, errors in self.client.batch_chunks(address_commands, size=30):
+            for key, _raw_result in success.items():
+                source_address_id, old_req, operation, fields, target_id = address_context[key]
+                self.report.maps["addresses"][source_address_id] = target_id
+                self.report.add(operation, "ADDRESS", source_address_id, "ADDRESS", target_id, "OK", f"requisite {old_req}")
                 self.report.add_transfer(
-                    operation="create_address",
-                    source_type="ADDRESS",
-                    source_id=old_address,
-                    target_type="ADDRESS",
-                    target_id=target_id or "",
-                    status="OK",
-                    payload=fields,
-                    route="REQUISITE_ADDRESS",
+                    operation=operation, source_type="ADDRESS", source_id=source_address_id,
+                    target_type="ADDRESS", target_id=target_id, status="OK",
+                    payload=fields, route="REQUISITE_ADDRESS",
                 )
-            for key, err in errors.items():
-                old_address, old_req, fields = context[key]
-                self.report.add("create_address", "ADDRESS", old_address, "ADDRESS", "", "SKIP", f"requisite {old_req}: {text(err)}")
+            for key, error in errors.items():
+                source_address_id, old_req, operation, fields, target_id = address_context[key]
+                self.report.add(operation, "ADDRESS", source_address_id, "ADDRESS", target_id, "SKIP", f"requisite {old_req}: {text(error)}")
                 self.report.add_transfer(
-                    operation="create_address",
-                    source_type="ADDRESS",
-                    source_id=old_address,
-                    target_type="ADDRESS",
-                    target_id="",
-                    status="SKIP",
-                    payload=fields,
-                    route="REQUISITE_ADDRESS",
+                    operation=operation, source_type="ADDRESS", source_id=source_address_id,
+                    target_type="ADDRESS", target_id=target_id, status="SKIP",
+                    payload=fields, route="REQUISITE_ADDRESS",
                 )
 
     def import_requisite_links(self, deal_map: Mapping[str, int], lead_map: Mapping[str, int]) -> None:
@@ -2262,9 +2752,14 @@ class MigrationProject:
                 return f"L_{target_id}" if kind == "lead" else f"D_{target_id}"
         return None
 
-    def _existing_tasks(self) -> dict[str, int]:
+    def _existing_tasks(self, *, include_saved_maps: bool = True) -> dict[str, int]:
         rows = self.client.list_all("tasks.task.list", {"select": ["ID", "XML_ID", "DESCRIPTION"]})
-        result: dict[str, int] = {}
+        # Saved maps are an additional idempotency guard when the target webhook
+        # cannot list a task assigned to another employee. Live API results
+        # override them. Verification deliberately disables this fallback.
+        result: dict[str, int] = (
+            dict(self.report.maps["tasks"]) if include_saved_maps else {}
+        )
         for row in rows:
             xml_id = text(row.get("xmlId") or row.get("XML_ID"))
             if xml_id.startswith("B24MIG_TASK_"):
@@ -2932,146 +3427,118 @@ class MigrationProject:
         )
         existing = self._existing_tasks()
         task_map = dict(self.report.maps["tasks"])
+
         for row in rows:
-            old_id = text(row.get("id")); parent_old = text(row.get("parentId"))
+            old_id = text(row.get("id"))
             skip_reason = self._task_skip_reason(row)
             if skip_reason:
                 self.report.add("create_task", "TASK", old_id, "TASK", "", "SKIP", skip_reason)
                 continue
+
+            if old_id in existing:
+                task_map[old_id] = existing[old_id]
+
+            fields, blocking, warnings = self._task_registry_fields(
+                row, user_map, company_map, contact_map, lead_map, deal_map, task_map
+            )
+            for warning in warnings:
+                self.report.add("prepare_task", "TASK", old_id, "TASK", existing.get(old_id, ""), "WARN", warning)
+
+            preview_fields = dict(fields)
+            target_fields = dict(fields)
+            target_fields.pop("SOURCE_FILE_REFERENCES", None)
+
             if old_id in existing:
                 target_id = existing[old_id]
                 task_map[old_id] = target_id
                 self.report.maps["tasks"][old_id] = target_id
-                preview_fields, preview_problems = self._task_registry_fields(
-                    row, user_map, company_map, contact_map, lead_map, deal_map, task_map
-                )
-                self.report.add("create_task", "TASK", old_id, "TASK", target_id, "SKIP", "XML_ID/marker exists; completing missing child data")
+                update_status = "OK"
+                update_message = "existing task updated"
+                if blocking:
+                    update_status = "WARN"
+                    update_message = "main fields not updated: " + "; ".join(blocking)
+                else:
+                    # Creator and XML_ID identify the historical task and should
+                    # not be rewritten on reruns. All operational fields are
+                    # refreshed so earlier test imports can be repaired.
+                    update_fields = dict(target_fields)
+                    update_fields.pop("CREATED_BY", None)
+                    update_fields.pop("XML_ID", None)
+                    try:
+                        self.client.call(
+                            "tasks.task.update",
+                            {"taskId": target_id, "fields": update_fields},
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        update_status = "WARN"
+                        update_message = f"existing task main fields could not be updated: {exc}"
+                self.report.add("update_task", "TASK", old_id, "TASK", target_id, update_status, update_message)
                 self.report.add_transfer(
                     operation="update_task",
                     source_type="TASK",
                     source_id=old_id,
                     target_type="TASK",
                     target_id=target_id,
-                    status="WARN" if preview_problems else "OK",
+                    status="WARN" if blocking or warnings or update_status == "WARN" else "OK",
                     payload=preview_fields,
                     route="TASK_WITHOUT_PROJECT",
                 )
-                self._record_applied_task_relations(
-                    row, target_id, task_map, company_map, contact_map, lead_map, deal_map
+            else:
+                if blocking:
+                    message = "Пропущено: " + "; ".join(blocking)
+                    self.report.add("create_task", "TASK", old_id, "TASK", "", "SKIP", message)
+                    self.report.add_transfer(
+                        operation="create_task",
+                        source_type="TASK",
+                        source_id=old_id,
+                        target_type="TASK",
+                        target_id="",
+                        status="SKIP",
+                        payload=preview_fields,
+                        route="TASK_WITHOUT_PROJECT",
+                    )
+                    continue
+                try:
+                    result = self.client.call("tasks.task.add", {"fields": target_fields})
+                    target_id = extract_id(result)
+                    if not target_id:
+                        raise RuntimeError(f"tasks.task.add returned no task ID: {result}")
+                except Exception as exc:  # noqa: BLE001
+                    self.report.add("create_task", "TASK", old_id, "TASK", "", "SKIP", str(exc))
+                    self.report.add_transfer(
+                        operation="create_task",
+                        source_type="TASK",
+                        source_id=old_id,
+                        target_type="TASK",
+                        target_id="",
+                        status="SKIP",
+                        payload=preview_fields,
+                        route="TASK_WITHOUT_PROJECT",
+                    )
+                    continue
+                task_map[old_id] = target_id
+                self.report.maps["tasks"][old_id] = target_id
+                self.report.add(
+                    "create_task", "TASK", old_id, "TASK", target_id,
+                    "WARN" if warnings else "OK",
+                    "; ".join(warnings) if warnings else "project/group removed; CRM links remapped",
                 )
-                disk_ids = self._transfer_task_files(row)
-                self._attach_task_files(target_id, disk_ids, old_id, "existing task")
-                self._import_task_checklist(old_id, target_id, user_map)
-                self._import_task_comments(old_id, target_id, user_map)
-                self._set_task_status(old_id, target_id, text(row.get("status")))
-                continue
-            created_by = self._required_user(row.get("createdBy"), user_map, "prepare_task", "TASK", old_id, "creator", context="task")
-            responsible = self._required_user(row.get("responsibleId"), user_map, "prepare_task", "TASK", old_id, "responsible", context="task")
-            accomplices = []
-            auditors = []
-            missing = False
-            for source_user in row.get("accomplices") or []:
-                target_user = self._required_user(source_user, user_map, "prepare_task", "TASK", old_id, "accomplice", context="task")
-                if not target_user:
-                    missing = True
-                else:
-                    accomplices.append(target_user)
-            for source_user in row.get("auditors") or []:
-                target_user = self._required_user(source_user, user_map, "prepare_task", "TASK", old_id, "auditor", context="task")
-                if not target_user:
-                    missing = True
-                else:
-                    auditors.append(target_user)
-            if not created_by or not responsible or missing:
-                continue
-            if parent_old not in {"", "0"} and parent_old not in task_map:
-                self.report.add("prepare_task", "TASK", old_id, "TASK", "", "ERROR", f"parent task {parent_old} was not imported")
-                continue
-            crm_refs = []
-            unresolved_crm = []
-            for reference in row.get("ufCrmTask") or []:
-                mapped = self._map_crm_ref(text(reference), company_map, contact_map, lead_map, deal_map)
-                if mapped:
-                    crm_refs.append(mapped)
-                else:
-                    unresolved_crm.append(text(reference))
-            if unresolved_crm:
-                self.report.add("prepare_task", "TASK", old_id, "TASK", "", "ERROR", f"unresolved CRM links: {unresolved_crm}")
-                continue
-            disk_ids = self._transfer_task_files(row)
-            marker = migration_marker("TASK", old_id, "TASK")
-            description = text(row.get("description"))
-            if row.get("closedDate"):
-                description = append_text(description, f"Исходная дата завершения: {text(row.get('closedDate'))}")
-            description = append_text(description, marker)
-            fields: dict[str, Any] = {
-                "TITLE": text(row.get("title")) or f"Задача {old_id}",
-                "DESCRIPTION": description,
-                "DESCRIPTION_IN_BBCODE": text(row.get("descriptionInBbcode")) or "Y",
-                "CREATED_BY": created_by,
-                "RESPONSIBLE_ID": responsible,
-                "ACCOMPLICES": accomplices,
-                "AUDITORS": auditors,
-                "PRIORITY": text(row.get("priority")) or "1",
-                "ALLOW_CHANGE_DEADLINE": text(row.get("allowChangeDeadline")) or "N",
-                "ALLOW_TIME_TRACKING": text(row.get("allowTimeTracking")) or "N",
-                "TASK_CONTROL": text(row.get("taskControl")) or "N",
-                "ADD_IN_REPORT": text(row.get("addInReport")) or "N",
-                "MATCH_WORK_TIME": text(row.get("matchWorkTime")) or "N",
-                "TIME_ESTIMATE": int(row.get("timeEstimate") or 0),
-                "GROUP_ID": 0,
-                "XML_ID": f"B24MIG_TASK_{old_id}",
-            }
-            for source_key, target_key in {
-                "deadline": "DEADLINE", "dateStart": "DATE_START", "startDatePlan": "START_DATE_PLAN", "endDatePlan": "END_DATE_PLAN", "mark": "MARK"
-            }.items():
-                if row.get(source_key) not in (None, ""):
-                    fields[target_key] = row.get(source_key)
-            if parent_old not in {"", "0"}:
-                fields["PARENT_ID"] = task_map[parent_old]
-            if crm_refs:
-                fields["UF_CRM_TASK"] = crm_refs
-            try:
-                result = self.client.call("tasks.task.add", {"fields": fields})
-                target_id = extract_id(result)
-                if not target_id:
-                    raise RuntimeError(f"tasks.task.add returned no task ID: {result}")
-            except Exception as exc:
-                self.report.add("create_task", "TASK", old_id, "TASK", "", "SKIP", str(exc))
-                failed_preview = dict(fields)
-                if row.get("ufTaskWebdavFiles"):
-                    failed_preview["SOURCE_FILE_REFERENCES"] = row.get("ufTaskWebdavFiles")
                 self.report.add_transfer(
                     operation="create_task",
                     source_type="TASK",
                     source_id=old_id,
                     target_type="TASK",
-                    target_id="",
-                    status="SKIP",
-                    payload=failed_preview,
+                    target_id=target_id,
+                    status="WARN" if warnings else "OK",
+                    payload=preview_fields,
                     route="TASK_WITHOUT_PROJECT",
                 )
-                continue
-            task_map[old_id] = target_id
-            self.report.maps["tasks"][old_id] = target_id
-            self.report.add("create_task", "TASK", old_id, "TASK", target_id, "OK", "project/group removed; CRM links remapped")
-            preview_fields = dict(fields)
-            if row.get("ufTaskWebdavFiles"):
-                preview_fields["SOURCE_FILE_REFERENCES"] = row.get("ufTaskWebdavFiles")
-            self.report.add_transfer(
-                operation="create_task",
-                source_type="TASK",
-                source_id=old_id,
-                target_type="TASK",
-                target_id=target_id,
-                status="OK",
-                payload=preview_fields,
-                route="TASK_WITHOUT_PROJECT",
-            )
+
             self._record_applied_task_relations(
                 row, target_id, task_map, company_map, contact_map, lead_map, deal_map
             )
-            self._attach_task_files(target_id, disk_ids, old_id, "new task")
+            disk_ids = self._transfer_task_files(row)
+            self._attach_task_files(target_id, disk_ids, old_id, "existing task" if old_id in existing else "new task")
             self._import_task_checklist(old_id, target_id, user_map)
             self._import_task_comments(old_id, target_id, user_map)
             self._set_task_status(old_id, target_id, text(row.get("status")))
@@ -3098,13 +3565,17 @@ class MigrationProject:
                 return (1, target_id) if kind == "lead" else (2, target_id)
         return None
 
-    def _existing_activities(self) -> dict[str, int]:
+    def _existing_activities(self, *, include_saved_maps: bool = True) -> dict[str, int]:
         rows = self.client.list_all("crm.activity.list", {"select": ["ID", "ORIGINATOR_ID", "ORIGIN_ID"]})
-        return {
+        result: dict[str, int] = (
+            dict(self.report.maps["activities"]) if include_saved_maps else {}
+        )
+        result.update({
             text(row.get("ORIGIN_ID")).removeprefix("ACTIVITY_"): int(row["ID"])
             for row in rows
             if text(row.get("ORIGINATOR_ID")) == "B24_CLOUD_MIGRATION" and text(row.get("ORIGIN_ID")).startswith("ACTIVITY_")
-        }
+        })
+        return result
 
     def _map_activity_communications(self, rows: Iterable[Mapping[str, Any]], company_map: Mapping[str, int], contact_map: Mapping[str, int], lead_map: Mapping[str, int], deal_map: Mapping[str, int]) -> tuple[list[dict[str, Any]], list[str]]:
         result: list[dict[str, Any]] = []
@@ -3260,9 +3731,18 @@ class MigrationProject:
             communication_type = text(item.get("TYPE"))
             value = text(item.get("VALUE"))
             key = (entity_type, entity_id, communication_type, value)
-            if entity_type in {3, 4} and entity_id and key not in seen:
-                seen.add(key)
-                result.append(dict(item))
+            if entity_type not in {3, 4} or not entity_id or key in seen:
+                return
+            seen.add(key)
+            cleaned: dict[str, Any] = {
+                "ENTITY_TYPE_ID": entity_type,
+                "ENTITY_ID": entity_id,
+            }
+            if communication_type:
+                cleaned["TYPE"] = communication_type
+            if value:
+                cleaned["VALUE"] = value
+            result.append(cleaned)
 
         for old_type, old_id in self._activity_source_client_candidates(activity):
             target_id = company_map.get(old_id) if old_type == 4 else contact_map.get(old_id)
@@ -3482,159 +3962,121 @@ class MigrationProject:
         except Exception as exc:
             self.report.add("attach_activity_files", "ACTIVITY", old_id, "ACTIVITY", target_id, "WARN", str(exc))
 
-    def import_activities(self, user_map: Mapping[str, int], company_map: Mapping[str, int], contact_map: Mapping[str, int], lead_map: Mapping[str, int], deal_map: Mapping[str, int], *, max_items: int = 0) -> None:
+    def import_activities(
+        self,
+        user_map: Mapping[str, int],
+        company_map: Mapping[str, int],
+        contact_map: Mapping[str, int],
+        lead_map: Mapping[str, int],
+        deal_map: Mapping[str, int],
+        *,
+        max_items: int = 0,
+    ) -> None:
         self.load_source("CRM_Activities")
         rows = self._select_sample_activity_rows(
-            self._source["CRM_Activities"],
-            max_items,
-            company_map,
-            contact_map,
-            lead_map,
-            deal_map,
+            self._source["CRM_Activities"], max_items,
+            company_map, contact_map, lead_map, deal_map,
         )
         existing = self._existing_activities()
         for activity in rows:
             old_id = text(activity.get("ID"))
-            bindings, unresolved_bindings = self._activity_bindings(activity, company_map, contact_map, lead_map, deal_map)
-            if unresolved_bindings:
-                self.report.add("prepare_activity", "ACTIVITY", old_id, "ACTIVITY", "", "SKIP", f"Пропущено: unresolved CRM bindings: {unresolved_bindings}")
-                continue
-            if not bindings:
-                self.report.add("create_activity", "ACTIVITY", old_id, "ACTIVITY", "", "SKIP", "Пропущено: no mapped CRM owner/binding")
-                continue
-            communications, unresolved_communications, client_warnings = self._activity_client_communications(
-                activity, company_map, contact_map, lead_map, deal_map
+            fields, bindings, problems, warnings = self._activity_registry_fields(
+                activity, user_map, company_map, contact_map, lead_map, deal_map
             )
-            communication_note = self._unresolved_communications_note(
-                activity.get("COMMUNICATIONS") or [], unresolved_communications
-            )
-            if unresolved_communications:
+            for warning in warnings:
                 self.report.add(
-                    "prepare_activity", "ACTIVITY", old_id, "ACTIVITY", "", "WARN",
-                    "unresolved CRM communications omitted: " + ", ".join(unresolved_communications),
-                )
-            for client_warning in client_warnings:
-                self.report.add(
-                    "prepare_activity", "ACTIVITY", old_id, "ACTIVITY", "", "WARN", client_warning
+                    "prepare_activity", "ACTIVITY", old_id, "ACTIVITY", existing.get(old_id, ""),
+                    "WARN", warning,
                 )
             files = self._activity_files(activity)
+            preview_fields = dict(fields)
+            target_fields = dict(fields)
+            target_fields.pop("SOURCE_FILE_REFERENCES", None)
+            # File payloads are handled separately and idempotently.
+            target_fields.pop("FILES", None)
+
             if old_id in existing:
                 target_id = existing[old_id]
                 self.report.maps["activities"][old_id] = target_id
-                preview_fields, preview_bindings, preview_problems, preview_warnings = self._activity_registry_fields(
-                    activity, user_map, company_map, contact_map, lead_map, deal_map
-                )
-                self.report.add("create_activity", "ACTIVITY", old_id, "ACTIVITY", target_id, "SKIP", "ORIGIN_ID exists; completing bindings/files")
-                self.report.add_transfer(
-                    operation="update_activity",
-                    source_type="ACTIVITY",
-                    source_id=old_id,
-                    target_type="ACTIVITY",
-                    target_id=target_id,
-                    status="WARN" if preview_problems or preview_warnings else "OK",
-                    payload=preview_fields,
-                    route="CRM_ACTIVITY",
-                )
-                for owner_type, owner_id in preview_bindings:
-                    self.report.add_relation(
-                        relation_type="ACTIVITY_CRM_BINDING",
-                        source_from_type="ACTIVITY",
-                        source_from_id=old_id,
-                        source_to_type="CRM",
-                        source_to_id=text(activity.get("OWNER_ID")),
-                        target_from_type="ACTIVITY",
-                        target_from_id=target_id,
-                        target_to_type=CRM_OWNER_TYPES.get(owner_type, "CRM").upper(),
-                        target_to_id=owner_id,
-                        status="APPLIED",
-                        details={"owner_type_id": owner_type},
-                    )
-                self._ensure_activity_bindings(old_id, target_id, bindings)
-                self._ensure_activity_client_communications(
-                    old_id, target_id, preview_fields.get("COMMUNICATIONS") or []
-                )
-                self._ensure_activity_files(old_id, target_id, files)
-                continue
-            responsible = self._required_user(activity.get("RESPONSIBLE_ID"), user_map, "prepare_activity", "ACTIVITY", old_id, "responsible")
-            if not responsible:
-                continue
-            primary_type, primary_id = bindings[0]
-            settings = activity.get("SETTINGS") if isinstance(activity.get("SETTINGS"), dict) else {}
-            fields: dict[str, Any] = {
-                "OWNER_TYPE_ID": primary_type,
-                "OWNER_ID": primary_id,
-                "TYPE_ID": int(activity.get("TYPE_ID") or 0),
-                "SUBJECT": text(activity.get("SUBJECT")) or f"Дело {old_id}",
-                "RESPONSIBLE_ID": responsible,
-                "COMPLETED": text(activity.get("COMPLETED")) or "N",
-                "STATUS": int(activity.get("STATUS") or 1),
-                "PRIORITY": int(activity.get("PRIORITY") or 1),
-                "DESCRIPTION": append_text(text(activity.get("DESCRIPTION")), communication_note),
-                "DESCRIPTION_TYPE": int(activity.get("DESCRIPTION_TYPE") or 1),
-                "DIRECTION": int(activity.get("DIRECTION") or 0),
-                "LOCATION": text(activity.get("LOCATION")),
-                "NOTIFY_TYPE": int(activity.get("NOTIFY_TYPE") or 0),
-                "NOTIFY_VALUE": int(activity.get("NOTIFY_VALUE") or 0),
-                "START_TIME": activity.get("START_TIME"),
-                "END_TIME": activity.get("END_TIME"),
-                "DEADLINE": activity.get("DEADLINE"),
-                "COMMUNICATIONS": communications,
-                "PROVIDER_ID": text(activity.get("PROVIDER_ID")),
-                "PROVIDER_TYPE_ID": text(activity.get("PROVIDER_TYPE_ID")),
-                "PROVIDER_GROUP_ID": text(activity.get("PROVIDER_GROUP_ID")),
-                "PROVIDER_PARAMS": activity.get("PROVIDER_PARAMS") or {},
-                "PROVIDER_DATA": text(activity.get("PROVIDER_DATA")),
-                "IS_INCOMING_CHANNEL": text(activity.get("IS_INCOMING_CHANNEL")) or "N",
-                "ORIGINATOR_ID": "B24_CLOUD_MIGRATION",
-                "ORIGIN_ID": f"ACTIVITY_{old_id}",
-                "SETTINGS": {**settings, "DISABLE_SENDING_MESSAGE_COPY": "Y"},
-            }
-            fields = {key: value for key, value in fields.items() if value not in (None, "", [], {}) or key in {"COMMUNICATIONS", "SETTINGS"}}
-            if files:
-                fields["FILES"] = [item["payload"] for item in files]
-            try:
-                result = self.client.call("crm.activity.add", {"fields": fields})
-                target_id = extract_id(result)
-                if not target_id:
-                    raise RuntimeError(f"crm.activity.add returned no ID: {result}")
-            except Exception as exc:
+                update_status = "OK"
+                update_message = "existing activity updated"
+                if problems:
+                    update_status = "WARN"
+                    update_message = "main fields not updated: " + "; ".join(problems)
+                else:
+                    update_fields = dict(target_fields)
+                    update_fields.pop("ORIGINATOR_ID", None)
+                    update_fields.pop("ORIGIN_ID", None)
+                    try:
+                        self.client.call(
+                            "crm.activity.update",
+                            {"id": target_id, "fields": update_fields},
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        update_status = "WARN"
+                        update_message = f"existing activity main fields could not be updated: {exc}"
                 self.report.add(
-                    "create_activity", "ACTIVITY", old_id, "ACTIVITY", "", "SKIP",
-                    f"Пропущено: activity could not be created without changing its source meaning: {exc}",
+                    "update_activity", "ACTIVITY", old_id, "ACTIVITY", target_id,
+                    update_status, update_message,
                 )
-                continue
-            self.report.maps["activities"][old_id] = target_id
-            self.report.add("create_activity", "ACTIVITY", old_id, "ACTIVITY", target_id, "OK", "")
-            preview_fields = dict(fields)
-            if activity.get("FILES"):
-                preview_fields["SOURCE_FILE_REFERENCES"] = activity.get("FILES")
-            self.report.add_transfer(
-                operation="create_activity",
-                source_type="ACTIVITY",
-                source_id=old_id,
-                target_type="ACTIVITY",
-                target_id=target_id,
-                status="OK",
-                payload=preview_fields,
-                route="CRM_ACTIVITY",
-            )
+                self.report.add_transfer(
+                    operation="update_activity", source_type="ACTIVITY", source_id=old_id,
+                    target_type="ACTIVITY", target_id=target_id,
+                    status="WARN" if problems or warnings or update_status == "WARN" else "OK",
+                    payload=preview_fields, route="CRM_ACTIVITY",
+                )
+            else:
+                if problems:
+                    message = "Пропущено: " + "; ".join(problems)
+                    self.report.add("create_activity", "ACTIVITY", old_id, "ACTIVITY", "", "SKIP", message)
+                    self.report.add_transfer(
+                        operation="create_activity", source_type="ACTIVITY", source_id=old_id,
+                        target_type="ACTIVITY", target_id="", status="SKIP",
+                        payload=preview_fields, route="CRM_ACTIVITY",
+                    )
+                    continue
+                try:
+                    raw_result = self.client.call("crm.activity.add", {"fields": target_fields})
+                    target_id = extract_id(raw_result)
+                    if not target_id:
+                        raise RuntimeError(f"crm.activity.add returned no ID: {raw_result}")
+                except Exception as exc:  # noqa: BLE001
+                    self.report.add(
+                        "create_activity", "ACTIVITY", old_id, "ACTIVITY", "", "SKIP",
+                        f"activity could not be created: {exc}",
+                    )
+                    self.report.add_transfer(
+                        operation="create_activity", source_type="ACTIVITY", source_id=old_id,
+                        target_type="ACTIVITY", target_id="", status="SKIP",
+                        payload=preview_fields, route="CRM_ACTIVITY",
+                    )
+                    continue
+                self.report.maps["activities"][old_id] = target_id
+                self.report.add(
+                    "create_activity", "ACTIVITY", old_id, "ACTIVITY", target_id,
+                    "WARN" if warnings else "OK", "; ".join(warnings),
+                )
+                self.report.add_transfer(
+                    operation="create_activity", source_type="ACTIVITY", source_id=old_id,
+                    target_type="ACTIVITY", target_id=target_id,
+                    status="WARN" if warnings else "OK", payload=preview_fields, route="CRM_ACTIVITY",
+                )
+
             for owner_type, owner_id in bindings:
                 self.report.add_relation(
                     relation_type="ACTIVITY_CRM_BINDING",
-                    source_from_type="ACTIVITY",
-                    source_from_id=old_id,
-                    source_to_type="CRM",
-                    source_to_id=text(activity.get("OWNER_ID")),
-                    target_from_type="ACTIVITY",
-                    target_from_id=target_id,
+                    source_from_type="ACTIVITY", source_from_id=old_id,
+                    source_to_type="CRM", source_to_id=text(activity.get("OWNER_ID")),
+                    target_from_type="ACTIVITY", target_from_id=target_id,
                     target_to_type=CRM_OWNER_TYPES.get(owner_type, "CRM").upper(),
-                    target_to_id=owner_id,
-                    status="APPLIED",
+                    target_to_id=owner_id, status="APPLIED",
                     details={"owner_type_id": owner_type},
                 )
             self._ensure_activity_bindings(old_id, target_id, bindings)
-            if files:
-                self._ensure_activity_files(old_id, target_id, files)
+            self._ensure_activity_client_communications(
+                old_id, target_id, target_fields.get("COMMUNICATIONS") or []
+            )
+            self._ensure_activity_files(old_id, target_id, files)
 
     def verify(self) -> dict[str, Any]:
         if not self.client:
@@ -3646,13 +4088,43 @@ class MigrationProject:
             ("contacts", "contact", "CONTACT", "CONTACT"),
         ):
             markers = self._existing_markers(entity)
-            result["markers"][label] = sum(1 for key in markers if key[0] == source_type and key[2] == route)
+            result["markers"][label] = sum(
+                1 for key in markers if key[0] == source_type and key[2] == route
+            )
         lead_markers = self._existing_markers("lead")
         deal_markers = self._existing_markers("deal")
-        result["markers"]["deals_routed_to_leads"] = sum(1 for key in lead_markers if key[0] == "DEAL" and key[2] == "LEAD")
-        result["markers"]["deals_kept_as_deals"] = sum(1 for key in deal_markers if key[0] == "DEAL" and key[2] == "DEAL")
-        result["markers"]["tasks"] = len(self._existing_tasks())
-        result["markers"]["activities"] = len(self._existing_activities())
+        result["markers"]["deals_routed_to_leads"] = sum(
+            1 for key in lead_markers if key[0] == "DEAL" and key[2] == "LEAD"
+        )
+        result["markers"]["deals_kept_as_deals"] = sum(
+            1 for key in deal_markers if key[0] == "DEAL" and key[2] == "DEAL"
+        )
+        result["markers"]["tasks"] = len(self._existing_tasks(include_saved_maps=False))
+        result["markers"]["activities"] = len(self._existing_activities(include_saved_maps=False))
+
+        requisites = self.client.list_all(
+            "crm.requisite.list",
+            {"order": {"ID": "ASC"}, "filter": {}, "select": ["ID", "XML_ID"]},
+        )
+        result["markers"]["requisites"] = sum(
+            1 for row in requisites if text(row.get("XML_ID")).startswith("B24MIG_REQ_")
+        )
+        addresses = self.client.list_all(
+            "crm.address.list",
+            {"filter": {"ENTITY_TYPE_ID": 8}, "order": {"ENTITY_ID": "ASC", "TYPE_ID": "ASC"}},
+        )
+        requisite_ids = {
+            text(row.get("ID"))
+            for row in requisites
+            if text(row.get("XML_ID")).startswith("B24MIG_REQ_")
+        }
+        result["markers"]["addresses"] = len({
+            (text(row.get("ENTITY_ID")), text(row.get("TYPE_ID")))
+            for row in addresses
+            if text(row.get("ENTITY_ID")) in requisite_ids
+        })
+
+        self.load_source("Addresses")
         expected_counts = {
             "companies": plan["source_counts"]["Companies"],
             "contacts": plan["source_counts"]["Contacts"],
@@ -3660,15 +4132,29 @@ class MigrationProject:
             "deals_kept_as_deals": plan["source_deals_kept_as_deals"],
             "tasks": plan["expected_tasks"],
             "activities": plan["expected_activities"],
+            "requisites": plan["source_counts"]["Requisites"],
+            "addresses": len(self._unique_source_addresses()),
         }
         gaps = {
-            name: max(0, expected_counts[name] - int(result["markers"].get(name, 0)))
-            for name in expected_counts
+            name: max(0, int(expected) - int(result["markers"].get(name, 0)))
+            for name, expected in expected_counts.items()
         }
         result["expected_counts"] = expected_counts
         result["gaps"] = gaps
-        result["complete"] = not any(gaps.values())
-        result["ok"] = True
-        result["policy"] = "Verification never blocks: gaps are fixed in the report for later review."
+        result["count_complete"] = not any(gaps.values())
+        result["complete"] = result["count_complete"]
+        result["ok"] = result["count_complete"]
+        result["scope"] = (
+            "Entity marker counts plus migrated requisite and unique address counts."
+        )
+        result["limitations"] = [
+            "Does not compare every field value in every target card.",
+            "Does not prove every task comment, checklist item or binary file was readable in the source.",
+            "Does not call every relation endpoint again; relation-level failures remain in the import reports.",
+        ]
+        result["policy"] = (
+            "Verification reports gaps honestly and does not delete or recreate data automatically."
+        )
         self.report.extra["verification"] = result
         return result
+

@@ -35,15 +35,19 @@ def enrichment() -> CompanyEnrichment:
 
 
 class FakeClient:
-    def __init__(self, lead=None, field_type="string"):
+    def __init__(self, lead=None, field_type="string", field_items=None):
         self.lead = lead
         self.field_type = field_type
+        self.field_items = field_items
         self.created_fields = None
         self.updated_fields = None
         self.timeline = []
 
     def get_lead_fields(self):
-        return {FIELD: {"type": self.field_type, "title": "Тип лидогенерации"}}
+        meta = {"type": self.field_type, "title": "Тип лидогенерации"}
+        if self.field_items is not None:
+            meta["items"] = self.field_items
+        return {FIELD: meta}
 
     def find_lead_by_origin(self, origin_id, originator_id="EQAZYNA_LEAD", extra_select=None):
         assert origin_id == "123456789012"
@@ -75,6 +79,9 @@ def test_create_lead_writes_exact_generation_field_and_no_deal_entities():
     assert result.action == "created_lead"
     assert result.lead_id == "501"
     assert client.created_fields[FIELD] == VALUE
+    assert client.created_fields["TITLE"] == "ТОО Тест Недра. e-Qazyna № APP-1"
+    assert client.created_fields["COMPANY_TITLE"] == "ТОО Тест Недра"
+    assert "—" not in client.created_fields["TITLE"]
     assert client.created_fields["ORIGINATOR_ID"] == "EQAZYNA_LEAD"
     assert client.created_fields["ORIGIN_ID"] == "123456789012"
     assert client.created_fields["STATUS_ID"] == "NEW"
@@ -167,15 +174,51 @@ def test_legacy_migrated_lead_is_canonicalised_to_one_bin_marker():
     assert client.updated_fields["ORIGIN_ID"] == app.bin
 
 
-def test_validate_rejects_missing_or_non_text_field():
+def test_validate_rejects_missing_or_unsupported_field():
     missing = FakeClient()
     missing.get_lead_fields = lambda: {}
     with pytest.raises(BitrixError, match=FIELD):
         LeadPipeline(missing, LeadPipelineConfig()).validate()
 
-    non_text = FakeClient(field_type="enumeration")
-    with pytest.raises(BitrixError, match="текстовое"):
-        LeadPipeline(non_text, LeadPipelineConfig()).validate()
+    unsupported = FakeClient(field_type="employee")
+    with pytest.raises(BitrixError, match="неподдерживаемый"):
+        LeadPipeline(unsupported, LeadPipelineConfig()).validate()
+
+
+def test_enumeration_field_resolves_label_to_internal_id():
+    client = FakeClient(
+        field_type="enumeration",
+        field_items=[
+            {"ID": "41", "VALUE": "Другое"},
+            {"ID": "42", "VALUE": "ГПО недропользователя"},
+        ],
+    )
+    pipeline = LeadPipeline(client, LeadPipelineConfig())
+
+    pipeline.validate()
+    result = pipeline.process(application(), enrichment())
+
+    assert result.action == "created_lead"
+    assert client.created_fields[FIELD] == "42"
+
+
+def test_enumeration_field_rejects_missing_or_ambiguous_label():
+    missing = FakeClient(
+        field_type="enumeration",
+        field_items=[{"ID": "41", "VALUE": "Другое"}],
+    )
+    with pytest.raises(BitrixError, match="не найдено"):
+        LeadPipeline(missing, LeadPipelineConfig()).validate()
+
+    ambiguous = FakeClient(
+        field_type="enumeration",
+        field_items=[
+            {"ID": "41", "VALUE": "ГПО недропользователя"},
+            {"ID": "42", "VALUE": "гпо НЕДРОПОЛЬЗОВАТЕЛЯ"},
+        ],
+    )
+    with pytest.raises(BitrixError, match="несколько"):
+        LeadPipeline(ambiguous, LeadPipelineConfig()).validate()
 
 
 def test_dry_run_never_writes():

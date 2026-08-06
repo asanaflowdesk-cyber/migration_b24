@@ -240,6 +240,8 @@ class _UnreadableCommentsSourceClient:
 def test_live_source_unreadable_comments_are_non_blocking(tmp_path: Path) -> None:
     p = project(tmp_path)
     p.source_client = _UnreadableCommentsSourceClient()
+    p._source["Tasks"] = [{"id": "2", "commentsCount": 2, "serviceCommentsCount": 0}]
+    p._source["CRM_Activities"] = []
     result = p.validate_live_source()
     assert result["ok"] is True
     assert not result["errors"]
@@ -347,7 +349,8 @@ def test_dry_run_dependency_problem_is_skip_not_error(tmp_path: Path) -> None:
 def test_skip_and_log_policy_has_no_blocking_import_exit() -> None:
     source = (ROOT / "migrate.py").read_text(encoding="utf-8")
     assert "exit_code = 4" not in source
-    assert 'row["status"] = "SKIP"' in source
+    assert 'row["status"] = "SKIP"' not in source
+    assert 'row.get("status") == "ERROR"' in source
     assert "exit_code = 0" in source
 
 
@@ -454,6 +457,9 @@ def test_dry_run_builds_requisites_relations_tasks_and_activities(tmp_path: Path
     p.source_client = object()
     p.report = Report(tmp_path)
     p.file_transfer = None
+    p._source = {}
+    p._source_origins = {}
+    p.load_source = lambda *datasets: [p._source.setdefault(name, []) for name in datasets]
 
     p.discover_target = lambda: None
     p.validate_target = lambda: {"ok": True}
@@ -688,3 +694,368 @@ def test_existing_activity_client_is_repaired_on_rerun(tmp_path: Path) -> None:
     ]
     assert p.report.actions[-1]["operation"] == "update_activity_client"
     assert p.report.actions[-1]["status"] == "OK"
+
+
+def test_exact_duplicate_addresses_are_removed_from_import_registry(tmp_path: Path) -> None:
+    p = project(tmp_path)
+    row = {
+        "ENTITY_TYPE_ID": "8",
+        "ENTITY_ID": "74",
+        "TYPE_ID": "1",
+        "ADDRESS_1": "Алматы",
+        "CITY": "Алматы",
+    }
+    p._source["Addresses"] = [dict(row), dict(row)]
+
+    unique = p._unique_source_addresses()
+
+    assert unique == [row]
+    assert p.report.extra["source_address_duplicates_removed"] == 1
+
+
+def test_existing_child_objects_are_really_updated_not_only_reported() -> None:
+    source = (ROOT / "src" / "migration.py").read_text(encoding="utf-8")
+    assert '"tasks.task.update"' in source
+    assert '"crm.activity.update"' in source
+    assert '"crm.requisite.update"' in source
+    assert '"crm.address.update"' in source
+
+
+class _PresetOnlyClient:
+    def list_all(self, method, params=None):
+        assert method == "crm.requisite.preset.list"
+        return [{"ID": "10", "NAME": "Организация", "ENTITY_TYPE_ID": "8", "COUNTRY_ID": "6"}]
+
+
+def test_sample_dry_run_uses_requisites_of_selected_clients_not_first_rows(tmp_path: Path) -> None:
+    p = project(tmp_path)
+    p.client = _PresetOnlyClient()
+    p._sample_scope = {"company_ids": {"2"}}
+    p._target_fields["requisite"] = {"NAME": {}}
+    p._target_fields["address"] = {"ADDRESS_1": {}, "CITY": {}, "COUNTRY": {}}
+    p._source["Requisite_Presets"] = [{"ID": "1", "NAME": "Юр. лицо", "COUNTRY_ID": "6"}]
+    p._source["Requisites"] = [
+        {"ID": "1", "ENTITY_TYPE_ID": "4", "ENTITY_ID": "1", "PRESET_ID": "1", "NAME": "Не выбран"},
+        {"ID": "2", "ENTITY_TYPE_ID": "4", "ENTITY_ID": "2", "PRESET_ID": "1", "NAME": "Выбран"},
+    ]
+    p._source["Addresses"] = [
+        {"ENTITY_TYPE_ID": "8", "ENTITY_ID": "2", "TYPE_ID": "1", "ADDRESS_1": "Алматы"}
+    ]
+
+    p._dry_run_requisites_and_addresses({"2": -20}, {}, max_items=1)
+
+    requisites = [row for row in p.report.transfers if row["source_type"] == "REQUISITE"]
+    addresses = [row for row in p.report.transfers if row["source_type"] == "ADDRESS"]
+    assert [row["source_id"] for row in requisites] == ["2"]
+    assert len(addresses) == 1
+
+
+class _VerifyScopeClient:
+    def list_all(self, method, params=None):
+        if method == "crm.requisite.list":
+            return [
+                {"ID": "10", "XML_ID": "B24MIG_REQ_1"},
+                {"ID": "20", "XML_ID": "MANUAL_REQUISITE"},
+            ]
+        if method == "crm.address.list":
+            return [
+                {"ENTITY_ID": "10", "TYPE_ID": "1"},
+                {"ENTITY_ID": "20", "TYPE_ID": "1"},
+            ]
+        raise AssertionError(method)
+
+
+def test_verify_counts_only_addresses_of_migrated_requisites(tmp_path: Path) -> None:
+    p = project(tmp_path)
+    p.client = _VerifyScopeClient()
+    p.source_plan = lambda: {
+        "source_counts": {"Companies": 0, "Contacts": 0, "Requisites": 1},
+        "source_deals_routed_to_leads": 0,
+        "source_deals_kept_as_deals": 0,
+        "expected_tasks": 0,
+        "expected_activities": 0,
+    }
+    p._existing_markers = lambda entity: {}
+    p._existing_tasks = lambda **kwargs: {}
+    p._existing_activities = lambda **kwargs: {}
+    p.load_source = lambda *args: None
+    p._unique_source_addresses = lambda: [{"ENTITY_ID": "1", "TYPE_ID": "1"}]
+
+    result = p.verify()
+
+    assert result["markers"]["requisites"] == 1
+    assert result["markers"]["addresses"] == 1
+    assert result["ok"] is True
+
+
+class _EmptyListClient:
+    def list_all(self, method, params=None):
+        return []
+
+
+def test_saved_task_and_activity_maps_are_idempotency_fallback_only(tmp_path: Path) -> None:
+    p = project(tmp_path)
+    p.client = _EmptyListClient()
+    p.report.maps["tasks"]["2"] = 2002
+    p.report.maps["activities"]["6"] = 6006
+
+    assert p._existing_tasks() == {"2": 2002}
+    assert p._existing_tasks(include_saved_maps=False) == {}
+    assert p._existing_activities() == {"6": 6006}
+    assert p._existing_activities(include_saved_maps=False) == {}
+
+
+def test_workflow_inputs_are_not_interpolated_into_cmd_commands() -> None:
+    import_workflow = (ROOT.parents[1] / ".github" / "workflows" / "12-migration-import.yml").read_text(encoding="utf-8")
+    user_workflow = (ROOT.parents[1] / ".github" / "workflows" / "20-user-registration.yml").read_text(encoding="utf-8")
+    assert "%INPUT_MODE%" not in import_workflow
+    assert "%INPUT_MAX_ITEMS%" not in import_workflow
+    assert "%INPUT_FILE_PATH%" not in user_workflow
+    assert "run_from_env.py" in import_workflow
+    assert "run_from_env.py" in user_workflow
+
+
+def test_compact_company_and_eqazyna_titles() -> None:
+    from common.naming import build_compact_crm_title, short_organization_name
+
+    full = "Партнерство с ограниченной ответственностью Kazmine Limited Liability Partnership"
+    assert short_organization_name(full) == "ТОО Kazmine"
+    assert build_compact_crm_title(full, "❗ e-Qazyna № 42468-NEA") == (
+        "ТОО Kazmine. e-Qazyna № 42468-NEA"
+    )
+
+
+class _DuplicateMergeClient:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict]] = []
+
+    def list_all(self, method, params=None):
+        if method == "crm.company.list":
+            return [
+                {
+                    "ID": "100",
+                    "TITLE": "ТОО Kazmine",
+                    "ORIGIN_ID": "250740900736",
+                    "COMMENTS": migration_marker("COMPANY", 8, "COMPANY"),
+                },
+                {
+                    "ID": "101",
+                    "TITLE": "Партнерство с ограниченной ответственностью Kazmine Limited Liability Partnership",
+                    "ORIGIN_ID": "250740900736",
+                    "COMMENTS": "",
+                },
+            ]
+        if method == "crm.contact.list":
+            return [
+                {
+                    "ID": "200",
+                    "LAST_NAME": "ДЖЕБЕДЖИ",
+                    "NAME": "ЕРТУГРУЛ",
+                    "POST": "Руководитель",
+                    "COMPANY_ID": "100",
+                    "COMMENTS": migration_marker("CONTACT", 10, "CONTACT"),
+                },
+                {
+                    "ID": "201",
+                    "LAST_NAME": "ДЖЕБЕДЖИ",
+                    "NAME": "ЕРТУГРУЛ",
+                    "POST": "Руководитель",
+                    "COMPANY_ID": "100",
+                    "COMMENTS": "",
+                },
+            ]
+        raise AssertionError(method)
+
+    def call(self, method, params=None):
+        assert method == "crm.entity.mergeBatch"
+        self.calls.append((method, params))
+        ids = params["params"]["entityIds"]
+        return {"STATUS": "SUCCESS", "ENTITY_IDS": ids[1:]}
+
+
+def test_target_company_and_director_duplicates_are_merged(tmp_path: Path) -> None:
+    p = project(tmp_path)
+    client = _DuplicateMergeClient()
+    p.client = client
+
+    p.consolidate_target_duplicates(dry_run=False)
+
+    assert [call[1]["params"] for call in client.calls] == [
+        {"entityTypeId": 4, "entityIds": [100, 101]},
+        {"entityTypeId": 3, "entityIds": [200, 201]},
+    ]
+    assert p.report.extra["target_duplicate_consolidation"] == {
+        "company_groups": 1,
+        "contact_groups": 1,
+        "marker_only": 0,
+    }
+
+
+class _GenericDirectorMergeClient:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict]] = []
+
+    def list_all(self, method, params=None):
+        if method == "crm.company.list":
+            return []
+        if method == "crm.contact.list":
+            return [
+                {
+                    "ID": "300",
+                    "LAST_NAME": "ДЖЕБЕДЖИ",
+                    "NAME": "ЕРТУГРУЛ",
+                    "SECOND_NAME": "МЕХМЕТ",
+                    "POST": "Руководитель",
+                    "COMPANY_ID": "100",
+                    "COMMENTS": migration_marker("CONTACT", 10, "CONTACT"),
+                },
+                {
+                    "ID": "301",
+                    "NAME": "Руководитель",
+                    "POST": "Руководитель",
+                    "COMPANY_ID": "100",
+                    "COMMENTS": "",
+                },
+                {
+                    # Same FIO in another company must never be merged merely
+                    # because the person name is identical.
+                    "ID": "302",
+                    "LAST_NAME": "ДЖЕБЕДЖИ",
+                    "NAME": "ЕРТУГРУЛ",
+                    "SECOND_NAME": "МЕХМЕТ",
+                    "POST": "Руководитель",
+                    "COMPANY_ID": "999",
+                    "COMMENTS": "",
+                },
+            ]
+        raise AssertionError(method)
+
+    def call(self, method, params=None):
+        assert method == "crm.entity.mergeBatch"
+        self.calls.append((method, params))
+        ids = params["params"]["entityIds"]
+        return {"STATUS": "SUCCESS", "ENTITY_IDS": ids[1:]}
+
+
+def test_nameless_director_is_merged_only_with_director_of_same_company(tmp_path: Path) -> None:
+    p = project(tmp_path)
+    client = _GenericDirectorMergeClient()
+    p.client = client
+
+    p.consolidate_target_duplicates(dry_run=False)
+
+    assert [call[1]["params"] for call in client.calls] == [
+        {"entityTypeId": 3, "entityIds": [300, 301]},
+    ]
+
+
+def test_limited_apply_merges_only_exact_migration_marker_duplicates(tmp_path: Path) -> None:
+    p = project(tmp_path)
+    client = _DuplicateMergeClient()
+    p.client = client
+
+    p.consolidate_target_duplicates(dry_run=False, marker_only=True)
+
+    # Only the pair sharing an exact migration marker would be merged. The
+    # fake rows have one marker each, so BIN/FIO cleanup is intentionally not
+    # performed during a limited apply run.
+    assert client.calls == []
+    assert p.report.extra["target_duplicate_consolidation"] == {
+        "company_groups": 0,
+        "contact_groups": 0,
+        "marker_only": 1,
+    }
+
+
+class _TargetTitleCleanupClient:
+    def __init__(self) -> None:
+        self.commands: list[tuple[str, dict]] = []
+
+    def list_all(self, method, params=None):
+        if method == "crm.company.list":
+            return [
+                {
+                    "ID": "100",
+                    "TITLE": "Партнерство с ограниченной ответственностью Kazmine Limited Liability Partnership",
+                    "ORIGINATOR_ID": "EQAZYNA",
+                    "ORIGIN_ID": "250740900736",
+                    "COMMENTS": migration_marker("COMPANY", 8, "COMPANY"),
+                }
+            ]
+        if method == "crm.lead.list":
+            return [
+                {
+                    "ID": "500",
+                    "TITLE": "e-Qazyna лид — Партнерство с ограниченной ответственностью Kazmine Limited Liability Partnership",
+                    "COMPANY_ID": "100",
+                    "COMPANY_TITLE": "Партнерство с ограниченной ответственностью Kazmine Limited Liability Partnership",
+                    "ORIGINATOR_ID": "EQAZYNA_LEAD",
+                    "ORIGIN_ID": "250740900736",
+                    "COMMENTS": "",
+                }
+            ]
+        if method == "crm.deal.list":
+            return [
+                {
+                    "ID": "600",
+                    "TITLE": "Партнерство с ограниченной ответственностью Kazmine Limited Liability Partnership — e-Qazyna № 42468-NEA",
+                    "COMPANY_ID": "100",
+                    "ORIGINATOR_ID": "EQAZYNA",
+                    "ORIGIN_ID": "42468-NEA",
+                    "COMMENTS": migration_marker("DEAL", 42, "DEAL"),
+                    "ADDITIONAL_INFO": "",
+                }
+            ]
+        raise AssertionError(method)
+
+    def batch_chunks(self, commands, size=35):
+        commands = list(commands)
+        for key, method, params in commands:
+            self.commands.append((method, params))
+        yield ({key: True for key, _method, _params in commands}, {})
+
+
+def test_existing_target_titles_are_renamed_in_full_cleanup(tmp_path: Path) -> None:
+    p = project(tmp_path)
+    client = _TargetTitleCleanupClient()
+    p.client = client
+
+    p.normalize_existing_target_titles(dry_run=False, full_cleanup=True)
+
+    assert client.commands == [
+        ("crm.company.update", {"id": 100, "fields": {"TITLE": "ТОО Kazmine"}}),
+        (
+            "crm.lead.update",
+            {
+                "id": 500,
+                "fields": {
+                    "TITLE": "ТОО Kazmine. e-Qazyna",
+                    "COMPANY_TITLE": "ТОО Kazmine",
+                },
+            },
+        ),
+        (
+            "crm.deal.update",
+            {
+                "id": 600,
+                "fields": {"TITLE": "ТОО Kazmine. e-Qazyna № 42468-NEA"},
+            },
+        ),
+    ]
+    assert p.report.extra["target_title_normalization"] == {
+        "company_updates": 1,
+        "lead_updates": 1,
+        "deal_updates": 1,
+        "skipped_limited_apply": 0,
+    }
+
+
+def test_limited_apply_skips_portal_wide_title_cleanup(tmp_path: Path) -> None:
+    p = project(tmp_path)
+    client = _TargetTitleCleanupClient()
+    p.client = client
+
+    p.normalize_existing_target_titles(dry_run=False, full_cleanup=False)
+
+    assert client.commands == []
+    assert p.report.extra["target_title_normalization"]["skipped_limited_apply"] == 1

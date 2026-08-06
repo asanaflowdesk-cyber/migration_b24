@@ -53,7 +53,7 @@ def main() -> int:
         "--source-id",
         value("BITRIX_SOURCE_ID", "OTHER"),
         "--source-description",
-        value("BITRIX_SOURCE_DESCRIPTION", "e-Qazyna Minerals — ГПО недропользователи"),
+        value("BITRIX_SOURCE_DESCRIPTION", "e-Qazyna Minerals. ГПО недропользователи"),
         "--max-consecutive-page-errors",
         "1",
         "--push-bitrix",

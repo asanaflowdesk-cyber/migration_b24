@@ -88,7 +88,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--lead-generation-value",
-        default=os.getenv("BITRIX_LEAD_GENERATION_VALUE", "ГПО Недропользователя"),
+        default=os.getenv("BITRIX_LEAD_GENERATION_VALUE", "ГПО недропользователя"),
     )
     parser.add_argument(
         "--originator-id",
@@ -102,7 +102,7 @@ def parse_args() -> argparse.Namespace:
         "--source-description",
         default=os.getenv(
             "BITRIX_SOURCE_DESCRIPTION",
-            "e-Qazyna Minerals — ГПО недропользователи",
+            "e-Qazyna Minerals. ГПО недропользователи",
         ),
     )
     parser.add_argument(
