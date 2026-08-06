@@ -52,7 +52,9 @@ jobs:
           PYTHONUNBUFFERED: "1"
           PYTHONPATH: ${{ github.workspace }}
           TARGET_BITRIX_WEBHOOK_URL: ${{ secrets.TARGET_BITRIX_WEBHOOK_URL }}
-        run: '".venv\Scripts\python.exe" -u register_users_from_excel.py --file "${{ inputs.file_path }}" --mode "${{ inputs.mode }}"'
+          INPUT_MODE: ${{ inputs.mode }}
+          INPUT_FILE_PATH: ${{ inputs.file_path }}
+        run: '".venv\Scripts\python.exe" -u run_from_env.py'
 
       - name: Загрузить отчет
         if: always()
