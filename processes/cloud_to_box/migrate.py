@@ -34,7 +34,7 @@ def source_client(required: bool) -> BitrixClient | None:
     if not url:
         if required:
             raise RuntimeError(
-                "SOURCE_BITRIX_WEBHOOK_URL is required for tasks, comments, checklists and files"
+                "SOURCE_BITRIX_WEBHOOK_URL is required for direct cloud-to-box import"
             )
         return None
     return BitrixClient.from_env("SOURCE_BITRIX_WEBHOOK_URL")
@@ -42,6 +42,8 @@ def source_client(required: bool) -> BitrixClient | None:
 
 def main() -> int:
     args = parser().parse_args()
+    if args.max_items < 0:
+        parser().error("--max-items must be 0 or a positive integer")
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -93,32 +95,26 @@ def main() -> int:
         elif args.command == "import":
             project.import_all(dry_run=args.dry_run, max_items=args.max_items)
 
-            # Object-level failures never stop the migration. Any legacy ERROR
-            # produced by an individual record is normalized to SKIP and remains
-            # visible in skipped.csv/actions.csv. Only an unhandled SYSTEM/FATAL
-            # exception may stop the workflow.
-            normalized = 0
-            for row in project.report.actions:
-                if row.get("status") == "ERROR":
-                    row["status"] = "SKIP"
-                    message = str(row.get("message") or "")
-                    if not message.startswith("Пропущено:"):
-                        row["message"] = f"Пропущено: {message}" if message else "Пропущено: объект не обработан"
-                    normalized += 1
-
+            # Individual records and child objects are handled inside the
+            # migration as SKIP/WARN/ERROR and do not stop the run. We preserve
+            # the original severity instead of rewriting ERROR to SKIP, so the
+            # report remains trustworthy. Only an unhandled SYSTEM/FATAL error
+            # stops the workflow.
             skipped = sum(1 for row in project.report.actions if row.get("status") == "SKIP")
             warnings = sum(1 for row in project.report.actions if row.get("status") == "WARN")
+            errors = sum(1 for row in project.report.actions if row.get("status") == "ERROR")
             project.report.extra["non_blocking_import_result"] = {
                 "policy": "skip_and_log",
-                "normalized_errors_to_skip": normalized,
                 "skipped": skipped,
                 "warnings": warnings,
+                "errors": errors,
                 "workflow_failed": False,
             }
             logging.info(
-                "Import completed under skip-and-log policy: skipped=%s, warnings=%s",
+                "Import completed under skip-and-log policy: skipped=%s, warnings=%s, errors=%s",
                 skipped,
                 warnings,
+                errors,
             )
             exit_code = 0
 
