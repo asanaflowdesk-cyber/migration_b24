@@ -5,6 +5,50 @@ from datetime import datetime, timezone
 from typing import Any
 
 
+MANAGER_NAMES = {
+    22: "Гаухар Джунисалиева",
+    23: "Айнура Жумакан",
+    16: "Андрей Крижевский",
+    17: "Юлия Сидикова",
+    18: "Ксения Кудайбергенова",
+    38: "Асет Исаев",
+    44: "Алина Курбанова",
+    39: "Владимир Петухов",
+    40: "Еркебулан Толекбергенов",
+    19: "Алия Казрахметова",
+    15: "Ольга Скребцова",
+}
+
+ACTION_LABELS = {
+    "created_lead": "СОЗДАН новый лид",
+    "dry_run_create_lead": "БУДЕТ СОЗДАН новый лид",
+    "skipped_existing_application": "ПРОПУЩЕНО: заявка уже существует",
+    "skipped_duplicate_application_in_run": "ПРОПУЩЕНО: повтор заявки в текущем запуске",
+    "error": "ОШИБКА",
+    "excel_only": "ТОЛЬКО ВЫГРУЗКА",
+}
+
+ENTITY_ACTION_LABELS = {
+    "dry_run_create_company": "будет создана",
+    "created_company": "создана",
+    "dry_run_update_company": "существует, будет обновлена",
+    "updated_company": "существует, обновлена",
+    "company_unchanged": "существует, без изменений",
+    "dry_run_create_contact": "будет создан",
+    "created_contact": "создан",
+    "dry_run_update_contact": "существует, будет обновлён",
+    "updated_contact": "существует, обновлён",
+    "contact_unchanged": "существует, без изменений",
+    "contact_skipped": "не создаётся",
+    "dry_run_create_requisite": "будет создан",
+    "created_requisite": "создан",
+    "dry_run_update_requisite": "существует, будет обновлён",
+    "updated_requisite": "существует, обновлён",
+    "requisite_unchanged": "существует, без изменений",
+    "requisite_skipped": "не создаётся",
+}
+
+
 @dataclass(slots=True)
 class Application:
     created_at_raw: str
@@ -91,15 +135,26 @@ class ProcessResult:
             "region": self.enrichment.region,
             "city": self.enrichment.city,
             "action": self.action,
+            "action_label": ACTION_LABELS.get(self.action, self.action),
+            "application_exists": "Да" if self.action == "skipped_existing_application" else "Нет",
+            "lead_decision": (
+                "Пропустить" if self.action.startswith("skipped_")
+                else "Создать" if self.action in {"created_lead", "dry_run_create_lead"}
+                else "Ошибка" if self.action == "error" else self.action
+            ),
             "lead_id": self.lead_id,
             "company_id": self.company_id,
             "contact_id": self.contact_id,
             "requisite_id": self.requisite_id,
             "company_action": self.company_action,
+            "company_action_label": ENTITY_ACTION_LABELS.get(self.company_action or "", self.company_action),
             "contact_action": self.contact_action,
+            "contact_action_label": ENTITY_ACTION_LABELS.get(self.contact_action or "", self.contact_action),
             "requisite_action": self.requisite_action,
+            "requisite_action_label": ENTITY_ACTION_LABELS.get(self.requisite_action or "", self.requisite_action),
             "address_action": self.address_action,
             "assigned_by_id": self.assigned_by_id,
+            "assigned_by_name": MANAGER_NAMES.get(self.assigned_by_id or 0),
             "assignment_reason": self.assignment_reason,
             "status_id": self.status_id,
             "status_reason": self.status_reason,

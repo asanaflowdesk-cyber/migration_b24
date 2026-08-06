@@ -11,7 +11,7 @@ from .bitrix_client import BitrixClient
 from .egov_client import EgovClient
 from .exporter import write_xlsx
 from .lead_pipeline import LeadPipeline, LeadPipelineConfig
-from .models import Application, CompanyEnrichment, ProcessResult
+from .models import ACTION_LABELS, ENTITY_ACTION_LABELS, MANAGER_NAMES, Application, CompanyEnrichment, ProcessResult
 from .scraper import EqazynaScraper
 from .settings import Settings, env_bool
 
@@ -326,12 +326,36 @@ def main() -> int:
             result = ProcessResult(app, enrichment, action="excel_only")
 
         if result.error:
-            print(f"    ERROR: {result.error}")
+            print(f"    ИТОГ: ОШИБКА — {result.error}")
         else:
+            print(f"    ИТОГ: {ACTION_LABELS.get(result.action, result.action)}")
+            if result.action == "skipped_existing_application":
+                print(
+                    f"    ПРОВЕРКА ДУБЛЯ: номер {app.doc_number} найден; "
+                    f"существующий lead_id={result.lead_id}; повторная загрузка запрещена"
+                )
+            elif result.action == "skipped_duplicate_application_in_run":
+                print(f"    ПРОВЕРКА ДУБЛЯ: номер {app.doc_number} уже встречался в этом запуске")
+            else:
+                print(f"    ПРОВЕРКА ДУБЛЯ: номер {app.doc_number} не найден; будет создан новый лид")
             print(
-                f"    {result.action}: lead={result.lead_id} company={result.company_id} "
-                f"contact={result.contact_id} requisite={result.requisite_id} "
-                f"assigned={result.assigned_by_id} status={result.status_id}"
+                f"    ЛИД: id={result.lead_id or '-'}; status={result.status_id or '-'}; "
+                f"правило_стадии={result.status_reason or '-'}; "
+                f"лид_источник={result.status_reference_lead_id or '-'}; "
+                f"причина={result.failure_reason or '-'}"
+            )
+            print(
+                f"    ОТВЕТСТВЕННЫЙ: {result.assigned_by_id or '-'} "
+                f"{MANAGER_NAMES.get(result.assigned_by_id or 0, '')}; "
+                f"правило={result.assignment_reason or '-'}"
+            )
+            print(
+                f"    КОМПАНИЯ: id={result.company_id or '-'}; "
+                f"{ENTITY_ACTION_LABELS.get(result.company_action or '', result.company_action or '-')}; "
+                f"КОНТАКТ: id={result.contact_id or '-'}; "
+                f"{ENTITY_ACTION_LABELS.get(result.contact_action or '', result.contact_action or '-')}; "
+                f"РЕКВИЗИТ: id={result.requisite_id or '-'}; "
+                f"{ENTITY_ACTION_LABELS.get(result.requisite_action or '', result.requisite_action or '-')}"
             )
             if result.warning:
                 print(f"    WARNING: {result.warning}")
@@ -345,6 +369,30 @@ def main() -> int:
         json.dumps([result.as_dict() for result in results], ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+
+    journal_path = result_path.with_name(result_path.stem + "_journal.txt")
+    journal_lines = [
+        "ЖУРНАЛ e-Qazyna → Bitrix24",
+        f"Режим: {'DRY RUN — без записи' if args.dry_run else 'APPLY — запись в CRM'}",
+        f"Заявок: {len(results)}",
+        "",
+    ]
+    for index, result in enumerate(results, start=1):
+        data = result.as_dict()
+        journal_lines.extend([
+            f"{index}. Заявка {data['doc_number']} | БИН {data['bin']}",
+            f"   Итог: {data['action_label']}",
+            f"   Проверка: {'найден существующий лид ' + str(data['lead_id']) if data['application_exists'] == 'Да' else 'точный номер заявки в CRM не найден'}",
+            f"   Лид: {data['lead_id'] or '-'} | стадия {data['status_id'] or '-'} | правило {data['status_reason'] or '-'} | источник стадии {data['status_reference_lead_id'] or '-'} | причина {data['failure_reason'] or '-'}",
+            f"   Ответственный: {data['assigned_by_id'] or '-'} {data['assigned_by_name'] or ''} | правило {data['assignment_reason'] or '-'}",
+            f"   Компания: {data['company_id'] or '-'} | {data['company_action_label'] or '-'}",
+            f"   Контакт: {data['contact_id'] or '-'} | {data['contact_action_label'] or '-'}",
+            f"   Реквизит: {data['requisite_id'] or '-'} | {data['requisite_action_label'] or '-'}",
+            f"   Предупреждение: {data['warning'] or '-'}",
+            f"   Ошибка: {data['error'] or '-'}",
+            "",
+        ])
+    journal_path.write_text("\n".join(journal_lines), encoding="utf-8")
 
     pages_path = result_path.with_name(result_path.stem + "_pages.json")
     pages_payload = {
@@ -370,6 +418,7 @@ def main() -> int:
     print(f"XLSX: {xlsx}")
     print(f"PAGES JSON: {pages_path}")
     print(f"JSON: {result_path}")
+    print(f"JOURNAL: {journal_path}")
     return 0
 
 
