@@ -21,11 +21,20 @@ def main() -> int:
     page_start = value("INPUT_PAGE_START", "1")
     page_list = value("INPUT_PAGE_LIST")
 
-    # Multiple pages are allowed only when the operator explicitly supplies the
-    # exact list/range. This prevents an accidental long backfill from a typo.
-    if not page_list and pages != "1":
-        print(f"WARNING: PAGE_LIST is empty; PAGES changed from {pages} to 1")
-        pages = "1"
+    try:
+        pages_number = int(pages)
+        page_start_number = int(page_start)
+    except ValueError as exc:
+        raise SystemExit("INPUT_PAGES and INPUT_PAGE_START must be integers") from exc
+    if pages_number < 1:
+        raise SystemExit("INPUT_PAGES must be at least 1")
+    if page_start_number < 1:
+        raise SystemExit("INPUT_PAGE_START must be at least 1")
+
+    # When PAGE_LIST is empty, PAGES means the requested number of consecutive
+    # pages starting from PAGE_START. Do not silently reduce it to one page.
+    pages = str(pages_number)
+    page_start = str(page_start_number)
 
     output_dir = Path("output")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -59,7 +68,7 @@ def main() -> int:
         "--source-description",
         value("BITRIX_SOURCE_DESCRIPTION", "e-Qazyna Minerals. ГПО недропользователи"),
         "--max-consecutive-page-errors",
-        "1",
+        "0",
         "--push-bitrix",
         "--out",
         str(output_dir / "eqazyna_bitrix_leads.xlsx"),
@@ -83,10 +92,16 @@ def main() -> int:
     if assigned_by_id:
         args.extend(["--assigned-by-id", assigned_by_id])
 
+    if page_list:
+        resolved_pages = page_list
+    else:
+        resolved_pages = f"{page_start_number}-{page_start_number + pages_number - 1}"
+
     print(
         "PARSER_RUN "
         f"mode={mode} pages={pages} page_start={page_start} "
-        f"page_list={page_list or '-'} field={value('BITRIX_LEAD_GENERATION_FIELD')}"
+        f"page_list={page_list or '-'} resolved_pages={resolved_pages} "
+        f"field={value('BITRIX_LEAD_GENERATION_FIELD')}"
     )
     completed = subprocess.run(args, check=False)
     return int(completed.returncode)
