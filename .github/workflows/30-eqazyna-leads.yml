@@ -90,7 +90,7 @@ jobs:
 
       - name: Проверить код парсера
         env:
-          PYTHONPATH: ${{ github.workspace }}\processes\eqazyna_leads
+          PYTHONPATH: ${{ github.workspace }};${{ github.workspace }}\processes\eqazyna_leads
         run: |
           ".venv\Scripts\python.exe" -m pytest -q tests
           if errorlevel 1 exit /b 1
@@ -105,7 +105,7 @@ jobs:
       - name: Проверить или загрузить лиды
         env:
           PYTHONUNBUFFERED: "1"
-          PYTHONPATH: ${{ github.workspace }}\processes\eqazyna_leads
+          PYTHONPATH: ${{ github.workspace }};${{ github.workspace }}\processes\eqazyna_leads
           TARGET_BITRIX_WEBHOOK_URL: ${{ secrets.TARGET_BITRIX_WEBHOOK_URL }}
           EGOV_API_KEY: ${{ secrets.EGOV_API_KEY }}
           BITRIX_ASSIGNED_BY_ID: ${{ vars.BITRIX_ASSIGNED_BY_ID }}
@@ -116,7 +116,7 @@ jobs:
           BITRIX_LEAD_GENERATION_VALUE: "ГПО недропользователя"
           BITRIX_ORIGINATOR_ID: "EQAZYNA_LEAD"
           BITRIX_SOURCE_ID: "OTHER"
-          BITRIX_SOURCE_DESCRIPTION: "e-Qazyna Minerals — ГПО недропользователи"
+          BITRIX_SOURCE_DESCRIPTION: "e-Qazyna Minerals. ГПО недропользователи"
           EQAZYNA_REQUEST_TIMEOUT: ${{ vars.EQAZYNA_REQUEST_TIMEOUT || '15' }}
           BITRIX_REQUEST_TIMEOUT: ${{ vars.BITRIX_REQUEST_TIMEOUT || '45' }}
           EGOV_REQUEST_TIMEOUT: ${{ vars.EGOV_REQUEST_TIMEOUT || '25' }}
