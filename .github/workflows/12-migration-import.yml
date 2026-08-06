@@ -20,6 +20,13 @@ on:
         default: ""
         type: string
 
+concurrency:
+  group: 12-migration-import-${{ github.repository }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
 env:
   NODE_USE_SYSTEM_CA: "1"
 
@@ -70,16 +77,19 @@ jobs:
           HTTP_TIMEOUT_SECONDS: "90"
           MAX_RETRIES: "7"
           REQUEST_DELAY_SECONDS: "0.05"
-        run: |
-          setlocal EnableExtensions EnableDelayedExpansion
-          set "ARGS=migrate.py import --max-items ${{ inputs.max_items }}"
-          if /I "${{ inputs.mode }}"=="dry_run" set "ARGS=!ARGS! --dry-run"
-          ".venv\Scripts\python.exe" -u !ARGS!
-          exit /b !ERRORLEVEL!
+          INPUT_MODE: ${{ inputs.mode }}
+          INPUT_MAX_ITEMS: ${{ inputs.max_items }}
+        run: '".venv\Scripts\python.exe" -u run_from_env.py'
 
       - name: Показать сформированные отчеты
         if: always()
-        run: dir output /s
+        run: |
+          if exist output (
+            dir output /s
+          ) else (
+            echo Папка output не создана: предыдущий шаг завершился до запуска миграции.
+          )
+          exit /b 0
 
       - name: Загрузить отчет и карты ID
         if: always()
