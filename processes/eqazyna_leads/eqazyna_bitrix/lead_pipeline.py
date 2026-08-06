@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import random
 import re
+from datetime import datetime
 from dataclasses import dataclass
 from typing import Any
 
@@ -21,15 +23,22 @@ DEFAULT_LEAD_GENERATION_VALUE = "ГПО Недропользователя"
 DEFAULT_ORIGINATOR_ID = "EQAZYNA_LEAD"
 DEFAULT_COMPANY_ORIGINATOR_ID = "EQAZYNA"
 DEFAULT_REQUISITE_PRESET_ID = "1"
+DEFAULT_FAILURE_REASON_FIELD = "STATUS_DESCRIPTION"
+DEFAULT_MANAGER_IDS = (22, 23, 16, 17, 18, 38, 44, 39, 40, 19, 15)
 
 
 @dataclass(slots=True)
 class LeadPipelineConfig:
     """Create and maintain a complete e-Qazyna CRM bundle.
 
-    One BIN is represented by one lead, one company, one company requisite and,
-    when a valid director name is available, one linked director contact.
-    Existing lead stage and responsible user are preserved on updates.
+    One e-Qazyna application number is represented by one lead. One BIN is
+    represented by one company, one company requisite and, when a valid
+    director name is available, one linked director contact. The responsible
+    manager is inherited only from the director contact card. If that contact
+    has no approved responsible manager, a manager is selected randomly among
+    the least-loaded approved managers. A new lead inherits a failed stage and
+    its reason only when the latest related lead ended unsuccessfully;
+    otherwise it starts NEW.
     """
 
     lead_status_id: str = "NEW"
@@ -44,6 +53,9 @@ class LeadPipelineConfig:
     source_description: str = "e-Qazyna Minerals. ГПО недропользователи"
     dry_run: bool = False
     validate_custom_field: bool = True
+    manager_ids: tuple[int, ...] = DEFAULT_MANAGER_IDS
+    failure_reason_field: str = DEFAULT_FAILURE_REASON_FIELD
+    random_seed: int | None = None
 
 
 @dataclass(slots=True)
@@ -66,6 +78,7 @@ class LeadPipeline:
         )
         self._requisite_bin_field = "RQ_BIN"
         self.validation_warnings: list[str] = []
+        self._seen_application_numbers: set[str] = set()
         self._available_requisite_fields: set[str] = {
             "RQ_BIN",
             "RQ_COMPANY_NAME",
@@ -73,6 +86,21 @@ class LeadPipeline:
             "RQ_DIRECTOR",
             "RQ_OKED",
         }
+        self._manager_ids = tuple(
+            dict.fromkeys(
+                int(value)
+                for value in config.manager_ids
+                if str(value).strip().isdigit() and int(value) > 0
+            )
+        )
+        self._manager_loads: dict[int, int] = {}
+        self._failed_status_ids: set[str] = {"JUNK"}
+        self._terminal_status_ids: set[str] = {"JUNK", "CONVERTED"}
+        self._random = (
+            random.Random(config.random_seed)
+            if config.random_seed is not None
+            else random.SystemRandom()
+        )
 
     # ---------- preflight ----------
 
@@ -134,6 +162,56 @@ class LeadPipeline:
                 "PRESET_ID не удалось определить автоматически; используется PRESET_ID=1, "
                 "как у перенесённых реквизитов компаний."
             )
+
+        self._load_lead_status_catalog()
+        self._load_manager_workloads()
+
+    def _load_lead_status_catalog(self) -> None:
+        try:
+            statuses = self.client.list_lead_statuses()
+        except Exception as exc:  # noqa: BLE001 - safe fallbacks remain available
+            self.validation_warnings.append(
+                f"Не удалось прочитать статусы лидов; для неудачи используется JUNK: {exc}"
+            )
+            return
+
+        failed: set[str] = set()
+        terminal: set[str] = set()
+        for row in statuses:
+            status_id = str(row.get("STATUS_ID") or row.get("ID") or "").strip()
+            semantics = str(row.get("SEMANTICS") or "").strip().upper()
+            if not status_id:
+                continue
+            if semantics == "F":
+                failed.add(status_id)
+                terminal.add(status_id)
+            elif semantics == "S":
+                terminal.add(status_id)
+        if failed:
+            self._failed_status_ids = failed
+        if terminal:
+            self._terminal_status_ids = terminal
+
+    def _load_manager_workloads(self) -> None:
+        if not self._manager_ids:
+            self.validation_warnings.append(
+                "Список менеджеров распределения пуст; Bitrix24 назначит ответственного по умолчанию."
+            )
+            return
+        loads: dict[int, int] = {}
+        try:
+            for manager_id in self._manager_ids:
+                loads[manager_id] = self.client.count_open_leads_for_manager(
+                    manager_id,
+                    self._terminal_status_ids,
+                )
+        except Exception as exc:  # noqa: BLE001 - distribution still remains possible
+            loads = {manager_id: 0 for manager_id in self._manager_ids}
+            self.validation_warnings.append(
+                "Не удалось получить текущую загрузку менеджеров; "
+                f"первичное распределение будет случайным между всеми: {exc}"
+            )
+        self._manager_loads = loads
 
     def _validate_lead_generation_field(self) -> None:
         fields = self.client.get_lead_fields()
@@ -206,27 +284,93 @@ class LeadPipeline:
     # ---------- public processing ----------
 
     def process(self, app: Application, enrichment: CompanyEnrichment) -> ProcessResult:
-        """Create/update the lead first-class bundle without optional blockers.
+        """Create one lead per application and shared company master data.
 
-        Company, director contact and requisite are attempted independently. A
-        failure of the requisite/address API is recorded as a warning and does
-        not cancel a correctly created lead.
+        Duplicate control is based on the exact e-Qazyna application number.
+        A repeated application is reported and skipped without creating or
+        changing CRM entities. Company, director contact and requisite remain
+        shared by BIN.
         """
         warnings: list[str] = []
-        lead: dict[str, Any] | None = None
         company = EntityOutcome(None, "company_not_processed")
         contact = EntityOutcome(None, "contact_not_processed")
         requisite = EntityOutcome(None, "requisite_not_processed")
+        reserved_manager_id: int | None = None
 
-        try:
-            lead = self.client.find_lead_by_origin(
-                app.bin,
-                originator_id=self.config.originator_id,
-                extra_select=[self.config.lead_generation_field],
+        doc_number = str(app.doc_number or "").strip()
+        if not doc_number:
+            return ProcessResult(
+                app,
+                enrichment,
+                action="error",
+                error="У заявки e-Qazyna отсутствует номер; дедупликация невозможна",
             )
 
+        if doc_number in self._seen_application_numbers:
+            return ProcessResult(
+                app,
+                enrichment,
+                action="skipped_duplicate_application_in_run",
+                warning=f"Заявка {doc_number} повторяется в текущей выборке и пропущена.",
+            )
+        self._seen_application_numbers.add(doc_number)
+
+        try:
+            duplicate = self.client.find_lead_by_application(
+                doc_number,
+                app.bin,
+                originator_id=self.config.originator_id,
+                extra_select=[
+                    self.config.lead_generation_field,
+                    self.config.failure_reason_field,
+                ],
+            )
+            if duplicate:
+                return ProcessResult(
+                    app,
+                    enrichment,
+                    action="skipped_existing_application",
+                    lead_id=str(duplicate.get("ID") or "") or None,
+                    company_id=str(duplicate.get("COMPANY_ID") or "") or None,
+                    contact_id=str(duplicate.get("CONTACT_ID") or "") or None,
+                    assigned_by_id=self._record_assigned_by_id(duplicate),
+                    assignment_reason="existing_application",
+                    status_id=str(duplicate.get("STATUS_ID") or "") or None,
+                    status_reason="existing_application",
+                    failure_reason=self._record_failure_reason(duplicate),
+                    warning=f"Заявка {doc_number} уже существует в CRM и не загружена повторно.",
+                )
+
+            existing_company = self._find_existing_company(app)
+            existing_contact = self._find_existing_director_contact(
+                app,
+                enrichment,
+                existing_company,
+            )
+            contact_reference_lead = self._find_contact_reference_lead(existing_contact)
+            company_reference_lead = self._find_reference_lead(app, existing_company)
+
+            inherited_assigned_by_id, assignment_reason = self._resolve_assignment(
+                existing_contact,
+            )
+            reserved_manager_id = inherited_assigned_by_id
+
+            lead_status_id, status_reason, failure_reason, status_reference_lead = (
+                self._resolve_status(
+                    contact_reference_lead,
+                    company_reference_lead,
+                )
+            )
+            force_entity_assignment = assignment_reason == "least_loaded_random"
+
             try:
-                company = self._ensure_company(app, enrichment, lead)
+                company = self._ensure_company(
+                    app,
+                    enrichment,
+                    existing_company=existing_company,
+                    preferred_assigned_by_id=inherited_assigned_by_id,
+                    force_assigned_by=force_entity_assignment,
+                )
                 if company.warning:
                     warnings.append(company.warning)
             except Exception as exc:  # noqa: BLE001 - lead must still be created
@@ -234,7 +378,14 @@ class LeadPipeline:
                 warnings.append(company.warning)
 
             try:
-                contact = self._ensure_director_contact(app, enrichment, company.entity_id)
+                contact = self._ensure_director_contact(
+                    app,
+                    enrichment,
+                    company.entity_id,
+                    existing_contact=existing_contact,
+                    preferred_assigned_by_id=inherited_assigned_by_id,
+                    force_assigned_by=force_entity_assignment,
+                )
                 if contact.warning:
                     warnings.append(contact.warning)
             except Exception as exc:  # noqa: BLE001 - lead must still be created
@@ -244,14 +395,20 @@ class LeadPipeline:
             if enrichment.error:
                 warnings.append(f"eGov: {enrichment.error}")
 
-            if lead:
-                lead_result = self._update_existing_lead(
-                    lead, app, enrichment, company.entity_id, contact.entity_id
-                )
-            else:
-                lead_result = self._create_lead(
-                    app, enrichment, company.entity_id, contact.entity_id
-                )
+            lead_result = self._create_lead(
+                app,
+                enrichment,
+                company.entity_id,
+                contact.entity_id,
+                assigned_by_id=inherited_assigned_by_id,
+                assignment_reason=assignment_reason,
+                status_id=lead_status_id,
+                status_reason=status_reason,
+                failure_reason=failure_reason,
+                status_reference_lead_id=(
+                    str((status_reference_lead or {}).get("ID") or "") or None
+                ),
+            )
 
             # Requisite belongs to the company, not to the lead. It is created
             # after the lead so a preset/address problem cannot erase the main
@@ -280,6 +437,8 @@ class LeadPipeline:
             lead_result.address_action = requisite.address_action
             return lead_result
         except Exception as exc:  # noqa: BLE001 - report error per application
+            if reserved_manager_id is not None:
+                self._release_manager_load(reserved_manager_id)
             return ProcessResult(
                 app,
                 enrichment,
@@ -294,15 +453,8 @@ class LeadPipeline:
                 error=str(exc),
             )
 
-    # ---------- company ----------
-
-    def _ensure_company(
-        self,
-        app: Application,
-        enrichment: CompanyEnrichment,
-        lead: dict[str, Any] | None,
-    ) -> EntityOutcome:
-        company: dict[str, Any] | None = self.client.find_company_by_origin(
+    def _find_existing_company(self, app: Application) -> dict[str, Any] | None:
+        company = self.client.find_company_by_origin(
             app.bin,
             originator_id=self.config.company_originator_id,
         )
@@ -311,15 +463,209 @@ class LeadPipeline:
                 app.bin,
                 bin_field=self._requisite_bin_field,
             )
-        if company is None:
-            lead_company_id = str((lead or {}).get("COMPANY_ID") or "")
-            if lead_company_id.isdigit():
-                company = self.client.get_company(lead_company_id)
+        if company is not None:
+            return company
 
+        legacy_lead = self.client.find_latest_lead_by_bin(
+            app.bin,
+            extra_select=[
+                self.config.lead_generation_field,
+                self.config.failure_reason_field,
+            ],
+        )
+        lead_company_id = str((legacy_lead or {}).get("COMPANY_ID") or "")
+        if lead_company_id.isdigit():
+            return self.client.get_company(lead_company_id)
+        return None
+
+    def _find_existing_director_contact(
+        self,
+        app: Application,
+        enrichment: CompanyEnrichment,
+        company: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        company_id = str((company or {}).get("ID") or "")
+        person = self._split_director_name(enrichment.director)
+        if not company_id.isdigit() or person is None:
+            return None
+        last_name, name, second_name = person
+        return self.client.find_director_contact(
+            company_id,
+            last_name,
+            name,
+            second_name,
+        )
+
+    def _find_contact_reference_lead(
+        self,
+        contact: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        contact_id = str((contact or {}).get("ID") or "")
+        if not contact_id.isdigit():
+            return None
+        return self.client.find_latest_lead_for_contact(
+            contact_id,
+            extra_select=[
+                self.config.lead_generation_field,
+                self.config.failure_reason_field,
+            ],
+        )
+
+    def _find_reference_lead(
+        self,
+        app: Application,
+        company: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        company_id = str((company or {}).get("ID") or "")
+        if company_id.isdigit():
+            lead = self.client.find_latest_lead_for_company(
+                company_id,
+                extra_select=[
+                    self.config.lead_generation_field,
+                    self.config.failure_reason_field,
+                ],
+            )
+            if lead:
+                return lead
+        return self.client.find_latest_lead_by_bin(
+            app.bin,
+            extra_select=[
+                self.config.lead_generation_field,
+                self.config.failure_reason_field,
+            ],
+        )
+
+    def _resolve_assignment(
+        self,
+        contact: dict[str, Any] | None,
+    ) -> tuple[int | None, str | None]:
+        """Resolve the lead owner from one unambiguous source.
+
+        If the director contact already exists, its ``ASSIGNED_BY_ID`` is the
+        only historical assignment considered. Lead history and company owner
+        are deliberately ignored, so conflicting owners cannot compete. When
+        the contact has no approved owner (or is being created now), the lead
+        bundle is distributed randomly among the least-loaded approved
+        managers.
+        """
+        manager_id = self._approved_record_assigned_by_id(contact or {})
+        if manager_id is not None:
+            self._reserve_manager_load(manager_id)
+            return manager_id, "director_contact_owner"
+
+        if self._manager_ids:
+            return self._select_least_loaded_manager(), "least_loaded_random"
+
+        configured = self._configured_assigned_by_id()
+        if configured:
+            return configured, "configured_default_no_manager_pool"
+        return None, None
+
+    def _resolve_status(
+        self,
+        contact_reference_lead: dict[str, Any] | None,
+        company_reference_lead: dict[str, Any] | None,
+    ) -> tuple[str, str, str | None, dict[str, Any] | None]:
+        reference = self._newest_lead(contact_reference_lead, company_reference_lead)
+        if reference and self._is_failed_lead(reference):
+            status_id = str(reference.get("STATUS_ID") or "").strip()
+            if status_id:
+                return (
+                    status_id,
+                    "failed_related_lead_inherited",
+                    self._record_failure_reason(reference),
+                    reference,
+                )
+        return (
+            str(self.config.lead_status_id or "NEW"),
+            "default_new",
+            None,
+            reference,
+        )
+
+    def _is_failed_lead(self, lead: dict[str, Any]) -> bool:
+        semantic = str(lead.get("STATUS_SEMANTIC_ID") or "").strip().upper()
+        if semantic == "F":
+            return True
+        return str(lead.get("STATUS_ID") or "").strip() in self._failed_status_ids
+
+    def _newest_lead(
+        self,
+        *leads: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        valid = [lead for lead in leads if isinstance(lead, dict) and lead]
+        if not valid:
+            return None
+        return max(valid, key=self._lead_sort_key)
+
+    @staticmethod
+    def _lead_sort_key(lead: dict[str, Any]) -> tuple[float, int]:
+        raw = str(lead.get("DATE_MODIFY") or lead.get("DATE_CREATE") or "").strip()
+        timestamp = 0.0
+        if raw:
+            try:
+                timestamp = datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                timestamp = 0.0
+        raw_id = str(lead.get("ID") or "").strip()
+        return timestamp, int(raw_id) if raw_id.isdigit() else 0
+
+    def _select_least_loaded_manager(self) -> int:
+        if not self._manager_loads:
+            self._manager_loads = {manager_id: 0 for manager_id in self._manager_ids}
+        minimum = min(self._manager_loads.values())
+        least_loaded = sorted(
+            manager_id
+            for manager_id, load in self._manager_loads.items()
+            if load == minimum
+        )
+        selected = int(self._random.choice(least_loaded))
+        self._reserve_manager_load(selected)
+        return selected
+
+    def _reserve_manager_load(self, manager_id: int) -> None:
+        if manager_id in self._manager_ids:
+            self._manager_loads[manager_id] = self._manager_loads.get(manager_id, 0) + 1
+
+    def _release_manager_load(self, manager_id: int) -> None:
+        if manager_id in self._manager_loads and self._manager_loads[manager_id] > 0:
+            self._manager_loads[manager_id] -= 1
+
+    def _approved_record_assigned_by_id(self, record: dict[str, Any]) -> int | None:
+        manager_id = self._record_assigned_by_id(record)
+        if manager_id is None:
+            return None
+        if self._manager_ids and manager_id not in self._manager_ids:
+            return None
+        return manager_id
+
+    def _record_failure_reason(self, record: dict[str, Any]) -> str | None:
+        for field_name in (self.config.failure_reason_field, "STATUS_DESCRIPTION"):
+            value = str(record.get(field_name) or "").strip()
+            if value:
+                return value
+        return None
+
+    # ---------- company ----------
+
+    def _ensure_company(
+        self,
+        app: Application,
+        enrichment: CompanyEnrichment,
+        *,
+        existing_company: dict[str, Any] | None,
+        preferred_assigned_by_id: int | None,
+        force_assigned_by: bool = False,
+    ) -> EntityOutcome:
+        company = existing_company
         desired = self._company_fields(app, enrichment, company)
-        assigned_by_id = self._configured_assigned_by_id()
-        if assigned_by_id and company is None:
-            desired["ASSIGNED_BY_ID"] = assigned_by_id
+        current_owner = self._record_assigned_by_id(company or {})
+        if preferred_assigned_by_id and (
+            company is None
+            or current_owner is None
+            or force_assigned_by
+        ):
+            desired["ASSIGNED_BY_ID"] = preferred_assigned_by_id
 
         if company:
             company_id = str(company.get("ID") or "")
@@ -507,6 +853,10 @@ class LeadPipeline:
         app: Application,
         enrichment: CompanyEnrichment,
         company_id: str | None,
+        *,
+        existing_contact: dict[str, Any] | None = None,
+        preferred_assigned_by_id: int | None = None,
+        force_assigned_by: bool = False,
     ) -> EntityOutcome:
         person = self._split_director_name(enrichment.director)
         if person is None:
@@ -522,19 +872,33 @@ class LeadPipeline:
         if not company_id:
             return EntityOutcome(None, "contact_skipped", warning="Контакт не создан: отсутствует компания")
         if company_id == "DRY_RUN_COMPANY":
-            return EntityOutcome("DRY_RUN_CONTACT", "dry_run_create_contact")
+            desired = self._contact_fields(
+                app,
+                enrichment,
+                "0",
+                person,
+                None,
+            )
+            desired["COMPANY_ID"] = "DRY_RUN_COMPANY"
+            if preferred_assigned_by_id:
+                desired["ASSIGNED_BY_ID"] = preferred_assigned_by_id
+            return EntityOutcome("DRY_RUN_CONTACT", "dry_run_create_contact", desired)
 
         last_name, name, second_name = person
-        contact = self.client.find_director_contact(
+        contact = existing_contact or self.client.find_director_contact(
             company_id,
             last_name,
             name,
             second_name,
         )
         desired = self._contact_fields(app, enrichment, company_id, person, contact)
-        assigned_by_id = self._configured_assigned_by_id()
-        if assigned_by_id and contact is None:
-            desired["ASSIGNED_BY_ID"] = assigned_by_id
+        current_owner = self._record_assigned_by_id(contact or {})
+        if preferred_assigned_by_id and (
+            contact is None
+            or current_owner is None
+            or force_assigned_by
+        ):
+            desired["ASSIGNED_BY_ID"] = preferred_assigned_by_id
 
         if contact:
             contact_id = str(contact.get("ID") or "")
@@ -600,9 +964,23 @@ class LeadPipeline:
         enrichment: CompanyEnrichment,
         company_id: str | None,
         contact_id: str | None,
+        *,
+        assigned_by_id: int | None,
+        assignment_reason: str | None,
+        status_id: str,
+        status_reason: str,
+        failure_reason: str | None,
+        status_reference_lead_id: str | None,
     ) -> ProcessResult:
-        fields = self._create_fields(app, enrichment, company_id, contact_id)
-        assigned_by_id = self._configured_assigned_by_id()
+        fields = self._create_fields(
+            app,
+            enrichment,
+            company_id,
+            contact_id,
+            assigned_by_id=assigned_by_id,
+            status_id=status_id,
+            failure_reason=failure_reason,
+        )
 
         if self.config.dry_run:
             return ProcessResult(
@@ -611,7 +989,11 @@ class LeadPipeline:
                 action="dry_run_create_lead",
                 lead_id="DRY_RUN_LEAD",
                 assigned_by_id=assigned_by_id,
-                assignment_reason="configured_on_create" if assigned_by_id else None,
+                assignment_reason=assignment_reason,
+                status_id=status_id,
+                status_reason=status_reason,
+                failure_reason=failure_reason,
+                status_reference_lead_id=status_reference_lead_id,
             )
 
         lead_id = self.client.create_lead(fields)
@@ -622,75 +1004,11 @@ class LeadPipeline:
             action="created_lead",
             lead_id=lead_id,
             assigned_by_id=assigned_by_id,
-            assignment_reason="configured_on_create" if assigned_by_id else None,
-            warning=warning,
-        )
-
-    def _update_existing_lead(
-        self,
-        lead: dict[str, Any],
-        app: Application,
-        enrichment: CompanyEnrichment,
-        company_id: str | None,
-        contact_id: str | None,
-    ) -> ProcessResult:
-        lead_id = str(lead.get("ID") or "")
-        if not lead_id:
-            raise BitrixError("crm.lead.list вернул лид без ID")
-
-        existing_comments = str(lead.get("COMMENTS") or "")
-        new_application = app.application_key not in existing_comments
-        fields = self._update_fields(
-            app,
-            enrichment,
-            existing_comments,
-            company_id,
-            contact_id,
-            lead,
-        )
-
-        if (
-            str(lead.get("ORIGINATOR_ID") or "") != self.config.originator_id
-            or str(lead.get("ORIGIN_ID") or "") != app.bin
-        ):
-            fields["ORIGINATOR_ID"] = self.config.originator_id
-            fields["ORIGIN_ID"] = app.bin
-
-        changed_fields = self._only_changed_fields(lead, fields)
-        assigned_by_id = self._record_assigned_by_id(lead)
-
-        if self.config.dry_run:
-            action = "dry_run_update_lead" if changed_fields else "dry_run_existing_lead_unchanged"
-            return ProcessResult(
-                app,
-                enrichment,
-                action=action,
-                lead_id=lead_id,
-                assigned_by_id=assigned_by_id,
-                assignment_reason="existing_lead_owner_preserved",
-            )
-
-        if changed_fields:
-            self.client.update_lead(lead_id, changed_fields)
-
-        warning = None
-        if new_application:
-            warning = self._safe_add_timeline_comment(lead_id, app, enrichment)
-
-        if new_application:
-            action = "existing_lead_new_application_added"
-        elif changed_fields:
-            action = "existing_lead_backfilled"
-        else:
-            action = "existing_lead_unchanged"
-
-        return ProcessResult(
-            app,
-            enrichment,
-            action=action,
-            lead_id=lead_id,
-            assigned_by_id=assigned_by_id,
-            assignment_reason="existing_lead_owner_preserved",
+            assignment_reason=assignment_reason,
+            status_id=status_id,
+            status_reason=status_reason,
+            failure_reason=failure_reason,
+            status_reference_lead_id=status_reference_lead_id,
             warning=warning,
         )
 
@@ -700,46 +1018,28 @@ class LeadPipeline:
         enrichment: CompanyEnrichment,
         company_id: str | None,
         contact_id: str | None,
+        *,
+        assigned_by_id: int | None,
+        status_id: str,
+        failure_reason: str | None,
     ) -> dict[str, object]:
         fields: dict[str, object] = {
             "TITLE": build_lead_title(app, enrichment),
             "COMPANY_TITLE": short_organization_name(enrichment.name or app.applicant_name),
-            "STATUS_ID": self.config.lead_status_id or "NEW",
+            "STATUS_ID": status_id or "NEW",
             "OPENED": "Y",
             "COMMENTS": build_lead_comment(app, enrichment),
             "ORIGINATOR_ID": self.config.originator_id,
-            "ORIGIN_ID": app.bin,
+            "ORIGIN_ID": app.doc_number,
             "SOURCE_ID": self.config.source_id,
             "SOURCE_DESCRIPTION": self.config.source_description,
             self.config.lead_generation_field: self._lead_generation_encoded_value,
         }
+        if failure_reason:
+            fields[self.config.failure_reason_field] = failure_reason
         self._add_lead_master_links(fields, enrichment, company_id, contact_id)
-        assigned_by_id = self._configured_assigned_by_id()
         if assigned_by_id:
             fields["ASSIGNED_BY_ID"] = assigned_by_id
-        return fields
-
-    def _update_fields(
-        self,
-        app: Application,
-        enrichment: CompanyEnrichment,
-        existing_comments: str,
-        company_id: str | None,
-        contact_id: str | None,
-        current: dict[str, Any],
-    ) -> dict[str, object]:
-        # Existing status and responsible are deliberately preserved.
-        fields: dict[str, object] = {
-            "TITLE": build_lead_title(app, enrichment),
-            "COMPANY_TITLE": short_organization_name(enrichment.name or app.applicant_name),
-            "COMMENTS": build_lead_comment(app, enrichment, existing_comments),
-            self.config.lead_generation_field: self._lead_generation_encoded_value,
-        }
-        self._add_lead_master_links(fields, enrichment, company_id, contact_id, current)
-        if self.config.overwrite_assigned_by_on_update:
-            assigned_by_id = self._configured_assigned_by_id()
-            if assigned_by_id:
-                fields["ASSIGNED_BY_ID"] = assigned_by_id
         return fields
 
     def _add_lead_master_links(

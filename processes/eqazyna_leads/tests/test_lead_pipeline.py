@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from eqazyna_bitrix.bitrix_client import BitrixError
-from eqazyna_bitrix.lead_pipeline import LeadPipeline, LeadPipelineConfig
+from eqazyna_bitrix.lead_pipeline import DEFAULT_MANAGER_IDS, LeadPipeline, LeadPipelineConfig
 from eqazyna_bitrix.models import Application, CompanyEnrichment
 
 
@@ -42,6 +42,8 @@ class FakeClient:
         self,
         *,
         lead=None,
+        contact_lead=None,
+        application_lead=None,
         company=None,
         requisite=None,
         contact=None,
@@ -51,8 +53,12 @@ class FakeClient:
         requisite_presets=None,
         discovered_preset=1,
         requisite_create_error=None,
+        manager_loads=None,
+        lead_statuses=None,
     ):
         self.lead = lead
+        self.contact_lead = contact_lead
+        self.application_lead = application_lead
         self.company = company
         self.requisite = requisite
         self.contact = contact
@@ -62,8 +68,16 @@ class FakeClient:
         self.requisite_presets = requisite_presets
         self.discovered_preset = discovered_preset
         self.requisite_create_error = requisite_create_error
+        self.manager_loads = dict(manager_loads or {})
+        self.lead_statuses = lead_statuses or [
+            {"STATUS_ID": "NEW", "SEMANTICS": ""},
+            {"STATUS_ID": "IN_PROCESS", "SEMANTICS": ""},
+            {"STATUS_ID": "CONVERTED", "SEMANTICS": "S"},
+            {"STATUS_ID": "JUNK", "SEMANTICS": "F"},
+        ]
 
         self.created_lead_fields = None
+        self.created_lead_fields_list = []
         self.updated_lead_fields = None
         self.created_company_fields = None
         self.updated_company_fields = None
@@ -90,6 +104,12 @@ class FakeClient:
             "RQ_OKED": {},
         }
 
+    def list_lead_statuses(self):
+        return self.lead_statuses
+
+    def count_open_leads_for_manager(self, manager_id, terminal_status_ids=None):
+        return int(self.manager_loads.get(int(manager_id), 0))
+
     def discover_company_requisite_preset_id(self):
         return self.discovered_preset
 
@@ -98,15 +118,37 @@ class FakeClient:
             return self.requisite_presets
         return [{"ID": "3", "ENTITY_TYPE_ID": "8", "NAME": "Юр. лицо", "XML_ID": "#CRM_REQUISITE_PRESET_DEF_KZ_LEGALENTITY#", "ACTIVE": "Y"}]
 
-    def find_lead_by_origin(self, origin_id, originator_id="EQAZYNA_LEAD", extra_select=None):
-        assert origin_id == "123456789012"
+    def find_lead_by_application(
+        self, doc_number, bin_number, originator_id="EQAZYNA_LEAD", extra_select=None
+    ):
+        assert doc_number.startswith("APP-")
+        assert bin_number == "123456789012"
         assert originator_id == "EQAZYNA_LEAD"
         assert FIELD in (extra_select or [])
+        return self.application_lead
+
+    def find_latest_lead_for_company(self, company_id, extra_select=None):
+        assert str(company_id) == "601"
+        assert FIELD in (extra_select or [])
+        assert "STATUS_DESCRIPTION" in (extra_select or [])
+        return self.lead
+
+    def find_latest_lead_for_contact(self, contact_id, extra_select=None):
+        assert str(contact_id) == "801"
+        assert FIELD in (extra_select or [])
+        assert "STATUS_DESCRIPTION" in (extra_select or [])
+        return self.contact_lead
+
+    def find_latest_lead_by_bin(self, bin_number, extra_select=None):
+        assert bin_number == "123456789012"
+        assert FIELD in (extra_select or [])
+        assert "STATUS_DESCRIPTION" in (extra_select or [])
         return self.lead
 
     def create_lead(self, fields):
         self.created_lead_fields = fields
-        return "501"
+        self.created_lead_fields_list.append(fields)
+        return str(500 + len(self.created_lead_fields_list))
 
     def update_lead(self, lead_id, fields):
         assert lead_id == "77"
@@ -174,6 +216,7 @@ class FakeClient:
 
 
 def pipeline(client: FakeClient, **config_kwargs) -> LeadPipeline:
+    config_kwargs.setdefault("random_seed", 7)
     result = LeadPipeline(client, LeadPipelineConfig(**config_kwargs))
     result.validate()
     return result
@@ -201,9 +244,13 @@ def test_create_complete_crm_bundle_and_use_compact_title():
     assert fields[FIELD] == VALUE
     assert fields["TITLE"] == "ТОО Тест Недра. e-Qazyna № APP-1"
     assert fields["STATUS_ID"] == "NEW"
+    assert fields["ORIGIN_ID"] == "APP-1"
     assert fields["COMPANY_ID"] == 601
     assert fields["CONTACT_ID"] == 801
-    assert fields["ASSIGNED_BY_ID"] == 36
+    assert fields["ASSIGNED_BY_ID"] == 22
+    assert client.created_company_fields["ASSIGNED_BY_ID"] == 22
+    assert client.created_contact_fields["ASSIGNED_BY_ID"] == 22
+    assert result.assignment_reason == "least_loaded_random"
     assert "—" not in fields["TITLE"]
     assert len(client.timeline) == 1
 
@@ -262,57 +309,124 @@ def test_existing_migrated_company_requisite_and_contact_are_reused():
     assert client.created_contact_fields is None
 
 
-def test_update_adds_new_application_but_preserves_stage_and_owner():
-    first = application("APP-1")
-    second = application("APP-2")
-    client = FakeClient(
-        lead={
-            "ID": "77",
-            "TITLE": "Старый заголовок",
-            "STATUS_ID": "IN_PROCESS",
-            "ASSIGNED_BY_ID": "116",
-            "COMPANY_TITLE": "Старое название",
-            "COMMENTS": f"Ключ заявки: {first.application_key}",
-            "ORIGINATOR_ID": "EQAZYNA_LEAD",
-            "ORIGIN_ID": second.bin,
-            FIELD: "",
-        }
-    )
+def test_failed_previous_company_lead_inherits_stage_reason_but_not_company_owner():
+    company = {
+        "ID": "601",
+        "TITLE": "ТОО Тест Недра",
+        "ASSIGNED_BY_ID": "15",
+        "ORIGINATOR_ID": "EQAZYNA",
+        "ORIGIN_ID": "123456789012",
+    }
+    previous = {
+        "ID": "77",
+        "TITLE": "ТОО Тест Недра. e-Qazyna № APP-1",
+        "STATUS_ID": "JUNK",
+        "STATUS_SEMANTIC_ID": "F",
+        "STATUS_DESCRIPTION": "Клиент отказался",
+        "DATE_MODIFY": "2026-08-05T10:00:00+05:00",
+        "ASSIGNED_BY_ID": "999",
+        "COMPANY_ID": "601",
+        "COMMENTS": "Ключ заявки: eQazyna|APP-1|123456789012",
+        "ORIGINATOR_ID": "EQAZYNA_LEAD",
+        "ORIGIN_ID": "APP-1",
+        FIELD: VALUE,
+    }
+    loads = {manager_id: 5 for manager_id in DEFAULT_MANAGER_IDS}
+    loads[44] = 0
+    client = FakeClient(company=company, lead=previous, manager_loads=loads)
 
-    result = pipeline(
-        client,
-        assigned_by_id="36",
-        overwrite_assigned_by_on_update=False,
-    ).process(second, enrichment())
+    result = pipeline(client, assigned_by_id="36").process(application("APP-2"), enrichment())
 
-    assert result.action == "existing_lead_new_application_added"
+    assert result.action == "created_lead"
+    assert result.assigned_by_id == 44
+    assert result.assignment_reason == "least_loaded_random"
+    assert result.status_id == "JUNK"
+    assert result.status_reason == "failed_related_lead_inherited"
+    assert result.failure_reason == "Клиент отказался"
+    assert result.status_reference_lead_id == "77"
+    assert client.created_lead_fields["ASSIGNED_BY_ID"] == 44
+    assert client.created_lead_fields["STATUS_ID"] == "JUNK"
+    assert client.created_lead_fields["STATUS_DESCRIPTION"] == "Клиент отказался"
+    assert client.created_lead_fields["ORIGIN_ID"] == "APP-2"
+    assert client.created_lead_fields["TITLE"].endswith("e-Qazyna № APP-2")
+
+
+def test_previous_lead_owner_is_ignored_without_director_contact_owner():
+    company = {
+        "ID": "601",
+        "TITLE": "ТОО Тест Недра",
+        "ORIGINATOR_ID": "EQAZYNA",
+        "ORIGIN_ID": "123456789012",
+    }
+    previous = {
+        "ID": "77",
+        "STATUS_ID": "IN_PROCESS",
+        "ASSIGNED_BY_ID": "16",
+        "COMPANY_ID": "601",
+        "DATE_MODIFY": "2026-08-05T10:00:00+05:00",
+    }
+    loads = {manager_id: 5 for manager_id in DEFAULT_MANAGER_IDS}
+    loads[38] = 0
+    client = FakeClient(company=company, lead=previous, manager_loads=loads)
+
+    result = pipeline(client, assigned_by_id="36").process(application("APP-2"), enrichment())
+
+    assert result.action == "created_lead"
+    assert result.assigned_by_id == 38
+    assert result.assignment_reason == "least_loaded_random"
+    assert result.status_id == "NEW"
+
+def test_existing_application_number_is_skipped_without_any_writes():
+    existing = {
+        "ID": "77",
+        "TITLE": "ТОО Тест Недра. e-Qazyna № APP-2",
+        "STATUS_ID": "IN_PROCESS",
+        "ASSIGNED_BY_ID": "116",
+        "COMPANY_ID": "601",
+        "CONTACT_ID": "801",
+        "ORIGINATOR_ID": "EQAZYNA_LEAD",
+        "ORIGIN_ID": "APP-2",
+    }
+    client = FakeClient(application_lead=existing)
+
+    result = pipeline(client).process(application("APP-2"), enrichment())
+
+    assert result.action == "skipped_existing_application"
+    assert result.lead_id == "77"
     assert result.assigned_by_id == 116
-    assert client.updated_lead_fields[FIELD] == VALUE
-    assert "STATUS_ID" not in client.updated_lead_fields
-    assert "ASSIGNED_BY_ID" not in client.updated_lead_fields
-    assert second.application_key in client.updated_lead_fields["COMMENTS"]
+    assert client.created_lead_fields is None
+    assert client.created_company_fields is None
+    assert client.created_contact_fields is None
+    assert client.created_requisite_fields is None
 
 
-def test_legacy_migrated_lead_is_canonicalised_to_bin_marker():
-    app = application("APP-2")
-    client = FakeClient(
-        lead={
-            "ID": "77",
-            "TITLE": "e-Qazyna № APP-1",
-            "STATUS_ID": "IN_PROCESS",
-            "ASSIGNED_BY_ID": "116",
-            "COMMENTS": "Ключ заявки: eQazyna|APP-1|123456789012",
-            "ORIGINATOR_ID": "EQAZYNA",
-            "ORIGIN_ID": "eQazyna|APP-1|123456789012",
-            FIELD: VALUE,
-        }
-    )
+def test_two_different_application_numbers_for_same_bin_create_two_leads():
+    client = FakeClient()
+    parser = pipeline(client)
 
-    result = pipeline(client).process(app, enrichment())
+    first = parser.process(application("APP-1"), enrichment())
+    second = parser.process(application("APP-2"), enrichment())
 
-    assert result.action == "existing_lead_new_application_added"
-    assert client.updated_lead_fields["ORIGINATOR_ID"] == "EQAZYNA_LEAD"
-    assert client.updated_lead_fields["ORIGIN_ID"] == app.bin
+    assert first.action == "created_lead"
+    assert second.action == "created_lead"
+    assert len(client.created_lead_fields_list) == 2
+    assert [row["ORIGIN_ID"] for row in client.created_lead_fields_list] == ["APP-1", "APP-2"]
+    assert [row["TITLE"] for row in client.created_lead_fields_list] == [
+        "ТОО Тест Недра. e-Qazyna № APP-1",
+        "ТОО Тест Недра. e-Qazyna № APP-2",
+    ]
+
+
+def test_same_application_repeated_in_one_run_is_skipped():
+    client = FakeClient()
+    parser = pipeline(client)
+
+    first = parser.process(application("APP-1"), enrichment())
+    second = parser.process(application("APP-1"), enrichment())
+
+    assert first.action == "created_lead"
+    assert second.action == "skipped_duplicate_application_in_run"
+    assert len(client.created_lead_fields_list) == 1
 
 
 def test_no_dummy_contact_is_created_without_full_director_name():
@@ -409,3 +523,201 @@ def test_dry_run_reads_but_never_writes():
     assert client.timeline == []
 
 
+
+
+def test_director_contact_owner_is_only_assignment_source_when_owners_conflict():
+    company = {
+        "ID": "601",
+        "TITLE": "ТОО Тест Недра",
+        "ASSIGNED_BY_ID": "15",
+        "ORIGINATOR_ID": "EQAZYNA",
+        "ORIGIN_ID": "123456789012",
+    }
+    contact = {
+        "ID": "801",
+        "LAST_NAME": "Иванов",
+        "NAME": "Иван",
+        "SECOND_NAME": "Иванович",
+        "COMPANY_ID": "601",
+        "ASSIGNED_BY_ID": "17",
+    }
+    contact_lead = {
+        "ID": "90",
+        "STATUS_ID": "IN_PROCESS",
+        "ASSIGNED_BY_ID": "18",
+        "CONTACT_ID": "801",
+        "COMPANY_ID": "601",
+        "DATE_MODIFY": "2026-08-05T12:00:00+05:00",
+    }
+    company_lead = {
+        "ID": "89",
+        "STATUS_ID": "IN_PROCESS",
+        "ASSIGNED_BY_ID": "16",
+        "COMPANY_ID": "601",
+        "DATE_MODIFY": "2026-08-05T13:00:00+05:00",
+    }
+    client = FakeClient(
+        company=company,
+        contact=contact,
+        contact_lead=contact_lead,
+        lead=company_lead,
+    )
+
+    result = pipeline(client).process(application("APP-2"), enrichment())
+
+    assert result.action == "created_lead"
+    assert result.assigned_by_id == 17
+    assert result.assignment_reason == "director_contact_owner"
+    assert client.created_lead_fields["ASSIGNED_BY_ID"] == 17
+
+
+def test_latest_related_lead_controls_failed_stage_and_reason():
+    company = {
+        "ID": "601",
+        "TITLE": "ТОО Тест Недра",
+        "ORIGINATOR_ID": "EQAZYNA",
+        "ORIGIN_ID": "123456789012",
+    }
+    contact = {
+        "ID": "801",
+        "LAST_NAME": "Иванов",
+        "NAME": "Иван",
+        "SECOND_NAME": "Иванович",
+        "COMPANY_ID": "601",
+        "ASSIGNED_BY_ID": "17",
+    }
+    contact_lead = {
+        "ID": "90",
+        "STATUS_ID": "IN_PROCESS",
+        "ASSIGNED_BY_ID": "17",
+        "CONTACT_ID": "801",
+        "DATE_MODIFY": "2026-08-05T12:00:00+05:00",
+    }
+    company_lead = {
+        "ID": "91",
+        "STATUS_ID": "JUNK",
+        "STATUS_SEMANTIC_ID": "F",
+        "STATUS_DESCRIPTION": "Не дозвонились",
+        "ASSIGNED_BY_ID": "16",
+        "COMPANY_ID": "601",
+        "DATE_MODIFY": "2026-08-05T14:00:00+05:00",
+    }
+    client = FakeClient(
+        company=company,
+        contact=contact,
+        contact_lead=contact_lead,
+        lead=company_lead,
+    )
+
+    result = pipeline(client).process(application("APP-2"), enrichment())
+
+    assert result.assigned_by_id == 17
+    assert result.assignment_reason == "director_contact_owner"
+    assert result.status_id == "JUNK"
+    assert result.failure_reason == "Не дозвонились"
+    assert result.status_reference_lead_id == "91"
+    assert client.created_lead_fields["STATUS_DESCRIPTION"] == "Не дозвонились"
+
+
+def test_newer_active_lead_means_new_stage_even_when_older_lead_failed():
+    company = {
+        "ID": "601",
+        "TITLE": "ТОО Тест Недра",
+        "ORIGINATOR_ID": "EQAZYNA",
+        "ORIGIN_ID": "123456789012",
+    }
+    contact = {
+        "ID": "801",
+        "LAST_NAME": "Иванов",
+        "NAME": "Иван",
+        "SECOND_NAME": "Иванович",
+        "COMPANY_ID": "601",
+        "ASSIGNED_BY_ID": "17",
+    }
+    contact_lead = {
+        "ID": "92",
+        "STATUS_ID": "IN_PROCESS",
+        "ASSIGNED_BY_ID": "17",
+        "CONTACT_ID": "801",
+        "DATE_MODIFY": "2026-08-05T15:00:00+05:00",
+    }
+    company_lead = {
+        "ID": "91",
+        "STATUS_ID": "JUNK",
+        "STATUS_SEMANTIC_ID": "F",
+        "STATUS_DESCRIPTION": "Клиент отказался",
+        "ASSIGNED_BY_ID": "16",
+        "COMPANY_ID": "601",
+        "DATE_MODIFY": "2026-08-05T14:00:00+05:00",
+    }
+    client = FakeClient(
+        company=company,
+        contact=contact,
+        contact_lead=contact_lead,
+        lead=company_lead,
+    )
+
+    result = pipeline(client).process(application("APP-2"), enrichment())
+
+    assert result.status_id == "NEW"
+    assert result.status_reason == "default_new"
+    assert result.failure_reason is None
+    assert "STATUS_DESCRIPTION" not in client.created_lead_fields
+
+
+def test_distribution_is_random_only_between_least_loaded_managers_and_assigns_bundle():
+    loads = {manager_id: 8 for manager_id in DEFAULT_MANAGER_IDS}
+    loads[16] = 2
+    loads[17] = 2
+    client = FakeClient(manager_loads=loads)
+
+    result = pipeline(client, random_seed=3).process(application(), enrichment())
+
+    assert result.action == "created_lead"
+    assert result.assignment_reason == "least_loaded_random"
+    assert result.assigned_by_id in {16, 17}
+    assert client.created_lead_fields["ASSIGNED_BY_ID"] == result.assigned_by_id
+    assert client.created_company_fields["ASSIGNED_BY_ID"] == result.assigned_by_id
+    assert client.created_contact_fields["ASSIGNED_BY_ID"] == result.assigned_by_id
+
+
+def test_director_contact_owner_outside_approved_pool_is_ignored():
+    company = {
+        "ID": "601",
+        "TITLE": "ТОО Тест Недра",
+        "ASSIGNED_BY_ID": "15",
+        "ORIGINATOR_ID": "EQAZYNA",
+        "ORIGIN_ID": "123456789012",
+    }
+    contact = {
+        "ID": "801",
+        "LAST_NAME": "Иванов",
+        "NAME": "Иван",
+        "SECOND_NAME": "Иванович",
+        "COMPANY_ID": "601",
+        "ASSIGNED_BY_ID": "999",
+    }
+    previous = {
+        "ID": "77",
+        "STATUS_ID": "IN_PROCESS",
+        "ASSIGNED_BY_ID": "16",
+        "CONTACT_ID": "801",
+        "COMPANY_ID": "601",
+        "DATE_MODIFY": "2026-08-05T10:00:00+05:00",
+    }
+    loads = {manager_id: 5 for manager_id in DEFAULT_MANAGER_IDS}
+    loads[44] = 0
+    client = FakeClient(
+        company=company,
+        contact=contact,
+        contact_lead=previous,
+        lead=previous,
+        manager_loads=loads,
+    )
+
+    result = pipeline(client).process(application("APP-2"), enrichment())
+
+    assert result.assigned_by_id == 44
+    assert result.assignment_reason == "least_loaded_random"
+    assert client.updated_company_fields["ASSIGNED_BY_ID"] == 44
+    assert client.updated_contact_fields["ASSIGNED_BY_ID"] == 44
