@@ -100,3 +100,67 @@ def test_fetch_page_retries_transient_read_timeout(monkeypatch):
     assert session.calls == 3
     assert session.timeouts == [(15, 60), (15, 60), (15, 60)]
     assert "flDocType=%D0%A2%D0%BF%D0%B8%D0%97%D0%B0%D1%8F%D0%B2%D0%BA%D0%B0%D0%9D%D0%B0%D0%A0%D0%B0%D0%B7%D0%B2%D0%B5%D0%B4%D0%BA%D1%83" in url
+
+
+def _registry_html(rows):
+    body = []
+    for doc_number, bin_number in rows:
+        body.append(
+            "<tr>"
+            "<td>01.08.2026 10:00:00</td>"
+            f"<td>{doc_number}</td>"
+            f"<td>{bin_number}</td>"
+            f"<td>ТОО {doc_number}</td>"
+            "<td>Заявка на разведку ТПИ</td>"
+            "<td>Принято</td>"
+            "</tr>"
+        )
+    return "<h1>Реестр заявок</h1><table>" + "".join(body) + "</table>"
+
+
+class _BoundaryShiftScraper(EqazynaScraper):
+    def __init__(self):
+        super().__init__(polite_delay_seconds=0)
+        self.requested = []
+        self.pages = {
+            1: [("A-1", "000000000001"), ("A-2", "000000000002")],
+            2: [("A-3", "000000000003"), ("A-4", "000000000004")],
+            # A-4 moved to the next page while the run was in progress.
+            3: [("A-4", "000000000004"), ("A-5", "000000000005")],
+            4: [("A-6", "000000000006"), ("A-7", "000000000007")],
+        }
+
+    def fetch_page(self, page, doc_type, statuses):
+        self.requested.append(page)
+        return _registry_html(self.pages.get(page, [])), f"https://example.test?p={page}"
+
+
+def test_sequential_scrape_backfills_page_boundary_duplicates():
+    scraper = _BoundaryShiftScraper()
+
+    rows = scraper.scrape(
+        pages=3,
+        page_start=1,
+        doc_type="Заявка на разведку ТПИ",
+        statuses=["Принято"],
+    )
+
+    assert scraper.requested == [1, 2, 3, 4]
+    assert [row.doc_number for row in rows] == ["A-1", "A-2", "A-3", "A-4", "A-5", "A-6"]
+    assert len(rows) == 6
+    assert scraper.page_logs[-1].status == "coverage_backfill"
+    assert scraper.page_logs[-1].accepted == 1
+
+
+def test_explicit_page_list_does_not_extend_requested_pages():
+    scraper = _BoundaryShiftScraper()
+
+    rows = scraper.scrape(
+        pages=3,
+        page_list="1-3",
+        doc_type="Заявка на разведку ТПИ",
+        statuses=["Принято"],
+    )
+
+    assert scraper.requested == [1, 2, 3]
+    assert [row.doc_number for row in rows] == ["A-1", "A-2", "A-3", "A-4", "A-5"]

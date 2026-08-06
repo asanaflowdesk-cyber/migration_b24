@@ -269,19 +269,46 @@ class EqazynaScraper:
         self.failed_pages.clear()
 
         explicit_pages = self.parse_page_list(page_list)
-        page_numbers = explicit_pages if explicit_pages else list(range(max(1, page_start), max(1, page_start) + pages))
+        requested_pages = (
+            explicit_pages
+            if explicit_pages
+            else list(range(max(1, page_start), max(1, page_start) + pages))
+        )
         sequential_mode = explicit_pages is None
+        page_queue = list(requested_pages)
+        requested_page_count = len(requested_pages)
+        next_safety_page = (max(requested_pages) + 1) if requested_pages else max(1, page_start)
+        safety_pages_added = 0
+        max_safety_pages = max(3, min(20, max(1, pages) * 2))
+        coverage_target = 0
+        coverage_backfill_enabled = sequential_mode and min_created_date is None
         consecutive_failed_pages = 0
+        queue_index = 0
+        stop_requested = False
 
-        for page in page_numbers:
+        while queue_index < len(page_queue):
+            page = page_queue[queue_index]
+            is_safety_page = queue_index >= requested_page_count
+            queue_index += 1
             url = self.build_url(page, doc_type, wanted_statuses)
             try:
                 html, url = self.fetch_page(page, doc_type, wanted_statuses)
             except Exception as exc:  # noqa: BLE001 - keep backfill alive
                 error = str(exc)
                 self.failed_pages.append(page)
-                self.page_logs.append(PageLog(page=page, url=url, status="failed", error=error, total_after_page=len(results)))
-                print(f"    ERROR: page {page} failed after retries; continue_on_page_error={self.continue_on_page_error}: {error}")
+                self.page_logs.append(
+                    PageLog(
+                        page=page,
+                        url=url,
+                        status="failed",
+                        error=error,
+                        total_after_page=len(results),
+                    )
+                )
+                print(
+                    f"    ERROR: page {page} failed after retries; "
+                    f"continue_on_page_error={self.continue_on_page_error}: {error}"
+                )
                 if not self.continue_on_page_error:
                     raise
                 consecutive_failed_pages += 1
@@ -294,6 +321,7 @@ class EqazynaScraper:
                         f"    stop: {consecutive_failed_pages} consecutive failed pages; "
                         "processing already collected applications"
                     )
+                    stop_requested = True
                     break
                 time.sleep(self.polite_delay_seconds)
                 continue
@@ -308,31 +336,62 @@ class EqazynaScraper:
 
             if not rows:
                 text_preview = clean_text(make_soup(html).get_text(" "))[:500]
-                print(f"    page {page}: no rows; html_chars={len(html)} text_preview={text_preview!r}")
-                self.page_logs.append(PageLog(page=page, url=url, status="empty", total_after_page=len(results), error=f"no_rows html_chars={len(html)} preview={text_preview}"))
+                print(
+                    f"    page {page}: no rows; html_chars={len(html)} "
+                    f"text_preview={text_preview!r}"
+                )
+                self.page_logs.append(
+                    PageLog(
+                        page=page,
+                        url=url,
+                        status="empty",
+                        total_after_page=len(results),
+                        error=f"no_rows html_chars={len(html)} preview={text_preview}",
+                    )
+                )
                 if stop_on_empty_page and sequential_mode:
+                    stop_requested = True
                     break
                 time.sleep(self.polite_delay_seconds)
                 continue
 
+            if coverage_backfill_enabled and not is_safety_page:
+                # The public register is live and rows can move between neighboring
+                # pages while one run is in progress. Preserve the amount of source
+                # coverage requested by the user: if page-boundary duplicates reduce
+                # the unique count, read the next page and take only enough new rows
+                # to restore that coverage.
+                coverage_target += len(rows)
+
             accepted_on_page = 0
+            duplicate_on_page = 0
+            filtered_on_page = 0
             stop_by_date = False
             for app in rows:
+                if is_safety_page and coverage_target and len(results) >= coverage_target:
+                    break
                 created_date = parse_created_date(app.created_at_raw)
                 if min_created_date and created_date and created_date < min_created_date:
                     stop_by_date = True
+                    filtered_on_page += 1
                     continue
                 if doc_type and app.doc_type.strip() != doc_type:
+                    filtered_on_page += 1
                     continue
                 if wanted_statuses and app.status.strip() not in wanted_statuses:
+                    filtered_on_page += 1
                     continue
                 if app.application_key in seen_keys:
+                    duplicate_on_page += 1
                     continue
                 seen_keys.add(app.application_key)
                 results.append(app)
                 accepted_on_page += 1
 
-            status = "stopped_by_date" if stop_by_date else "ok"
+            if is_safety_page:
+                status = "coverage_backfill"
+            else:
+                status = "stopped_by_date" if stop_by_date else "ok"
             self.page_logs.append(
                 PageLog(
                     page=page,
@@ -343,11 +402,57 @@ class EqazynaScraper:
                     status=status,
                 )
             )
-            print(f"    page {page}: rows={len(rows)} accepted={accepted_on_page} total={len(results)} url={url}")
+            extra = ""
+            if duplicate_on_page or filtered_on_page:
+                extra = (
+                    f" duplicates={duplicate_on_page} "
+                    f"filtered={filtered_on_page}"
+                )
+            print(
+                f"    page {page}: rows={len(rows)} accepted={accepted_on_page} "
+                f"total={len(results)}{extra} url={url}"
+            )
             if stop_by_date and sequential_mode:
-                print(f"    stop: reached min_created_date={min_created_date.isoformat() if min_created_date else None}")
+                print(
+                    "    stop: reached min_created_date="
+                    f"{min_created_date.isoformat() if min_created_date else None}"
+                )
+                stop_requested = True
                 break
+
+            if (
+                coverage_backfill_enabled
+                and queue_index >= len(page_queue)
+                and len(results) < coverage_target
+                and safety_pages_added < max_safety_pages
+            ):
+                deficit = coverage_target - len(results)
+                print(
+                    f"    coverage backfill: requested pages returned "
+                    f"{coverage_target} rows but only {len(results)} unique applications; "
+                    f"need {deficit} more, fetching page {next_safety_page}"
+                )
+                page_queue.append(next_safety_page)
+                next_safety_page += 1
+                safety_pages_added += 1
+
             time.sleep(self.polite_delay_seconds)
+
+        if (
+            coverage_backfill_enabled
+            and not stop_requested
+            and coverage_target
+            and len(results) < coverage_target
+        ):
+            print(
+                f"    WARNING: coverage backfill incomplete: "
+                f"target={coverage_target} unique={len(results)}"
+            )
+        elif coverage_backfill_enabled and safety_pages_added:
+            print(
+                f"    coverage restored: unique={len(results)} "
+                f"target={coverage_target} safety_pages={safety_pages_added}"
+            )
         return results
 
 
