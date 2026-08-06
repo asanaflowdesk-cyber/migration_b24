@@ -39,11 +39,6 @@ on:
         required: false
         default: ""
         type: string
-      no_egov:
-        description: "Отключить обогащение через data.egov.kz"
-        required: true
-        default: false
-        type: boolean
       upload_logs:
         description: "Выгрузить Excel/JSON в artifact"
         required: true
@@ -64,6 +59,8 @@ permissions:
 
 env:
   NODE_USE_SYSTEM_CA: "1"
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: "utf-8"
 
 jobs:
   eqazyna-leads:
@@ -92,6 +89,7 @@ jobs:
         env:
           PYTHONPATH: ${{ github.workspace }};${{ github.workspace }}\processes\eqazyna_leads
         run: |
+          chcp 65001 >nul
           ".venv\Scripts\python.exe" -m pytest -q tests
           if errorlevel 1 exit /b 1
           ".venv\Scripts\python.exe" -m eqazyna_bitrix.main --help >nul
@@ -113,8 +111,10 @@ jobs:
           BITRIX_CA_BUNDLE: ${{ vars.BITRIX_CA_BUNDLE }}
           BITRIX_OVERWRITE_ASSIGNED_BY_ON_UPDATE: "false"
           BITRIX_LEAD_GENERATION_FIELD: "UF_CRM_1785917145255"
-          BITRIX_LEAD_GENERATION_VALUE: "ГПО недропользователя"
+          BITRIX_LEAD_GENERATION_VALUE: "ГПО Недропользователя"
           BITRIX_ORIGINATOR_ID: "EQAZYNA_LEAD"
+          BITRIX_COMPANY_ORIGINATOR_ID: "EQAZYNA"
+          BITRIX_REQUISITE_PRESET_ID: ${{ vars.BITRIX_REQUISITE_PRESET_ID || '1' }}
           BITRIX_SOURCE_ID: "OTHER"
           BITRIX_SOURCE_DESCRIPTION: "e-Qazyna Minerals. ГПО недропользователи"
           EQAZYNA_REQUEST_TIMEOUT: ${{ vars.EQAZYNA_REQUEST_TIMEOUT || '15' }}
@@ -127,10 +127,14 @@ jobs:
           INPUT_DOC_TYPE: ${{ inputs.doc_type }}
           INPUT_STATUSES: ${{ inputs.statuses }}
           INPUT_MIN_CREATED_DATE: ${{ inputs.min_created_date }}
-          INPUT_NO_EGOV: ${{ inputs.no_egov }}
         run: |
+          chcp 65001 >nul
           if "%TARGET_BITRIX_WEBHOOK_URL%"=="" (
             echo Не задан secret TARGET_BITRIX_WEBHOOK_URL
+            exit /b 1
+          )
+          if "%EGOV_API_KEY%"=="" (
+            echo Не задан secret EGOV_API_KEY
             exit /b 1
           )
           if not exist output mkdir output
