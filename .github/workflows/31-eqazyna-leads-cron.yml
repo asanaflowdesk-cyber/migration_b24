@@ -1,0 +1,125 @@
+name: 31 | e-Qazyna — ежедневный импорт лидов
+
+on:
+  schedule:
+    # GitHub Actions использует UTC: 03:00 UTC = 08:00 Алматы (UTC+5)
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: eqazyna-minerals-to-box-leads
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  NODE_USE_SYSTEM_CA: "1"
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: "utf-8"
+
+jobs:
+  eqazyna-leads-cron:
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 90
+
+    defaults:
+      run:
+        shell: cmd
+        working-directory: processes/eqazyna_leads
+
+    steps:
+      - name: Получить код репозитория
+        uses: actions/checkout@v5
+
+      - name: Найти Python и создать локальное окружение
+        run: call ..\..\scripts\prepare-python.cmd
+
+      - name: Установить зависимости
+        env:
+          CUSTOM_PIP_INDEX_URL: ${{ vars.PIP_INDEX_URL }}
+        run: |
+          if not "%CUSTOM_PIP_INDEX_URL%"=="" set "PIP_INDEX_URL=%CUSTOM_PIP_INDEX_URL%"
+          ".venv\Scripts\python.exe" -m pip install -r requirements.txt
+
+      - name: Проверить код парсера
+        env:
+          PYTHONPATH: ${{ github.workspace }};${{ github.workspace }}\processes\eqazyna_leads
+        run: |
+          chcp 65001 >nul
+          ".venv\Scripts\python.exe" -m pytest -q tests
+          if errorlevel 1 exit /b 1
+          ".venv\Scripts\python.exe" -m eqazyna_bitrix.main --help >nul
+
+      - name: Загрузить новые заявки в Bitrix24
+        env:
+          PYTHONUNBUFFERED: "1"
+          PYTHONPATH: ${{ github.workspace }};${{ github.workspace }}\processes\eqazyna_leads
+
+          TARGET_BITRIX_WEBHOOK_URL: ${{ secrets.TARGET_BITRIX_WEBHOOK_URL }}
+          EGOV_API_KEY: ${{ secrets.EGOV_API_KEY }}
+
+          BITRIX_ASSIGNED_BY_ID: ${{ vars.BITRIX_ASSIGNED_BY_ID }}
+          BITRIX_MANAGER_IDS: "22,23,16,17,18,38,44,39,40,19,15"
+          BITRIX_LEAD_FAILURE_REASON_FIELD: "UF_CRM_1785508658316"
+          BITRIX_VERIFY_SSL: ${{ vars.BITRIX_VERIFY_SSL || 'true' }}
+          BITRIX_CA_BUNDLE: ${{ vars.BITRIX_CA_BUNDLE }}
+          BITRIX_OVERWRITE_ASSIGNED_BY_ON_UPDATE: "false"
+
+          BITRIX_LEAD_GENERATION_FIELD: "UF_CRM_1785917145255"
+          BITRIX_LEAD_GENERATION_VALUE: "ГПО Недропользователя"
+          BITRIX_ORIGINATOR_ID: "EQAZYNA_LEAD"
+          BITRIX_COMPANY_ORIGINATOR_ID: "EQAZYNA"
+          BITRIX_REQUISITE_PRESET_ID: ${{ vars.BITRIX_REQUISITE_PRESET_ID || '1' }}
+          BITRIX_SOURCE_ID: "OTHER"
+          BITRIX_SOURCE_DESCRIPTION: "e-Qazyna Minerals. ГПО недропользователи"
+
+          EQAZYNA_REQUEST_TIMEOUT: ${{ vars.EQAZYNA_REQUEST_TIMEOUT || '60' }}
+          EQAZYNA_MAX_RETRIES: ${{ vars.EQAZYNA_MAX_RETRIES || '4' }}
+          EQAZYNA_RETRY_BASE_SLEEP_SECONDS: ${{ vars.EQAZYNA_RETRY_BASE_SLEEP_SECONDS || '3' }}
+          BITRIX_REQUEST_TIMEOUT: ${{ vars.BITRIX_REQUEST_TIMEOUT || '45' }}
+          EGOV_REQUEST_TIMEOUT: ${{ vars.EGOV_REQUEST_TIMEOUT || '25' }}
+          EGOV_MIN_NAME_MATCH: "60"
+
+          # Боевой ежедневный запуск: первые 3 страницы.
+          # Парсер автоматически добирает следующую страницу при дублях на границе.
+          INPUT_MODE: "apply"
+          INPUT_PAGES: "3"
+          INPUT_PAGE_START: "1"
+          INPUT_PAGE_LIST: ""
+          INPUT_DOC_TYPE: "Заявка на разведку ТПИ"
+          INPUT_STATUSES: "Отправлено на рассмотрение,Принято"
+          INPUT_MIN_CREATED_DATE: ""
+
+        run: |
+          chcp 65001 >nul
+          if "%TARGET_BITRIX_WEBHOOK_URL%"=="" (
+            echo Не задан secret TARGET_BITRIX_WEBHOOK_URL
+            exit /b 1
+          )
+          if "%EGOV_API_KEY%"=="" (
+            echo Не задан secret EGOV_API_KEY
+            exit /b 1
+          )
+          if not exist output mkdir output
+          echo RUNNER=%RUNNER_NAME% / %RUNNER_OS% / %RUNNER_ARCH%
+          ".venv\Scripts\python.exe" -u scripts\run_from_env.py
+          if errorlevel 1 exit /b 1
+          ".venv\Scripts\python.exe" scripts\check_run_result.py --results "output\eqazyna_bitrix_leads.json" --pages "output\eqazyna_bitrix_leads_pages.json"
+          if errorlevel 1 exit /b 1
+          dir output
+
+      - name: Показать подробный журнал
+        if: ${{ always() }}
+        run: |
+          chcp 65001 >nul
+          if exist output\eqazyna_bitrix_leads_journal.txt type output\eqazyna_bitrix_leads_journal.txt
+
+      - name: Загрузить журнал запуска
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: 31-eqazyna-cron-${{ github.run_number }}
+          path: processes/eqazyna_leads/output/
+          if-no-files-found: warn
+          retention-days: 30
