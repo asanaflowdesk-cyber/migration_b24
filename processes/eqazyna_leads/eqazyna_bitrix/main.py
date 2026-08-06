@@ -101,8 +101,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--requisite-preset-id",
-        default=os.getenv("BITRIX_REQUISITE_PRESET_ID", "auto"),
-        help="Company requisite preset ID in the target Bitrix24; auto = detect automatically",
+        default=os.getenv("BITRIX_REQUISITE_PRESET_ID", "1"),
+        help="Company requisite preset ID in the target Bitrix24; 1 = preset used by migrated company requisites; a stale ID is replaced from existing requisites",
     )
     parser.add_argument(
         "--source-id",

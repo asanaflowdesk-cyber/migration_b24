@@ -20,7 +20,7 @@ DEFAULT_LEAD_GENERATION_FIELD = "UF_CRM_1785917145255"
 DEFAULT_LEAD_GENERATION_VALUE = "ГПО Недропользователя"
 DEFAULT_ORIGINATOR_ID = "EQAZYNA_LEAD"
 DEFAULT_COMPANY_ORIGINATOR_ID = "EQAZYNA"
-DEFAULT_REQUISITE_PRESET_ID = "auto"
+DEFAULT_REQUISITE_PRESET_ID = "1"
 
 
 @dataclass(slots=True)
@@ -77,23 +77,63 @@ class LeadPipeline:
     # ---------- preflight ----------
 
     def validate(self) -> None:
-        """Validate the target CRM structure before any write operation."""
+        """Validate only what is required to start the parser.
+
+        The original working parser validated the lead field and did not block
+        processing on the requisite preset catalogue. On this box
+        ``crm.requisite.preset.list`` returns an empty list although company
+        requisites already exist and use PRESET_ID=1. Therefore the preset is
+        resolved from existing company requisites, with a safe fallback, and a
+        missing catalogue never stops lead creation.
+        """
         if self.config.validate_custom_field:
             self._validate_lead_generation_field()
 
-        requisite_fields = self.client.get_requisite_fields()
-        self._available_requisite_fields = set(requisite_fields)
-        if "RQ_BIN" in requisite_fields:
-            self._requisite_bin_field = "RQ_BIN"
-        elif "RQ_INN" in requisite_fields:
-            self._requisite_bin_field = "RQ_INN"
-        else:
-            raise BitrixError(
-                "В коробке не найдено поле БИН/ИИН реквизита: ожидалось RQ_BIN или RQ_INN."
+        try:
+            requisite_fields = self.client.get_requisite_fields()
+        except Exception as exc:  # noqa: BLE001 - non-blocking metadata lookup
+            requisite_fields = {}
+            self.validation_warnings.append(
+                f"Не удалось прочитать поля реквизитов; будет использован стандартный RQ_BIN: {exc}"
             )
 
-        presets = self.client.list_requisite_presets()
-        self._requisite_preset_id = self._resolve_requisite_preset_id(presets)
+        if requisite_fields:
+            self._available_requisite_fields = set(requisite_fields)
+            if "RQ_BIN" in requisite_fields:
+                self._requisite_bin_field = "RQ_BIN"
+            elif "RQ_INN" in requisite_fields:
+                self._requisite_bin_field = "RQ_INN"
+            else:
+                self.validation_warnings.append(
+                    "В метаданных реквизитов не найден RQ_BIN/RQ_INN; используется RQ_BIN."
+                )
+
+        configured = self._configured_requisite_preset_id()
+        discovered: int | None = None
+        try:
+            discovered = self.client.discover_company_requisite_preset_id()
+        except Exception as exc:  # noqa: BLE001 - existing requisites are optional for preflight
+            self.validation_warnings.append(
+                f"Не удалось определить PRESET_ID по существующим компаниям: {exc}"
+            )
+
+        if discovered is not None:
+            self._requisite_preset_id = discovered
+            if configured is not None and configured != discovered:
+                self.validation_warnings.append(
+                    f"BITRIX_REQUISITE_PRESET_ID={configured} не совпадает с реально используемым "
+                    f"в коробке PRESET_ID={discovered}; выбран PRESET_ID={discovered}."
+                )
+        elif configured is not None:
+            self._requisite_preset_id = configured
+        else:
+            # The completed cloud-to-box migration created 618 company
+            # requisites with PRESET_ID=1. Keep the same target format.
+            self._requisite_preset_id = 1
+            self.validation_warnings.append(
+                "PRESET_ID не удалось определить автоматически; используется PRESET_ID=1, "
+                "как у перенесённых реквизитов компаний."
+            )
 
     def _validate_lead_generation_field(self) -> None:
         fields = self.client.get_lead_fields()
@@ -144,88 +184,16 @@ class LeadPipeline:
             )
         self._lead_generation_encoded_value = matches[0]
 
-    def _resolve_requisite_preset_id(self, presets: list[dict[str, Any]]) -> int:
-        """Resolve the legal-entity requisite preset for the company card.
-
-        ``crm.requisite.preset.list.ENTITY_TYPE_ID`` is normally ``8`` because
-        it describes a requisite preset. Company ownership is specified later in
-        ``crm.requisite.add`` with ``ENTITY_TYPE_ID=4``.
-        """
-        candidates = [
-            preset
-            for preset in presets
-            if str(preset.get("ID") or "").strip().isdigit()
-            and str(preset.get("ACTIVE") or "Y").upper() != "N"
-        ]
-        if not candidates:
-            raise BitrixError("Не найден активный шаблон реквизитов.")
-
-        requested = str(self.config.requisite_preset_id or "").strip()
-        requested_is_auto = requested.casefold() in {"", "auto", "0", "none", "null"}
-        if not requested_is_auto:
-            for preset in candidates:
-                if str(preset.get("ID") or "").strip() == requested:
-                    return int(requested)
-
-        # Prefer the reserved Kazakhstan legal-entity preset when it is present.
-        reserved_xml_ids = {
-            "#CRM_REQUISITE_PRESET_DEF_KZ_LEGALENTITY#",
-            "#CRM_REQUISITE_PRESET_DEF_RU_LEGALENTITY#",
-        }
-        xml_matches = [
-            preset
-            for preset in candidates
-            if str(preset.get("XML_ID") or "").strip().upper() in reserved_xml_ids
-        ]
-        if len(xml_matches) == 1:
-            selected = xml_matches[0]
-        else:
-            legal_labels = {
-                "юр лицо",
-                "юридическое лицо",
-                "организация",
-                "legal entity",
-                "company",
-            }
-            label_matches = []
-            for preset in candidates:
-                normalized_name = self._normalise_preset_name(preset.get("NAME"))
-                is_legal = (
-                    normalized_name in legal_labels
-                    or normalized_name.startswith("организация ")
-                    or normalized_name.startswith("юр лицо ")
-                    or normalized_name.startswith("юридическое лицо ")
-                )
-                if is_legal:
-                    label_matches.append(preset)
-            if len(label_matches) == 1:
-                selected = label_matches[0]
-            else:
-                available = [
-                    f"{preset.get('ID')}:{preset.get('NAME')}" for preset in candidates
-                ]
-                raise BitrixError(
-                    "Не удалось однозначно определить шаблон реквизитов юридического лица. "
-                    f"Доступно: {available}"
-                )
-
-        selected_id = int(str(selected.get("ID")))
-        if not requested_is_auto and str(selected_id) != requested:
-            selected_name = str(selected.get("NAME") or "").strip()
-            suffix = f" ({selected_name})" if selected_name else ""
+    def _configured_requisite_preset_id(self) -> int | None:
+        raw = str(self.config.requisite_preset_id or "").strip()
+        if raw.casefold() in {"", "auto", "0", "none", "null"}:
+            return None
+        if not raw.isdigit() or int(raw) <= 0:
             self.validation_warnings.append(
-                f"PRESET_ID={requested} в коробке не найден; "
-                f"автоматически выбран шаблон "
-                f"PRESET_ID={selected_id}{suffix}."
+                f"Некорректный BITRIX_REQUISITE_PRESET_ID={raw!r}; значение будет определено автоматически."
             )
-        return selected_id
-
-    @staticmethod
-    def _normalise_preset_name(value: Any) -> str:
-        text = str(value or "").casefold().replace("ё", "е")
-        text = text.replace("юр.", "юр ").replace("физ.", "физ ")
-        text = re.sub(r"[^0-9a-zа-я]+", " ", text, flags=re.IGNORECASE)
-        return " ".join(text.split())
+            return None
+        return int(raw)
 
     @property
     def requisite_preset_id(self) -> int | None:
@@ -238,7 +206,18 @@ class LeadPipeline:
     # ---------- public processing ----------
 
     def process(self, app: Application, enrichment: CompanyEnrichment) -> ProcessResult:
+        """Create/update the lead first-class bundle without optional blockers.
+
+        Company, director contact and requisite are attempted independently. A
+        failure of the requisite/address API is recorded as a warning and does
+        not cancel a correctly created lead.
+        """
         warnings: list[str] = []
+        lead: dict[str, Any] | None = None
+        company = EntityOutcome(None, "company_not_processed")
+        contact = EntityOutcome(None, "contact_not_processed")
+        requisite = EntityOutcome(None, "requisite_not_processed")
+
         try:
             lead = self.client.find_lead_by_origin(
                 app.bin,
@@ -246,20 +225,20 @@ class LeadPipeline:
                 extra_select=[self.config.lead_generation_field],
             )
 
-            company = self._ensure_company(app, enrichment, lead)
-            if company.warning:
+            try:
+                company = self._ensure_company(app, enrichment, lead)
+                if company.warning:
+                    warnings.append(company.warning)
+            except Exception as exc:  # noqa: BLE001 - lead must still be created
+                company = EntityOutcome(None, "company_error", warning=f"Компания не сохранена: {exc}")
                 warnings.append(company.warning)
 
-            requisite = self._ensure_requisite(app, enrichment, company.entity_id)
-            if requisite.warning:
-                warnings.append(requisite.warning)
-
-            contact = self._ensure_director_contact(
-                app,
-                enrichment,
-                company.entity_id,
-            )
-            if contact.warning:
+            try:
+                contact = self._ensure_director_contact(app, enrichment, company.entity_id)
+                if contact.warning:
+                    warnings.append(contact.warning)
+            except Exception as exc:  # noqa: BLE001 - lead must still be created
+                contact = EntityOutcome(None, "contact_error", warning=f"Контакт руководителя не сохранён: {exc}")
                 warnings.append(contact.warning)
 
             if enrichment.error:
@@ -267,19 +246,27 @@ class LeadPipeline:
 
             if lead:
                 lead_result = self._update_existing_lead(
-                    lead,
-                    app,
-                    enrichment,
-                    company.entity_id,
-                    contact.entity_id,
+                    lead, app, enrichment, company.entity_id, contact.entity_id
                 )
             else:
                 lead_result = self._create_lead(
-                    app,
-                    enrichment,
-                    company.entity_id,
-                    contact.entity_id,
+                    app, enrichment, company.entity_id, contact.entity_id
                 )
+
+            # Requisite belongs to the company, not to the lead. It is created
+            # after the lead so a preset/address problem cannot erase the main
+            # parser result.
+            try:
+                requisite = self._ensure_requisite(app, enrichment, company.entity_id)
+                if requisite.warning:
+                    warnings.append(requisite.warning)
+            except Exception as exc:  # noqa: BLE001 - non-blocking by design
+                requisite = EntityOutcome(
+                    None,
+                    "requisite_error",
+                    warning=f"Реквизит компании не сохранён: {exc}",
+                )
+                warnings.append(requisite.warning)
 
             if lead_result.warning:
                 warnings.append(lead_result.warning)
@@ -297,6 +284,12 @@ class LeadPipeline:
                 app,
                 enrichment,
                 action="error",
+                company_id=company.entity_id,
+                contact_id=contact.entity_id,
+                requisite_id=requisite.entity_id,
+                company_action=company.action,
+                contact_action=contact.action,
+                requisite_action=requisite.action,
                 warning=self._join_warnings(warnings),
                 error=str(exc),
             )
@@ -454,14 +447,13 @@ class LeadPipeline:
         enrichment: CompanyEnrichment,
         company_id: str,
     ) -> dict[str, object]:
-        if self._requisite_preset_id is None:
-            raise BitrixError("Не выполнена проверка шаблона реквизитов")
+        preset_id = int(self._requisite_preset_id or 1)
         full_name = str(enrichment.name or app.applicant_name or "").strip()
         short_name = short_organization_name(full_name)
         fields: dict[str, object] = {
             "ENTITY_TYPE_ID": 4,
             "ENTITY_ID": int(company_id),
-            "PRESET_ID": self._requisite_preset_id,
+            "PRESET_ID": preset_id,
             "NAME": f"БИН {app.bin}. {full_name or short_name}",
             "ACTIVE": "Y",
             "ADDRESS_ONLY": "N",

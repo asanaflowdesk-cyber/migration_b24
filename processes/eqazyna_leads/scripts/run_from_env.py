@@ -53,7 +53,7 @@ def main() -> int:
         "--company-originator-id",
         value("BITRIX_COMPANY_ORIGINATOR_ID", "EQAZYNA"),
         "--requisite-preset-id",
-        value("BITRIX_REQUISITE_PRESET_ID", "auto"),
+        value("BITRIX_REQUISITE_PRESET_ID", "1"),
         "--source-id",
         value("BITRIX_SOURCE_ID", "OTHER"),
         "--source-description",

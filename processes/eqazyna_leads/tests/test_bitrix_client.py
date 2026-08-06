@@ -59,3 +59,21 @@ def test_find_lead_falls_back_to_legacy_migrated_origin():
         "ORIGINATOR_ID": "EQAZYNA",
         "%ORIGIN_ID": "123456789012",
     }
+
+
+def test_discover_company_requisite_preset_uses_most_common_existing_value():
+    session = FakeSession(
+        [[
+            {"ID": "1", "PRESET_ID": "1"},
+            {"ID": "2", "PRESET_ID": "1"},
+            {"ID": "3", "PRESET_ID": "3"},
+        ]]
+    )
+    client = BitrixClient(
+        "https://box.example.invalid/rest/1/token",
+        polite_delay_seconds=0,
+        session=session,
+    )
+
+    assert client.discover_company_requisite_preset_id() == 1
+    assert session.calls[0][1]["filter"] == {"ENTITY_TYPE_ID": 4}

@@ -49,6 +49,8 @@ class FakeClient:
         field_type="string",
         field_items=None,
         requisite_presets=None,
+        discovered_preset=1,
+        requisite_create_error=None,
     ):
         self.lead = lead
         self.company = company
@@ -58,6 +60,8 @@ class FakeClient:
         self.field_type = field_type
         self.field_items = field_items
         self.requisite_presets = requisite_presets
+        self.discovered_preset = discovered_preset
+        self.requisite_create_error = requisite_create_error
 
         self.created_lead_fields = None
         self.updated_lead_fields = None
@@ -85,6 +89,9 @@ class FakeClient:
             "RQ_DIRECTOR": {},
             "RQ_OKED": {},
         }
+
+    def discover_company_requisite_preset_id(self):
+        return self.discovered_preset
 
     def list_requisite_presets(self):
         if self.requisite_presets is not None:
@@ -131,6 +138,8 @@ class FakeClient:
         return self.requisite
 
     def create_requisite(self, fields):
+        if self.requisite_create_error:
+            raise BitrixError(self.requisite_create_error)
         self.created_requisite_fields = fields
         self.requisite = {"ID": "701", **fields}
         return "701"
@@ -320,7 +329,7 @@ def test_no_dummy_contact_is_created_without_full_director_name():
     assert "CONTACT_ID" not in client.created_lead_fields
 
 
-def test_validate_rejects_missing_custom_field_or_requisite_bin_field():
+def test_validate_rejects_missing_custom_field_but_does_not_block_on_requisite_metadata():
     missing = FakeClient()
     missing.get_lead_fields = lambda: {}
     with pytest.raises(BitrixError, match=FIELD):
@@ -328,8 +337,10 @@ def test_validate_rejects_missing_custom_field_or_requisite_bin_field():
 
     missing_bin = FakeClient()
     missing_bin.get_requisite_fields = lambda: {"RQ_DIRECTOR": {}}
-    with pytest.raises(BitrixError, match="RQ_BIN"):
-        LeadPipeline(missing_bin, LeadPipelineConfig()).validate()
+    result = LeadPipeline(missing_bin, LeadPipelineConfig())
+    result.validate()
+    assert result.requisite_preset_id == 1
+    assert any("RQ_BIN" in warning for warning in result.validation_warnings)
 
 
 def test_enumeration_field_resolves_label_to_internal_id():
@@ -348,39 +359,39 @@ def test_enumeration_field_resolves_label_to_internal_id():
 
 
 
-def test_missing_configured_requisite_preset_falls_back_to_active_company_preset():
-    client = FakeClient(
-        requisite_presets=[
-            {
-                "ID": "7",
-                "NAME": "Организация Казахстан",
-                "ENTITY_TYPE_ID": "4",
-                "ACTIVE": "Y",
-            }
-        ]
-    )
+def test_stale_configured_preset_is_replaced_by_existing_company_requisite_preset():
+    client = FakeClient(discovered_preset=1)
 
     result = pipeline(client, requisite_preset_id="3")
 
-    assert result.requisite_preset_id == 7
+    assert result.requisite_preset_id == 1
     assert result.validation_warnings == [
-        "PRESET_ID=3 в коробке не найден; автоматически выбран шаблон "
-        "PRESET_ID=7 (Организация Казахстан)."
+        "BITRIX_REQUISITE_PRESET_ID=3 не совпадает с реально используемым "
+        "в коробке PRESET_ID=1; выбран PRESET_ID=1."
     ]
 
 
-def test_existing_configured_requisite_preset_is_used_without_warning():
-    client = FakeClient(
-        requisite_presets=[
-            {"ID": "3", "ENTITY_TYPE_ID": "4", "ACTIVE": "Y"},
-            {"ID": "7", "ENTITY_TYPE_ID": "4", "ACTIVE": "Y"},
-        ]
-    )
+def test_configured_preset_is_used_when_existing_requisites_cannot_resolve_it():
+    client = FakeClient(discovered_preset=None)
 
-    result = pipeline(client, requisite_preset_id="3")
+    result = pipeline(client, requisite_preset_id="1")
 
-    assert result.requisite_preset_id == 3
-    assert result.validation_warnings == []
+    assert result.requisite_preset_id == 1
+
+
+def test_requisite_failure_is_warning_and_does_not_cancel_lead_company_or_contact():
+    client = FakeClient(requisite_create_error="preset rejected")
+
+    result = pipeline(client).process(application(), enrichment())
+
+    assert result.action == "created_lead"
+    assert result.lead_id == "501"
+    assert result.company_id == "601"
+    assert result.contact_id == "801"
+    assert result.requisite_id is None
+    assert result.requisite_action == "requisite_error"
+    assert "Реквизит компании не сохранён" in (result.warning or "")
+
 
 def test_dry_run_reads_but_never_writes():
     client = FakeClient()
@@ -398,34 +409,3 @@ def test_dry_run_reads_but_never_writes():
     assert client.timeline == []
 
 
-def test_requisite_preset_entity_type_8_is_valid_for_company_requisites():
-    client = FakeClient(
-        requisite_presets=[
-            {
-                "ID": "3",
-                "ENTITY_TYPE_ID": "8",
-                "COUNTRY_ID": "6",
-                "NAME": "Юр. лицо",
-                "XML_ID": "#CRM_REQUISITE_PRESET_DEF_KZ_LEGALENTITY#",
-                "ACTIVE": "Y",
-            }
-        ]
-    )
-
-    result = pipeline(client, requisite_preset_id="3")
-
-    assert result.requisite_preset_id == 3
-
-
-def test_auto_preset_prefers_legal_entity_and_not_person_or_ip():
-    client = FakeClient(
-        requisite_presets=[
-            {"ID": "1", "ENTITY_TYPE_ID": "8", "NAME": "ИП", "XML_ID": "#CRM_REQUISITE_PRESET_DEF_KZ_INDIVIDUAL#", "ACTIVE": "Y"},
-            {"ID": "3", "ENTITY_TYPE_ID": "8", "NAME": "Юр. лицо", "XML_ID": "#CRM_REQUISITE_PRESET_DEF_KZ_LEGALENTITY#", "ACTIVE": "Y"},
-            {"ID": "5", "ENTITY_TYPE_ID": "8", "NAME": "Физ. лицо", "XML_ID": "#CRM_REQUISITE_PRESET_DEF_KZ_PERSON#", "ACTIVE": "Y"},
-        ]
-    )
-
-    result = pipeline(client, requisite_preset_id="auto")
-
-    assert result.requisite_preset_id == 3

@@ -114,6 +114,36 @@ class BitrixClient:
         result = self.call("crm.requisite.fields")
         return result if isinstance(result, dict) else {}
 
+    def discover_company_requisite_preset_id(self) -> int | None:
+        """Return the preset already used by company requisites in the box.
+
+        This is more reliable for this portal than ``crm.requisite.preset.list``:
+        the latter can be empty for the webhook while migrated company
+        requisites are fully readable and already prove the valid PRESET_ID.
+        """
+        result = self.call(
+            "crm.requisite.list",
+            {
+                "order": {"ID": "ASC"},
+                "filter": {"ENTITY_TYPE_ID": 4},
+                "select": ["ID", "PRESET_ID"],
+            },
+        )
+        if not isinstance(result, list):
+            return None
+
+        counts: dict[int, int] = {}
+        for row in result:
+            if not isinstance(row, dict):
+                continue
+            raw = str(row.get("PRESET_ID") or "").strip()
+            if raw.isdigit() and int(raw) > 0:
+                preset_id = int(raw)
+                counts[preset_id] = counts.get(preset_id, 0) + 1
+        if not counts:
+            return None
+        return sorted(counts.items(), key=lambda item: (-item[1], item[0]))[0][0]
+
     def list_requisite_presets(self) -> list[dict[str, Any]]:
         # Preset.ENTITY_TYPE_ID describes the preset object itself and is normally 8
         # (requisite). It does not mean that the future requisite owner is a company
