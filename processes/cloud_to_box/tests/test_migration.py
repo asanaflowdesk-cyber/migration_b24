@@ -10,6 +10,7 @@ from src.migration import (
     contact_display_name,
     migration_marker,
     normalize_name_tokens,
+    owner_scoped_requisite_xml_id,
     parse_marker,
     resolve_requisite_preset,
     restore_contact_name_fields,
@@ -765,6 +766,89 @@ def test_sample_dry_run_uses_requisites_of_selected_clients_not_first_rows(tmp_p
     addresses = [row for row in p.report.transfers if row["source_type"] == "ADDRESS"]
     assert [row["source_id"] for row in requisites] == ["2"]
     assert len(addresses) == 1
+
+
+class _RequisiteOwnerConflictClient:
+    def __init__(self) -> None:
+        self.commands: list[tuple[str, dict]] = []
+
+    def list_all(self, method, params=None):
+        if method == "crm.requisite.preset.list":
+            return [
+                {
+                    "ID": "1",
+                    "NAME": "Организация",
+                    "XML_ID": "",
+                    "ENTITY_TYPE_ID": "8",
+                    "COUNTRY_ID": "6",
+                }
+            ]
+        if method == "crm.requisite.list":
+            return [
+                {
+                    "ID": "39",
+                    "XML_ID": "EQAZYNA-REQ-091140011780",
+                    "ENTITY_TYPE_ID": "4",
+                    "ENTITY_ID": "31",
+                    "PRESET_ID": "1",
+                }
+            ]
+        if method == "crm.address.list":
+            return []
+        raise AssertionError(method)
+
+    def batch_chunks(self, commands, size=30):
+        commands = list(commands)
+        for _key, method, params in commands:
+            self.commands.append((method, params))
+        success = {}
+        for key, method, _params in commands:
+            success[key] = 77 if method == "crm.requisite.add" else True
+        yield success, {}
+
+
+def test_requisite_with_same_xml_under_another_company_is_recreated_for_target_owner(tmp_path: Path) -> None:
+    p = project(tmp_path)
+    client = _RequisiteOwnerConflictClient()
+    p.client = client
+    p.load_source = lambda *args: None
+    p._target_fields["requisite"] = {"NAME": {}, "RQ_BIN": {}}
+    p._target_fields["address"] = {"ADDRESS_1": {}}
+    p._source["Requisite_Presets"] = [
+        {"ID": "1", "NAME": "Юр. лицо", "COUNTRY_ID": "6"}
+    ]
+    p._source["Requisites"] = [
+        {
+            "ID": "90",
+            "ENTITY_TYPE_ID": "4",
+            "ENTITY_ID": "90",
+            "PRESET_ID": "1",
+            "XML_ID": "EQAZYNA-REQ-091140011780",
+            "NAME": "Есиль Company",
+            "RQ_BIN": "091140011780",
+        }
+    ]
+    p._source["Addresses"] = []
+
+    p.import_requisites({"90": 44}, {})
+
+    assert client.commands == [
+        (
+            "crm.requisite.add",
+            {
+                "fields": {
+                    "NAME": "Есиль Company",
+                    "RQ_BIN": "091140011780",
+                    "ENTITY_ID": 44,
+                    "ENTITY_TYPE_ID": 4,
+                    "PRESET_ID": 1,
+                    "XML_ID": owner_scoped_requisite_xml_id("90", "4", 44),
+                }
+            },
+        )
+    ]
+    assert p.report.maps["requisites"]["90"] == 77
+    assert p.report.extra["requisite_owner_conflicts_repaired"] == 1
 
 
 class _VerifyScopeClient:

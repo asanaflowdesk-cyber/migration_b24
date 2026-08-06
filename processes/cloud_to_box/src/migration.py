@@ -52,6 +52,26 @@ def normalize_text(value: Any) -> str:
     return " ".join(text(value).strip().casefold().replace("ё", "е").split())
 
 
+def owner_scoped_requisite_xml_id(
+    source_requisite_id: Any,
+    source_entity_type: Any,
+    target_entity_id: Any,
+) -> str:
+    """Return a deterministic XML_ID for a requisite recreated under another owner.
+
+    Bitrix24 does not reliably move a requisite between companies/contacts through
+    ``crm.requisite.update``. If an XML_ID already exists under another owner,
+    reusing that row makes ``crm.requisite.link.register`` fail later. The scoped
+    identifier keeps the source requisite stable while making the target owner
+    explicit, so repeated runs remain idempotent.
+    """
+    return (
+        f"B24MIG_REQ_{text(source_requisite_id)}"
+        f"_E{text(source_entity_type)}"
+        f"_T{text(target_entity_id)}"
+    )
+
+
 PRESET_NAME_ALIASES = {
     "3": {
         "физ лицо",
@@ -2535,13 +2555,14 @@ class MigrationProject:
             for row in target_existing
             if row.get("XML_ID") and text(row.get("ID")).isdigit()
         }
-        existing_by_xml = {
-            text(row.get("XML_ID")): int(row["ID"])
-            for row in target_existing
-            if row.get("XML_ID") and text(row.get("ID")).isdigit()
-        }
+        existing_rows_by_xml: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for row in target_existing:
+            xml_id = text(row.get("XML_ID"))
+            if xml_id and text(row.get("ID")).isdigit():
+                existing_rows_by_xml[xml_id].append(dict(row))
 
         req_map: dict[str, int] = dict(self.report.maps["requisites"])
+        owner_conflicts_repaired = 0
         commands: list[tuple[str, str, Mapping[str, Any]]] = []
         context: dict[str, tuple[str, str, dict[str, Any], int | None]] = {}
         for index, row in enumerate(self._source["Requisites"]):
@@ -2560,7 +2581,10 @@ class MigrationProject:
                 )
                 continue
 
-            xml_id = text(row.get("XML_ID")) or f"B24MIG_REQ_{old_id}"
+            base_xml_id = text(row.get("XML_ID")) or f"B24MIG_REQ_{old_id}"
+            scoped_xml_id = owner_scoped_requisite_xml_id(
+                old_id, source_entity_type, target_entity
+            )
             source_preset = source_presets.get(text(row.get("PRESET_ID")), {})
             target_preset, preset_match = resolve_requisite_preset(
                 source_preset, source_entity_type, target_presets
@@ -2572,6 +2596,38 @@ class MigrationProject:
                 )
                 continue
 
+            exact_base_id = existing_by_key.get(
+                (base_xml_id, source_entity_type, text(target_entity))
+            )
+            exact_scoped_id = existing_by_key.get(
+                (scoped_xml_id, source_entity_type, text(target_entity))
+            )
+            conflicting_base_rows = [
+                item
+                for item in existing_rows_by_xml.get(base_xml_id, [])
+                if not (
+                    text(item.get("ENTITY_TYPE_ID")) == source_entity_type
+                    and text(item.get("ENTITY_ID")) == text(target_entity)
+                )
+            ]
+
+            if exact_base_id:
+                xml_id = base_xml_id
+                existing_id = exact_base_id
+            elif exact_scoped_id:
+                xml_id = scoped_xml_id
+                existing_id = exact_scoped_id
+            elif conflicting_base_rows:
+                # A requisite cannot safely be moved from one company/contact to
+                # another with crm.requisite.update. Create an owner-scoped copy
+                # instead; otherwise crm.requisite.link.register rejects the deal.
+                xml_id = scoped_xml_id
+                existing_id = None
+                owner_conflicts_repaired += 1
+            else:
+                xml_id = base_xml_id
+                existing_id = None
+
             fields = self._copy_standard_fields(
                 "requisite", row,
                 excluded={"ID", "ENTITY_ID", "ENTITY_TYPE_ID", "PRESET_ID", "XML_ID"},
@@ -2582,9 +2638,6 @@ class MigrationProject:
                 "PRESET_ID": int(target_preset),
                 "XML_ID": xml_id,
             })
-            existing_id = existing_by_key.get((xml_id, source_entity_type, text(target_entity)))
-            if not existing_id:
-                existing_id = existing_by_xml.get(xml_id)
             if existing_id:
                 key = f"ru{index}"
                 commands.append((key, "crm.requisite.update", {"id": existing_id, "fields": fields}))
@@ -2620,6 +2673,8 @@ class MigrationProject:
                     payload=fields, route="REQUISITE",
                 )
         self.report.maps["requisites"].update(req_map)
+        if owner_conflicts_repaired:
+            self.report.extra["requisite_owner_conflicts_repaired"] = owner_conflicts_repaired
 
         existing_addresses = self.client.list_all(
             "crm.address.list",
