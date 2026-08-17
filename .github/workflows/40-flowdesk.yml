@@ -55,12 +55,12 @@ jobs:
           FLOWDESK_UTC_OFFSET_HOURS: "5"
         run: |
           chcp 65001 >nul
-          if "%TARGET_BITRIX_WEBHOOK_URL%"=="" (
+          if not defined TARGET_BITRIX_WEBHOOK_URL (
             echo Не задан secret TARGET_BITRIX_WEBHOOK_URL
             exit /b 1
           )
-          if "%FLOWDESK_PAYLOAD%"=="" (
-            echo Не получен github.event.client_payload.payload
+          if not defined FLOWDESK_PAYLOAD (
+            echo Не получен FlowDesk payload
             exit /b 1
           )
           ".venv\Scripts\python.exe" -u run_from_event.py
