@@ -1,0 +1,58 @@
+name: 40 | FlowDesk → Bitrix24
+
+on:
+  repository_dispatch:
+    types: [flowdesk_request]
+
+permissions:
+  contents: read
+
+env:
+  NODE_USE_SYSTEM_CA: "1"
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: "utf-8"
+
+jobs:
+  flowdesk-to-bitrix:
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 10
+
+    defaults:
+      run:
+        shell: cmd
+        working-directory: processes/flowdesk
+
+    steps:
+      - name: Получить код репозитория
+        uses: actions/checkout@v5
+
+      - name: Найти Python и создать локальное окружение
+        run: call ..\..\scripts\prepare-python.cmd
+
+      - name: Установить зависимости
+        env:
+          CUSTOM_PIP_INDEX_URL: ${{ vars.PIP_INDEX_URL }}
+        run: |
+          if not "%CUSTOM_PIP_INDEX_URL%"=="" set "PIP_INDEX_URL=%CUSTOM_PIP_INDEX_URL%"
+          ".venv\Scripts\python.exe" -m pip install -r requirements.txt
+
+      - name: Создать задачу FlowDesk в Bitrix24
+        env:
+          PYTHONUNBUFFERED: "1"
+          PYTHONPATH: ${{ github.workspace }}
+          TARGET_BITRIX_WEBHOOK_URL: ${{ secrets.TARGET_BITRIX_WEBHOOK_URL }}
+          FLOWDESK_PAYLOAD: ${{ github.event.client_payload.payload }}
+          FLOWDESK_PROJECT_ID: "2"
+          FLOWDESK_INVITE_DEPARTMENT_ID: ${{ vars.FLOWDESK_INVITE_DEPARTMENT_ID || '1' }}
+          FLOWDESK_UTC_OFFSET_HOURS: "5"
+        run: |
+          chcp 65001 >nul
+          if "%TARGET_BITRIX_WEBHOOK_URL%"=="" (
+            echo Не задан secret TARGET_BITRIX_WEBHOOK_URL
+            exit /b 1
+          )
+          if "%FLOWDESK_PAYLOAD%"=="" (
+            echo Не получен github.event.client_payload.payload
+            exit /b 1
+          )
+          ".venv\Scripts\python.exe" -u run_from_event.py
