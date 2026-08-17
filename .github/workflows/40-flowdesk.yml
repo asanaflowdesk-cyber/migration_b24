@@ -1,8 +1,10 @@
 name: 40 | FlowDesk → Bitrix24
 
 on:
+  workflow_dispatch:
   repository_dispatch:
-    types: [flowdesk_request]
+    types:
+      - flowdesk_request
 
 permissions:
   contents: read
