@@ -43,7 +43,7 @@ jobs:
           TARGET_BITRIX_WEBHOOK_URL: ${{ secrets.TARGET_BITRIX_WEBHOOK_URL }}
           FLOWDESK_PAYLOAD: ${{ github.event.client_payload.payload }}
           FLOWDESK_PROJECT_ID: "2"
-          FLOWDESK_INVITE_DEPARTMENT_ID: ${{ vars.FLOWDESK_INVITE_DEPARTMENT_ID || '1' }}
+          FLOWDESK_INVITE_DEPARTMENT_ID: "19" ##Филиалы
           FLOWDESK_UTC_OFFSET_HOURS: "5"
         run: |
           chcp 65001 >nul
