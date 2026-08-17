@@ -2,8 +2,15 @@ name: 40 | FlowDesk → Bitrix24
 
 on:
   workflow_dispatch:
+    inputs:
+      payload:
+        description: "FlowDesk payload"
+        required: true
+        type: string
+
   repository_dispatch:
-    types: [flowdesk_request]
+    types:
+      - flowdesk_request
     
 permissions:
   contents: read
@@ -42,7 +49,7 @@ jobs:
           PYTHONUNBUFFERED: "1"
           PYTHONPATH: ${{ github.workspace }}
           TARGET_BITRIX_WEBHOOK_URL: ${{ secrets.TARGET_BITRIX_WEBHOOK_URL }}
-          FLOWDESK_PAYLOAD: ${{ github.event.client_payload.payload }}
+          FLOWDESK_PAYLOAD: ${{ inputs.payload || github.event.client_payload.payload }}
           FLOWDESK_PROJECT_ID: "2"
           FLOWDESK_INVITE_DEPARTMENT_ID: "19" ##Филиалы
           FLOWDESK_UTC_OFFSET_HOURS: "5"
