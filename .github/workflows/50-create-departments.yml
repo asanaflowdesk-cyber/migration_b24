@@ -1,0 +1,77 @@
+name: 50 | Подразделения — массовое создание
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "dry_run — проверить; apply — создать отсутствующие подразделения"
+        required: true
+        default: dry_run
+        type: choice
+        options:
+          - dry_run
+          - apply
+      confirm:
+        description: "Для apply введите CREATE_DEPARTMENTS"
+        required: false
+        default: ""
+        type: string
+
+env:
+  NODE_USE_SYSTEM_CA: "1"
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: "utf-8"
+
+jobs:
+  create-departments:
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 20
+
+    defaults:
+      run:
+        shell: cmd
+        working-directory: processes/departments
+
+    steps:
+      - name: Получить код репозитория
+        uses: actions/checkout@v5
+
+      - name: Найти Python и создать локальное окружение
+        run: call ..\..\scripts\prepare-python.cmd
+
+      - name: Установить зависимости
+        env:
+          CUSTOM_PIP_INDEX_URL: ${{ vars.PIP_INDEX_URL }}
+        run: |
+          if not "%CUSTOM_PIP_INDEX_URL%"=="" set "PIP_INDEX_URL=%CUSTOM_PIP_INDEX_URL%"
+          ".venv\Scripts\python.exe" -m pip install -r requirements.txt
+
+      - name: Проверить подтверждение
+        if: ${{ inputs.mode == 'apply' && inputs.confirm != 'CREATE_DEPARTMENTS' }}
+        run: |
+          echo Для реального создания введите CREATE_DEPARTMENTS
+          exit /b 1
+
+      - name: Проверить или создать подразделения
+        env:
+          PYTHONUNBUFFERED: "1"
+          PYTHONPATH: ${{ github.workspace }}
+          TARGET_BITRIX_WEBHOOK_URL: ${{ secrets.TARGET_BITRIX_WEBHOOK_URL }}
+          INPUT_MODE: ${{ inputs.mode }}
+          INPUT_FILE_PATH: "departments.json"
+        run: |
+          chcp 65001 >nul
+          if not defined TARGET_BITRIX_WEBHOOK_URL (
+            echo Не задан secret TARGET_BITRIX_WEBHOOK_URL
+            exit /b 1
+          )
+          ".venv\Scripts\python.exe" -u create_departments.py
+
+      - name: Загрузить отчет
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: 50-departments-${{ github.run_number }}
+          path: processes/departments/output/
+          if-no-files-found: warn
+          retention-days: 30
