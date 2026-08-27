@@ -1,86 +1,117 @@
 from __future__ import annotations
 
-from sync_company_owners import build_audit_rows
+from sync_company_owners import (
+    apply_updates,
+    build_company_update_rows,
+    build_desync_tree,
+)
 
 
-def test_earliest_lead_owner_is_target_even_if_later_leads_have_other_owners():
-    companies = [{"ID": "10", "TITLE": "A", "ASSIGNED_BY_ID": "99"}]
+def company(company_id, title, owner):
+    return {"ID": str(company_id), "TITLE": title, "ASSIGNED_BY_ID": str(owner) if owner else ""}
+
+
+def director(contact_id, fio, company_id, owner):
+    last, name, *rest = fio.split(" ")
+    return {
+        "ID": str(contact_id),
+        "LAST_NAME": last,
+        "NAME": name,
+        "SECOND_NAME": " ".join(rest),
+        "POST": "Руководитель",
+        "COMPANY_ID": str(company_id),
+        "ASSIGNED_BY_ID": str(owner) if owner else "",
+        "COMMENTS": "",
+    }
+
+
+def lead(lead_id, title, company_id, contact_id, owner, date="2026-01-01"):
+    return {
+        "ID": str(lead_id),
+        "TITLE": title,
+        "COMPANY_ID": str(company_id),
+        "CONTACT_ID": str(contact_id),
+        "ASSIGNED_BY_ID": str(owner) if owner else "",
+        "DATE_CREATE": date,
+    }
+
+
+def test_same_director_across_two_companies_is_one_tree():
+    companies = [company(10, "Компания 1", 17), company(20, "Компания 2", 18)]
+    contacts = [
+        director(100, "Иванов Иван Иванович", 10, 17),
+        director(200, "Иванов Иван Иванович", 20, 17),
+    ]
     leads = [
-        {
-            "ID": "20",
-            "TITLE": "later",
-            "COMPANY_ID": "10",
-            "ASSIGNED_BY_ID": "22",
-            "DATE_CREATE": "2026-02-01T10:00:00+05:00",
-        },
-        {
-            "ID": "11",
-            "TITLE": "first",
-            "COMPANY_ID": "10",
-            "ASSIGNED_BY_ID": "16",
-            "DATE_CREATE": "2026-01-01T10:00:00+05:00",
-        },
+        lead(1, "Лид 1", 10, 100, 17),
+        lead(2, "Лид 2", 20, 200, 18),
     ]
 
-    row = build_audit_rows(companies, leads)[0]
+    tree = build_desync_tree(companies, leads, contacts)
 
-    assert row["first_lead_id"] == 11
-    assert row["first_lead_owner_id"] == 16
-    assert row["needs_update"] == "Y"
+    assert len(tree) == 1
+    assert tree[0]["director_name"] == "Иванов Иван Иванович"
+    assert tree[0]["director_owner_id"] == 17
+    assert {node["company_title"] for node in tree[0]["companies"]} == {"Компания 1", "Компания 2"}
 
 
-def test_company_already_matching_first_lead_is_not_updated():
-    companies = [{"ID": "10", "TITLE": "A", "ASSIGNED_BY_ID": "16"}]
+def test_fully_synchronized_director_tree_is_not_reported():
+    companies = [company(10, "Компания 1", 17)]
+    contacts = [director(100, "Иванов Иван Иванович", 10, 17)]
+    leads = [lead(1, "Лид 1", 10, 100, 17)]
+
+    assert build_desync_tree(companies, leads, contacts) == []
+
+
+def test_one_bad_lead_includes_whole_director_tree_for_context():
+    companies = [company(10, "Компания 1", 17), company(20, "Компания 2", 17)]
+    contacts = [
+        director(100, "Иванов Иван Иванович", 10, 17),
+        director(200, "Иванов Иван Иванович", 20, 17),
+    ]
     leads = [
-        {
-            "ID": "11",
-            "COMPANY_ID": "10",
-            "ASSIGNED_BY_ID": "16",
-            "DATE_CREATE": "2026-01-01T10:00:00+05:00",
-        }
+        lead(1, "Лид 1", 10, 100, 17),
+        lead(2, "Лид 2", 20, 200, 99),
+        lead(3, "Лид 3", 20, 200, 17),
     ]
 
-    row = build_audit_rows(companies, leads)[0]
+    tree = build_desync_tree(companies, leads, contacts)
 
-    assert row["needs_update"] == "N"
-    assert row["action"] == "already_matches"
+    assert len(tree) == 1
+    assert len(tree[0]["companies"]) == 2
+    second = next(node for node in tree[0]["companies"] if node["company_id"] == 20)
+    assert [item["lead_title"] for item in second["leads"]] == ["Лид 2", "Лид 3"]
+    assert [item["lead_mismatch"] for item in second["leads"]] == [True, False]
 
 
-def test_three_or_more_distinct_owners_are_counted_independently_of_company_owner():
-    companies = [{"ID": "10", "TITLE": "A", "ASSIGNED_BY_ID": "16"}]
-    leads = [
-        {"ID": "11", "COMPANY_ID": "10", "ASSIGNED_BY_ID": "16", "DATE_CREATE": "2026-01-01"},
-        {"ID": "12", "COMPANY_ID": "10", "ASSIGNED_BY_ID": "17", "DATE_CREATE": "2026-01-02"},
-        {"ID": "13", "COMPANY_ID": "10", "ASSIGNED_BY_ID": "18", "DATE_CREATE": "2026-01-03"},
-        {"ID": "14", "COMPANY_ID": "10", "ASSIGNED_BY_ID": "18", "DATE_CREATE": "2026-01-04"},
+def test_company_owner_is_compared_to_director_owner_not_first_lead():
+    companies = [company(10, "Компания 1", 99)]
+    contacts = [director(100, "Иванов Иван Иванович", 10, 17)]
+    # First lead happens to be 99, but the director owner 17 is authoritative.
+    leads = [lead(1, "Лид 1", 10, 100, 99)]
+
+    tree = build_desync_tree(companies, leads, contacts)
+    node = tree[0]["companies"][0]
+
+    assert tree[0]["director_owner_id"] == 17
+    assert node["company_mismatch"] is True
+    assert node["leads"][0]["lead_mismatch"] is True
+
+
+def test_oldest_director_contact_with_owner_is_canonical_for_same_fio():
+    companies = [company(10, "Компания 1", 17), company(20, "Компания 2", 18)]
+    contacts = [
+        director(100, "Иванов Иван Иванович", 10, 17),
+        director(200, "Иванов Иван Иванович", 20, 18),
     ]
+    leads = []
 
-    row = build_audit_rows(companies, leads)[0]
+    tree = build_desync_tree(companies, leads, contacts)
 
-    assert row["unique_owner_count"] == 3
-    assert row["lead_count"] == 4
-    assert row["needs_update"] == "N"
+    assert len(tree) == 1
+    assert tree[0]["director_owner_id"] == 17
+    assert tree[0]["director_contact_owner_count"] == 2
 
-
-def test_company_without_linked_leads_is_not_in_audit():
-    companies = [{"ID": "10", "TITLE": "A", "ASSIGNED_BY_ID": "16"}]
-
-    assert build_audit_rows(companies, []) == []
-
-
-def test_first_lead_without_owner_never_becomes_update_target():
-    companies = [{"ID": "10", "TITLE": "A", "ASSIGNED_BY_ID": "16"}]
-    leads = [
-        {"ID": "11", "COMPANY_ID": "10", "ASSIGNED_BY_ID": "", "DATE_CREATE": "2026-01-01"},
-        {"ID": "12", "COMPANY_ID": "10", "ASSIGNED_BY_ID": "17", "DATE_CREATE": "2026-01-02"},
-    ]
-
-    row = build_audit_rows(companies, leads)[0]
-
-    assert row["first_lead_id"] == 11
-    assert row["first_lead_owner_id"] == ""
-    assert row["needs_update"] == "N"
-    assert row["action"] == "skipped_first_lead_no_owner"
 
 class FakeClient:
     def __init__(self):
@@ -90,47 +121,42 @@ class FakeClient:
         self.updates.append((company_id, fields))
 
 
-def test_apply_updates_changes_only_mismatches_to_first_lead_owner():
-    from sync_company_owners import apply_updates
-
-    rows = [
+def test_apply_updates_company_to_director_owner():
+    tree = [
         {
-            "company_id": 10,
-            "first_lead_owner_id": 16,
-            "needs_update": "Y",
-            "action": "pending_update",
-            "error": "",
-        },
-        {
-            "company_id": 20,
-            "first_lead_owner_id": 17,
-            "needs_update": "N",
-            "action": "already_matches",
-            "error": "",
-        },
+            "director_owner_id": 17,
+            "companies": [
+                {
+                    "company_id": 10,
+                    "company_owner_id": 99,
+                    "unique_lead_owner_count": 1,
+                }
+            ],
+        }
     ]
+    rows = build_company_update_rows(tree)
     client = FakeClient()
 
     apply_updates(client, rows)
 
-    assert client.updates == [("10", {"ASSIGNED_BY_ID": 16})]
+    assert client.updates == [("10", {"ASSIGNED_BY_ID": 17})]
     assert rows[0]["action"] == "updated"
-    assert rows[1]["action"] == "already_matches"
 
 
 def test_apply_skips_company_with_three_or_more_distinct_lead_owners():
-    from sync_company_owners import apply_updates
-
-    rows = [
+    tree = [
         {
-            "company_id": 30,
-            "first_lead_owner_id": 16,
-            "needs_update": "Y",
-            "unique_owner_count": 3,
-            "action": "manual_review_3plus",
-            "error": "",
+            "director_owner_id": 17,
+            "companies": [
+                {
+                    "company_id": 30,
+                    "company_owner_id": 99,
+                    "unique_lead_owner_count": 3,
+                }
+            ],
         }
     ]
+    rows = build_company_update_rows(tree)
     client = FakeClient()
 
     apply_updates(client, rows)
@@ -139,25 +165,22 @@ def test_apply_skips_company_with_three_or_more_distinct_lead_owners():
     assert rows[0]["action"] == "manual_review_3plus"
 
 
-def test_desync_selection_includes_three_plus_for_report_but_apply_still_skips_it():
-    from sync_company_owners import apply_updates
-
-    companies = [
-        {"ID": "10", "TITLE": "A", "ASSIGNED_BY_ID": "99"},
-        {"ID": "20", "TITLE": "B", "ASSIGNED_BY_ID": "88"},
+def test_apply_never_changes_leads_or_contacts():
+    tree = [
+        {
+            "director_owner_id": 17,
+            "companies": [
+                {
+                    "company_id": 10,
+                    "company_owner_id": 99,
+                    "unique_lead_owner_count": 2,
+                }
+            ],
+        }
     ]
-    leads = [
-        {"ID": "1", "COMPANY_ID": "10", "ASSIGNED_BY_ID": "16", "DATE_CREATE": "2026-01-01"},
-        {"ID": "2", "COMPANY_ID": "20", "ASSIGNED_BY_ID": "17", "DATE_CREATE": "2026-01-01"},
-        {"ID": "3", "COMPANY_ID": "20", "ASSIGNED_BY_ID": "18", "DATE_CREATE": "2026-01-02"},
-        {"ID": "4", "COMPANY_ID": "20", "ASSIGNED_BY_ID": "19", "DATE_CREATE": "2026-01-03"},
-    ]
-    rows = build_audit_rows(companies, leads)
-    desync = [row for row in rows if row["needs_update"] == "Y"]
-
-    assert {row["company_title"] for row in desync} == {"A", "B"}
-
+    rows = build_company_update_rows(tree)
     client = FakeClient()
+
     apply_updates(client, rows)
-    assert client.updates == [("10", {"ASSIGNED_BY_ID": 16})]
-    assert next(row for row in rows if row["company_title"] == "B")["action"] == "manual_review_3plus"
+
+    assert client.updates == [("10", {"ASSIGNED_BY_ID": 17})]

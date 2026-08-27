@@ -356,8 +356,12 @@ class LeadPipeline:
             contact_reference_lead = self._find_contact_reference_lead(existing_contact)
             company_reference_lead = self._find_reference_lead(app, existing_company)
 
-            inherited_assigned_by_id, assignment_reason = self._resolve_assignment(
+            assignment_contact = self._find_director_assignment_contact(
+                enrichment,
                 existing_contact,
+            )
+            inherited_assigned_by_id, assignment_reason = self._resolve_assignment(
+                assignment_contact,
             )
             reserved_manager_id = inherited_assigned_by_id
 
@@ -525,6 +529,33 @@ class LeadPipeline:
             return None
         normalized = "|".join(self._normalise_label(value) for value in person)
         return f"{app.bin}|{normalized}"
+
+    def _find_director_assignment_contact(
+        self,
+        enrichment: CompanyEnrichment,
+        existing_contact: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Return the historical director card used only for assignment.
+
+        A director may control several companies. The company-specific contact
+        is preferred when it already has an approved owner. Otherwise we look
+        for the same director FIO globally and inherit that historical owner.
+        The global card is not re-linked or edited; it is only an assignment
+        reference for the new company/contact/lead bundle.
+        """
+        if self._approved_record_assigned_by_id(existing_contact or {}) is not None:
+            return existing_contact
+        person = self._split_director_name(enrichment.director)
+        if person is None:
+            return existing_contact
+        finder = getattr(self.client, "find_director_contact_global", None)
+        if not callable(finder):
+            return existing_contact
+        last_name, name, second_name = person
+        global_contact = finder(last_name, name, second_name)
+        if self._approved_record_assigned_by_id(global_contact or {}) is not None:
+            return global_contact
+        return existing_contact
 
     def _find_contact_reference_lead(
         self,

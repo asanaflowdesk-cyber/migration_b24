@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import os
-import sys
+import re
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,30 +11,17 @@ from typing import Any, Iterable
 
 import xlsxwriter
 
-# The repository workflow adds processes/eqazyna_leads to PYTHONPATH so this
-# reuses the already tested Bitrix REST client and TLS settings.
-from eqazyna_bitrix.bitrix_client import BitrixClient, BitrixError
+from eqazyna_bitrix.bitrix_client import BitrixClient
 from eqazyna_bitrix.settings import Settings
 
 
-AUDIT_FIELDS = [
-    "company_id",
-    "company_title",
-    "company_owner_id",
-    "company_owner_name",
-    "first_lead_id",
-    "first_lead_date_create",
-    "first_lead_title",
-    "first_lead_owner_id",
-    "first_lead_owner_name",
-    "lead_count",
-    "unique_owner_count",
-    "owner_distribution",
-    "owner_ids",
-    "owner_names",
-    "needs_update",
-    "action",
-    "error",
+VISIBLE_COLUMNS = [
+    "Руководитель",
+    "Ответственный руководителя",
+    "Компания",
+    "Ответственный компании",
+    "Лид",
+    "Ответственный лида",
 ]
 
 
@@ -58,12 +44,8 @@ def parse_date(value: Any) -> float:
 
 
 def lead_sort_key(lead: dict[str, Any]) -> tuple[float, int]:
-    lead_id = normalized_id(lead.get("ID")) or sys.maxsize
+    lead_id = normalized_id(lead.get("ID")) or 2**63 - 1
     return parse_date(lead.get("DATE_CREATE")), lead_id
-
-
-def earliest_lead(leads: Iterable[dict[str, Any]]) -> dict[str, Any]:
-    return min(leads, key=lead_sort_key)
 
 
 def display_user(user: dict[str, Any] | None, user_id: int | None) -> str:
@@ -80,15 +62,40 @@ def display_user(user: dict[str, Any] | None, user_id: int | None) -> str:
     return name or str(user_id)
 
 
+def display_director(contact: dict[str, Any]) -> str:
+    parts = [
+        str(contact.get("LAST_NAME") or "").strip(),
+        str(contact.get("NAME") or "").strip(),
+        str(contact.get("SECOND_NAME") or "").strip(),
+    ]
+    return " ".join(part for part in parts if part).strip()
+
+
+def _normalize_name_part(value: Any) -> str:
+    text = str(value or "").strip().casefold().replace("ё", "е")
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
+def director_key(contact: dict[str, Any]) -> str:
+    parts = [
+        _normalize_name_part(contact.get("LAST_NAME")),
+        _normalize_name_part(contact.get("NAME")),
+        _normalize_name_part(contact.get("SECOND_NAME")),
+    ]
+    return "|".join(parts)
+
+
+def is_director_contact(contact: dict[str, Any]) -> bool:
+    post = str(contact.get("POST") or "").casefold()
+    comments = str(contact.get("COMMENTS") or "")
+    return "руковод" in post or "EQAZYNA_DIRECTOR:" in comments
+
+
 def load_users(client: BitrixClient) -> dict[int, dict[str, Any]]:
     try:
-        rows = client.list_all(
-            "user.get",
-            {
-                "order": {"ID": "ASC"},
-            },
-        )
-    except Exception as exc:  # noqa: BLE001 - names are optional for the audit
+        rows = client.list_all("user.get", {"order": {"ID": "ASC"}})
+    except Exception as exc:  # noqa: BLE001
         print(f"WARN user.get unavailable; reports will contain IDs only: {exc}")
         return {}
     result: dict[int, dict[str, Any]] = {}
@@ -120,6 +127,7 @@ def load_linked_leads(client: BitrixClient) -> list[dict[str, Any]]:
                 "ID",
                 "TITLE",
                 "COMPANY_ID",
+                "CONTACT_ID",
                 "ASSIGNED_BY_ID",
                 "DATE_CREATE",
             ],
@@ -128,162 +136,355 @@ def load_linked_leads(client: BitrixClient) -> list[dict[str, Any]]:
     return [row for row in rows if normalized_id(row.get("COMPANY_ID")) is not None]
 
 
-def build_audit_rows(
+def load_director_contacts(client: BitrixClient) -> list[dict[str, Any]]:
+    rows = client.list_all(
+        "crm.contact.list",
+        {
+            "order": {"ID": "ASC"},
+            "filter": {},
+            "select": [
+                "ID",
+                "LAST_NAME",
+                "NAME",
+                "SECOND_NAME",
+                "POST",
+                "COMPANY_ID",
+                "ASSIGNED_BY_ID",
+                "COMMENTS",
+            ],
+        },
+    )
+    return [row for row in rows if director_key(row).strip("|") and is_director_contact(row)]
+
+
+def _contact_sort_key(contact: dict[str, Any]) -> int:
+    return normalized_id(contact.get("ID")) or 2**63 - 1
+
+
+def _canonical_contact(contacts: list[dict[str, Any]]) -> dict[str, Any]:
+    ordered = sorted(contacts, key=_contact_sort_key)
+    for contact in ordered:
+        if normalized_id(contact.get("ASSIGNED_BY_ID")) is not None:
+            return contact
+    return ordered[0]
+
+
+def _select_company_director_contacts(
     companies: Iterable[dict[str, Any]],
     leads: Iterable[dict[str, Any]],
-    users: dict[int, dict[str, Any]] | None = None,
-) -> list[dict[str, Any]]:
-    users = users or {}
-    by_company: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    director_contacts: Iterable[dict[str, Any]],
+) -> dict[int, dict[str, Any]]:
+    """Pick one director contact per company, deterministically.
+
+    Priority: a director contact whose primary COMPANY_ID is this company;
+    fallback: a director contact actually linked by one of the company's leads.
+    Within a priority tier the oldest contact (smallest ID) wins.
+    """
+    company_ids = {
+        company_id
+        for company_id in (normalized_id(company.get("ID")) for company in companies)
+        if company_id is not None
+    }
+    contacts_by_company: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    contacts_by_id: dict[int, dict[str, Any]] = {}
+    for contact in director_contacts:
+        contact_id = normalized_id(contact.get("ID"))
+        if contact_id is not None:
+            contacts_by_id[contact_id] = contact
+        company_id = normalized_id(contact.get("COMPANY_ID"))
+        if company_id in company_ids:
+            contacts_by_company[company_id].append(contact)
+
+    lead_contacts_by_company: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for lead in leads:
         company_id = normalized_id(lead.get("COMPANY_ID"))
-        if company_id is not None:
-            by_company[company_id].append(lead)
+        contact_id = normalized_id(lead.get("CONTACT_ID"))
+        if company_id is None or contact_id is None:
+            continue
+        contact = contacts_by_id.get(contact_id)
+        if contact is not None:
+            lead_contacts_by_company[company_id].append(contact)
 
-    rows: list[dict[str, Any]] = []
-    for company in companies:
+    selected: dict[int, dict[str, Any]] = {}
+    for company_id in sorted(company_ids):
+        candidates = contacts_by_company.get(company_id) or lead_contacts_by_company.get(company_id) or []
+        if candidates:
+            selected[company_id] = min(candidates, key=_contact_sort_key)
+    return selected
+
+
+def build_desync_tree(
+    companies: Iterable[dict[str, Any]],
+    leads: Iterable[dict[str, Any]],
+    director_contacts: Iterable[dict[str, Any]],
+    users: dict[int, dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Build director -> companies -> leads groups and keep only desync groups.
+
+    The director contact owner is the source of truth. One person may be the
+    director of several companies; contacts with the same normalized FIO are
+    treated as one director group. The canonical owner is taken from the oldest
+    director contact with a populated ASSIGNED_BY_ID.
+    """
+    users = users or {}
+    companies_list = list(companies)
+    leads_list = list(leads)
+    contacts_list = list(director_contacts)
+
+    company_by_id: dict[int, dict[str, Any]] = {}
+    for company in companies_list:
         company_id = normalized_id(company.get("ID"))
-        if company_id is None:
-            continue
-        linked = by_company.get(company_id, [])
-        if not linked:
-            continue
+        if company_id is not None:
+            company_by_id[company_id] = company
 
-        first = earliest_lead(linked)
-        company_owner = normalized_id(company.get("ASSIGNED_BY_ID"))
-        first_owner = normalized_id(first.get("ASSIGNED_BY_ID"))
-        owners = [
+    leads_by_company: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for lead in leads_list:
+        company_id = normalized_id(lead.get("COMPANY_ID"))
+        if company_id is not None:
+            leads_by_company[company_id].append(lead)
+    for company_leads in leads_by_company.values():
+        company_leads.sort(key=lead_sort_key)
+
+    group_contacts: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for contact in contacts_list:
+        key = director_key(contact)
+        if key.strip("|"):
+            group_contacts[key].append(contact)
+
+    selected_contact_by_company = _select_company_director_contacts(
+        companies_list,
+        leads_list,
+        contacts_list,
+    )
+
+    company_ids_by_group: dict[str, list[int]] = defaultdict(list)
+    for company_id, contact in selected_contact_by_company.items():
+        key = director_key(contact)
+        if key.strip("|"):
+            company_ids_by_group[key].append(company_id)
+
+    result: list[dict[str, Any]] = []
+    for key, company_ids in company_ids_by_group.items():
+        contacts = group_contacts.get(key, [])
+        if not contacts:
+            continue
+        canonical = _canonical_contact(contacts)
+        root_owner_id = normalized_id(canonical.get("ASSIGNED_BY_ID"))
+        contact_owner_ids = {
             owner_id
-            for owner_id in (normalized_id(lead.get("ASSIGNED_BY_ID")) for lead in linked)
+            for owner_id in (normalized_id(contact.get("ASSIGNED_BY_ID")) for contact in contacts)
             if owner_id is not None
-        ]
-        counts = Counter(owners)
-        owner_ids = sorted(counts)
-        owner_names = [display_user(users.get(owner_id), owner_id) for owner_id in owner_ids]
-        distribution = "; ".join(
-            f"{owner_id} {display_user(users.get(owner_id), owner_id)} — {counts[owner_id]}"
-            for owner_id in owner_ids
-        )
-        needs_update = first_owner is not None and company_owner != first_owner
+        }
 
-        rows.append(
+        company_nodes: list[dict[str, Any]] = []
+        # The visible report compares the related entities to the canonical
+        # director owner. Duplicate contact cards alone do not create a row
+        # that would look synchronized without explaining why it was included.
+        has_desync = root_owner_id is None
+
+        for company_id in sorted(
+            set(company_ids),
+            key=lambda cid: str(company_by_id.get(cid, {}).get("TITLE") or "").casefold(),
+        ):
+            company = company_by_id.get(company_id)
+            if company is None:
+                continue
+            company_owner_id = normalized_id(company.get("ASSIGNED_BY_ID"))
+            linked_leads = leads_by_company.get(company_id, [])
+            lead_owner_ids = {
+                owner_id
+                for owner_id in (normalized_id(lead.get("ASSIGNED_BY_ID")) for lead in linked_leads)
+                if owner_id is not None
+            }
+
+            company_mismatch = root_owner_id is None or company_owner_id != root_owner_id
+            lead_mismatch = any(
+                normalized_id(lead.get("ASSIGNED_BY_ID")) != root_owner_id
+                for lead in linked_leads
+            ) if root_owner_id is not None else bool(linked_leads)
+            has_desync = has_desync or company_mismatch or lead_mismatch
+
+            company_nodes.append(
+                {
+                    "company_id": company_id,
+                    "company_title": str(company.get("TITLE") or "").strip(),
+                    "company_owner_id": company_owner_id,
+                    "company_owner_name": display_user(users.get(company_owner_id), company_owner_id),
+                    "company_mismatch": company_mismatch,
+                    "unique_lead_owner_count": len(lead_owner_ids),
+                    "leads": [
+                        {
+                            "lead_id": normalized_id(lead.get("ID")),
+                            "lead_title": str(lead.get("TITLE") or "").strip(),
+                            "lead_owner_id": normalized_id(lead.get("ASSIGNED_BY_ID")),
+                            "lead_owner_name": display_user(
+                                users.get(normalized_id(lead.get("ASSIGNED_BY_ID"))),
+                                normalized_id(lead.get("ASSIGNED_BY_ID")),
+                            ),
+                            "lead_mismatch": (
+                                root_owner_id is None
+                                or normalized_id(lead.get("ASSIGNED_BY_ID")) != root_owner_id
+                            ),
+                        }
+                        for lead in linked_leads
+                    ],
+                }
+            )
+
+        if not has_desync:
+            continue
+
+        result.append(
             {
-                "company_id": company_id,
-                "company_title": str(company.get("TITLE") or "").strip(),
-                "company_owner_id": company_owner or "",
-                "company_owner_name": display_user(users.get(company_owner), company_owner),
-                "first_lead_id": normalized_id(first.get("ID")) or "",
-                "first_lead_date_create": str(first.get("DATE_CREATE") or "").strip(),
-                "first_lead_title": str(first.get("TITLE") or "").strip(),
-                "first_lead_owner_id": first_owner or "",
-                "first_lead_owner_name": display_user(users.get(first_owner), first_owner),
-                "lead_count": len(linked),
-                "unique_owner_count": len(owner_ids),
-                "owner_distribution": distribution,
-                "owner_ids": ",".join(str(owner_id) for owner_id in owner_ids),
-                "owner_names": "; ".join(owner_names),
-                "needs_update": "Y" if needs_update else "N",
-                "action": (
-                    "manual_review_3plus"
-                    if needs_update and len(owner_ids) >= 3
-                    else "pending_update"
-                    if needs_update
-                    else "skipped_first_lead_no_owner"
-                    if first_owner is None
-                    else "already_matches"
-                ),
-                "error": "",
+                "director_key": key,
+                "director_name": display_director(canonical),
+                "director_owner_id": root_owner_id,
+                "director_owner_name": display_user(users.get(root_owner_id), root_owner_id),
+                "director_contact_owner_count": len(contact_owner_ids),
+                "companies": company_nodes,
             }
         )
+
+    result.sort(key=lambda group: group["director_name"].casefold())
+    return result
+
+
+def build_company_update_rows(tree: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Prepare safe company-only updates from the director owner.
+
+    Existing leads and contacts are never changed here. A company whose leads
+    are split between 3+ different managers remains manual-review only.
+    """
+    rows: list[dict[str, Any]] = []
+    for group in tree:
+        target_owner = normalized_id(group.get("director_owner_id"))
+        for company in group.get("companies", []):
+            current_owner = normalized_id(company.get("company_owner_id"))
+            needs_update = target_owner is not None and current_owner != target_owner
+            rows.append(
+                {
+                    "company_id": company["company_id"],
+                    "target_owner_id": target_owner,
+                    "needs_update": "Y" if needs_update else "N",
+                    "unique_owner_count": int(company.get("unique_lead_owner_count") or 0),
+                    "action": (
+                        "manual_review_3plus"
+                        if needs_update and int(company.get("unique_lead_owner_count") or 0) >= 3
+                        else "pending_update"
+                        if needs_update
+                        else "skipped_director_no_owner"
+                        if target_owner is None
+                        else "already_matches"
+                    ),
+                    "error": "",
+                }
+            )
     return rows
 
 
 def apply_updates(client: BitrixClient, rows: list[dict[str, Any]]) -> None:
     for row in rows:
-        if row["needs_update"] != "Y":
+        if row.get("needs_update") != "Y":
             continue
-
-        # Companies whose linked leads are already split between 3+ managers
-        # are intentionally never changed automatically. They stay in the
-        # desync report for manual review. Check the count directly instead of
-        # trusting the action label so apply remains safe even for rows built
-        # by older report versions.
         if int(row.get("unique_owner_count") or 0) >= 3:
             row["action"] = "manual_review_3plus"
             continue
-
-        company_id = int(row["company_id"])
-        target_owner = normalized_id(row["first_lead_owner_id"])
+        target_owner = normalized_id(row.get("target_owner_id"))
         if target_owner is None:
-            row["action"] = "skipped_first_lead_no_owner"
+            row["action"] = "skipped_director_no_owner"
             continue
         try:
-            client.update_company(str(company_id), {"ASSIGNED_BY_ID": target_owner})
+            client.update_company(str(int(row["company_id"])), {"ASSIGNED_BY_ID": target_owner})
             row["action"] = "updated"
-        except Exception as exc:  # noqa: BLE001 - continue auditing other companies
+        except Exception as exc:  # noqa: BLE001
             row["action"] = "update_error"
             row["error"] = str(exc)
 
 
-def write_desync_xlsx(path: Path, rows: list[dict[str, Any]]) -> None:
-    """Write the only human-facing scan report: company + current owner."""
+def write_tree_xlsx(path: Path, tree: list[dict[str, Any]]) -> None:
+    """Write a sparse tree exactly as: director -> company -> leads."""
     path.parent.mkdir(parents=True, exist_ok=True)
     workbook = xlsxwriter.Workbook(path)
     ws = workbook.add_worksheet("Рассинхрон")
 
-    header = workbook.add_format({"bold": True, "valign": "vcenter"})
-    cell = workbook.add_format({"valign": "vcenter"})
-    ws.write(0, 0, "Компания", header)
-    ws.write(0, 1, "Текущий ответственный", header)
+    header = workbook.add_format(
+        {
+            "bold": True,
+            "bg_color": "#D9EAF7",
+            "border": 1,
+            "valign": "vcenter",
+            "align": "left",
+        }
+    )
+    root_fmt = workbook.add_format(
+        {"bold": True, "bg_color": "#EAF2F8", "top": 1, "bottom": 1, "valign": "vcenter"}
+    )
+    root_owner_fmt = workbook.add_format(
+        {"bold": True, "bg_color": "#EAF2F8", "top": 1, "bottom": 1, "valign": "vcenter"}
+    )
+    root_missing_fmt = workbook.add_format(
+        {"bold": True, "bg_color": "#FFF2CC", "top": 1, "bottom": 1, "valign": "vcenter"}
+    )
+    company_fmt = workbook.add_format(
+        {"bold": True, "bg_color": "#F7F7F7", "valign": "vcenter", "left": 1}
+    )
+    company_owner_fmt = workbook.add_format(
+        {"bold": True, "bg_color": "#F7F7F7", "valign": "vcenter"}
+    )
+    mismatch_fmt = workbook.add_format(
+        {"bg_color": "#FCE8E6", "font_color": "#B3261E", "valign": "vcenter"}
+    )
+    lead_fmt = workbook.add_format({"valign": "vcenter"})
+    lead_owner_fmt = workbook.add_format({"valign": "vcenter"})
 
-    for row_idx, row in enumerate(rows, start=1):
-        ws.write(row_idx, 0, row.get("company_title", ""), cell)
-        ws.write(row_idx, 1, row.get("company_owner_name", ""), cell)
+    for col, title in enumerate(VISIBLE_COLUMNS):
+        ws.write(0, col, title, header)
+
+    row_idx = 1
+    for group in tree:
+        first_root_row = True
+        director_owner_id = normalized_id(group.get("director_owner_id"))
+        companies = group.get("companies", []) or [{}]
+        for company in companies:
+            leads = company.get("leads") or [{}]
+            first_company_row = True
+            for lead in leads:
+                if first_root_row:
+                    ws.write(row_idx, 0, group.get("director_name", ""), root_fmt)
+                    ws.write(
+                        row_idx,
+                        1,
+                        group.get("director_owner_name", ""),
+                        root_owner_fmt if director_owner_id is not None else root_missing_fmt,
+                    )
+                    first_root_row = False
+                else:
+                    ws.write_blank(row_idx, 0, None, lead_fmt)
+                    ws.write_blank(row_idx, 1, None, lead_fmt)
+
+                if first_company_row:
+                    ws.write(row_idx, 2, company.get("company_title", ""), company_fmt)
+                    company_owner_format = mismatch_fmt if company.get("company_mismatch") else company_owner_fmt
+                    ws.write(row_idx, 3, company.get("company_owner_name", ""), company_owner_format)
+                    first_company_row = False
+                else:
+                    ws.write_blank(row_idx, 2, None, lead_fmt)
+                    ws.write_blank(row_idx, 3, None, lead_fmt)
+
+                ws.write(row_idx, 4, lead.get("lead_title", ""), lead_fmt)
+                lead_owner_format = mismatch_fmt if lead.get("lead_mismatch") else lead_owner_fmt
+                ws.write(row_idx, 5, lead.get("lead_owner_name", ""), lead_owner_format)
+                row_idx += 1
 
     ws.freeze_panes(1, 0)
-    ws.autofilter(0, 0, max(0, len(rows)), 1)
-    ws.set_column(0, 0, 48)
-    ws.set_column(1, 1, 32)
-    workbook.close()
-
-
-def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8-sig", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=AUDIT_FIELDS, delimiter=";")
-        writer.writeheader()
-        writer.writerows({field: row.get(field, "") for field in AUDIT_FIELDS} for row in rows)
-
-
-def write_xlsx(path: Path, sheets: list[tuple[str, list[dict[str, Any]]]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    workbook = xlsxwriter.Workbook(path)
-    header = workbook.add_format({"bold": True, "text_wrap": True, "valign": "top"})
-    wrap = workbook.add_format({"text_wrap": True, "valign": "top"})
-    for sheet_name, rows in sheets:
-        ws = workbook.add_worksheet(sheet_name[:31])
-        for col, field in enumerate(AUDIT_FIELDS):
-            ws.write(0, col, field, header)
-        for r_idx, row in enumerate(rows, start=1):
-            for c_idx, field in enumerate(AUDIT_FIELDS):
-                ws.write(r_idx, c_idx, row.get(field, ""), wrap)
-        ws.freeze_panes(1, 0)
-        ws.autofilter(0, 0, max(0, len(rows)), len(AUDIT_FIELDS) - 1)
-        widths = {
-            "company_id": 12,
-            "company_title": 35,
-            "company_owner_name": 28,
-            "first_lead_id": 12,
-            "first_lead_date_create": 23,
-            "first_lead_title": 40,
-            "first_lead_owner_name": 28,
-            "owner_distribution": 55,
-            "owner_names": 55,
-            "action": 25,
-            "error": 55,
-        }
-        for col, field in enumerate(AUDIT_FIELDS):
-            ws.set_column(col, col, widths.get(field, 16))
+    ws.set_row(0, 24)
+    ws.set_column(0, 0, 32)
+    ws.set_column(1, 1, 28)
+    ws.set_column(2, 2, 44)
+    ws.set_column(3, 3, 28)
+    ws.set_column(4, 4, 46)
+    ws.set_column(5, 5, 28)
+    ws.hide_gridlines(2)
     workbook.close()
 
 
@@ -296,29 +497,43 @@ def run(client: BitrixClient, output_dir: Path, apply: bool) -> dict[str, int]:
     leads = load_linked_leads(client)
     print(f"Linked leads loaded: {len(leads)}")
 
+    print("Loading director contacts...")
+    director_contacts = load_director_contacts(client)
+    print(f"Director contacts loaded: {len(director_contacts)}")
+
     users = load_users(client)
-    rows = build_audit_rows(companies, leads, users)
+    tree = build_desync_tree(companies, leads, director_contacts, users)
+    update_rows = build_company_update_rows(tree)
 
     if apply:
-        apply_updates(client, rows)
+        apply_updates(client, update_rows)
+        # Rebuild from current in-memory company owners for the report only when
+        # updates succeeded; this keeps the artifact useful after apply without
+        # re-fetching all CRM entities.
+        updated_by_company = {
+            int(row["company_id"]): normalized_id(row.get("target_owner_id"))
+            for row in update_rows
+            if row.get("action") == "updated"
+        }
+        if updated_by_company:
+            for company in companies:
+                company_id = normalized_id(company.get("ID"))
+                if company_id in updated_by_company:
+                    company["ASSIGNED_BY_ID"] = updated_by_company[company_id]
+            tree = build_desync_tree(companies, leads, director_contacts, users)
 
-    mismatches = [row for row in rows if row["needs_update"] == "Y"]
-    spread = [row for row in rows if int(row["unique_owner_count"]) >= 3]
-    errors = [row for row in rows if row["action"] == "update_error"]
-    no_first_owner = [row for row in rows if row["action"] == "skipped_first_lead_no_owner"]
+    write_tree_xlsx(output_dir / "company_owner_desync.xlsx", tree)
 
-    # Human-facing result is deliberately minimal. 3+ cases are included in
-    # this same desync list, but apply_updates() always leaves them untouched.
-    write_desync_xlsx(output_dir / "company_owner_desync.xlsx", mismatches)
-
+    errors = [row for row in update_rows if row.get("action") == "update_error"]
+    manual = [row for row in update_rows if row.get("action") == "manual_review_3plus"]
     summary = {
         "companies_total": len(companies),
-        "companies_with_linked_leads": len(rows),
         "linked_leads_total": len(leads),
-        "mismatches": len(mismatches),
-        "spread_3plus": len(spread),
-        "first_lead_without_owner": len(no_first_owner),
-        "updated": sum(1 for row in rows if row["action"] == "updated"),
+        "director_contacts_total": len(director_contacts),
+        "desync_directors": len(tree),
+        "desync_companies": sum(len(group.get("companies", [])) for group in tree),
+        "manual_review_3plus": len(manual),
+        "updated": sum(1 for row in update_rows if row.get("action") == "updated"),
         "update_errors": len(errors),
         "mode_apply": int(apply),
     }
@@ -345,11 +560,11 @@ def build_client() -> BitrixClient:
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Synchronize company ASSIGNED_BY_ID from the earliest lead linked by COMPANY_ID. "
-            "The earliest lead is chosen by DATE_CREATE, then by the smallest ID."
+            "Scan ownership desync as director -> company -> leads. "
+            "The responsible manager of the director contact is the source of truth."
         )
     )
-    parser.add_argument("--apply", action="store_true", help="write changes; default is dry-run")
+    parser.add_argument("--apply", action="store_true", help="update company owners only; default is dry-run")
     parser.add_argument("--output-dir", default="output")
     args = parser.parse_args()
 

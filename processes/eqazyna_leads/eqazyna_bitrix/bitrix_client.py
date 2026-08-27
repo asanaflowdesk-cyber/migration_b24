@@ -627,6 +627,59 @@ class BitrixClient:
         )
         return result[0] if isinstance(result, list) and result else None
 
+    def find_director_contact_global(
+        self,
+        last_name: str,
+        name: str,
+        second_name: str = "",
+    ) -> dict[str, Any] | None:
+        """Find the same director across all companies.
+
+        Only contacts explicitly marked as a director are eligible. If several
+        company-specific contact cards exist for the same FIO, the oldest one
+        with a populated ASSIGNED_BY_ID is the historical assignment source.
+        """
+        filter_fields: dict[str, Any] = {
+            "LAST_NAME": last_name,
+            "NAME": name,
+        }
+        if second_name:
+            filter_fields["SECOND_NAME"] = second_name
+        result = self.call(
+            "crm.contact.list",
+            {
+                "order": {"ID": "ASC"},
+                "filter": filter_fields,
+                "select": [
+                    "ID",
+                    "NAME",
+                    "LAST_NAME",
+                    "SECOND_NAME",
+                    "POST",
+                    "COMPANY_ID",
+                    "ASSIGNED_BY_ID",
+                    "COMMENTS",
+                    "ORIGINATOR_ID",
+                    "ORIGIN_ID",
+                ],
+            },
+        )
+        if not isinstance(result, list):
+            return None
+        directors = [
+            row
+            for row in result
+            if "руковод" in str(row.get("POST") or "").casefold()
+            or "EQAZYNA_DIRECTOR:" in str(row.get("COMMENTS") or "")
+        ]
+        if not directors:
+            return None
+        for row in directors:
+            raw_owner = str(row.get("ASSIGNED_BY_ID") or "").strip()
+            if raw_owner.isdigit() and int(raw_owner) > 0:
+                return row
+        return directors[0]
+
     def create_contact(self, fields: dict[str, Any]) -> str:
         result = self.call(
             "crm.contact.add",

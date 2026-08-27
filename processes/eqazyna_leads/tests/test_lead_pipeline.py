@@ -48,6 +48,7 @@ class FakeClient:
         company=None,
         requisite=None,
         contact=None,
+        global_contact=None,
         address=None,
         field_type="string",
         field_items=None,
@@ -63,6 +64,7 @@ class FakeClient:
         self.company = company
         self.requisite = requisite
         self.contact = contact
+        self.global_contact = global_contact
         self.address = address
         self.field_type = field_type
         self.field_items = field_items
@@ -202,6 +204,10 @@ class FakeClient:
     def find_director_contact(self, company_id, last_name, name, second_name=""):
         assert (last_name, name, second_name) == ("Иванов", "Иван", "Иванович")
         return self.contact
+
+    def find_director_contact_global(self, last_name, name, second_name=""):
+        assert (last_name, name, second_name) == ("Иванов", "Иван", "Иванович")
+        return self.global_contact if self.global_contact is not None else self.contact
 
     def create_contact(self, fields):
         self.created_contact_fields = fields
@@ -768,3 +774,32 @@ def test_failure_reason_uses_migrated_lead_enumeration_field():
     assert result.status_id == "JUNK"
     assert result.failure_reason == "901"
     assert client.created_lead_fields[FAILURE_FIELD] == "901"
+
+
+def test_same_director_on_another_company_has_priority_for_new_bundle_assignment():
+    company = {
+        "ID": "601",
+        "TITLE": "ТОО Новая компания",
+        "ORIGINATOR_ID": "EQAZYNA",
+        "ORIGIN_ID": "123456789012",
+    }
+    global_contact = {
+        "ID": "700",
+        "LAST_NAME": "Иванов",
+        "NAME": "Иван",
+        "SECOND_NAME": "Иванович",
+        "POST": "Руководитель",
+        "COMPANY_ID": "555",
+        "ASSIGNED_BY_ID": "17",
+    }
+    client = FakeClient(company=company, contact=None, global_contact=global_contact)
+
+    result = pipeline(client).process(application("APP-2"), enrichment())
+
+    assert result.assigned_by_id == 17
+    assert result.assignment_reason == "director_contact_owner"
+    assert client.created_lead_fields["ASSIGNED_BY_ID"] == 17
+    assert client.created_contact_fields["ASSIGNED_BY_ID"] == 17
+    # Existing company ownership remains protected from parser-side rewrites.
+    assert not client.updated_company_fields or "ASSIGNED_BY_ID" not in client.updated_company_fields
+
