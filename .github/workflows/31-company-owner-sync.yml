@@ -1,0 +1,98 @@
+name: 31 | Компании — ответственный по первому лиду
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "dry_run — только отчет; apply — исправить ответственных компаний"
+        required: true
+        default: dry_run
+        type: choice
+        options: [dry_run, apply]
+      confirm:
+        description: "Для apply введите SYNC_COMPANY_OWNERS"
+        required: false
+        default: ""
+        type: string
+
+concurrency:
+  group: company-owner-first-lead-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  NODE_USE_SYSTEM_CA: "1"
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: "utf-8"
+
+jobs:
+  sync-company-owners:
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: cmd
+        working-directory: processes/company_owner_sync
+
+    steps:
+      - name: Получить код репозитория
+        uses: actions/checkout@v5
+
+      - name: Найти Python и создать локальное окружение
+        run: call ..\..\scripts\prepare-python.cmd
+
+      - name: Установить зависимости
+        env:
+          CUSTOM_PIP_INDEX_URL: ${{ vars.PIP_INDEX_URL }}
+        run: |
+          if not "%CUSTOM_PIP_INDEX_URL%"=="" set "PIP_INDEX_URL=%CUSTOM_PIP_INDEX_URL%"
+          ".venv\Scripts\python.exe" -m pip install -r requirements.txt
+
+      - name: Проверить код
+        env:
+          PYTHONPATH: ${{ github.workspace }}\processes\company_owner_sync;${{ github.workspace }}\processes\eqazyna_leads
+        run: |
+          chcp 65001 >nul
+          ".venv\Scripts\python.exe" -m pytest -q tests
+          if errorlevel 1 exit /b 1
+          ".venv\Scripts\python.exe" sync_company_owners.py --help >nul
+
+      - name: Проверить подтверждение боевого запуска
+        if: ${{ inputs.mode == 'apply' && inputs.confirm != 'SYNC_COMPANY_OWNERS' }}
+        run: |
+          echo Для записи в коробку введите SYNC_COMPANY_OWNERS
+          exit /b 1
+
+      - name: Сверить ответственных компаний
+        env:
+          PYTHONPATH: ${{ github.workspace }}\processes\company_owner_sync;${{ github.workspace }}\processes\eqazyna_leads
+          TARGET_BITRIX_WEBHOOK_URL: ${{ secrets.TARGET_BITRIX_WEBHOOK_URL }}
+          BITRIX_VERIFY_SSL: ${{ vars.BITRIX_VERIFY_SSL || 'true' }}
+          BITRIX_CA_BUNDLE: ${{ vars.BITRIX_CA_BUNDLE }}
+          BITRIX_REQUEST_TIMEOUT: ${{ vars.BITRIX_REQUEST_TIMEOUT || '45' }}
+        run: |
+          chcp 65001 >nul
+          if "%TARGET_BITRIX_WEBHOOK_URL%"=="" (
+            echo Не задан secret TARGET_BITRIX_WEBHOOK_URL
+            exit /b 1
+          )
+          if not exist output mkdir output
+          if "${{ inputs.mode }}"=="apply" (
+            ".venv\Scripts\python.exe" -u sync_company_owners.py --apply --output-dir output
+          ) else (
+            ".venv\Scripts\python.exe" -u sync_company_owners.py --output-dir output
+          )
+          if errorlevel 1 exit /b 1
+          type output\company_owner_sync_summary.json
+          dir output
+
+      - name: Загрузить отчет
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: 31-company-owner-sync-${{ github.run_number }}
+          path: processes/company_owner_sync/output/
+          if-no-files-found: warn
+          retention-days: 14
