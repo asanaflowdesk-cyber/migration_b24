@@ -689,12 +689,11 @@ class LeadPipeline:
     ) -> EntityOutcome:
         company = existing_company
         desired = self._company_fields(app, enrichment, company)
-        current_owner = self._record_assigned_by_id(company or {})
-        if preferred_assigned_by_id and (
-            company is None
-            or current_owner is None
-            or force_assigned_by
-        ):
+        # Existing company ownership is never changed by the e-Qazyna loader.
+        # Ownership reconciliation is a separate controlled operation based on
+        # the earliest lead linked to the company. The parser may only set the
+        # owner while creating a brand-new company.
+        if company is None and preferred_assigned_by_id:
             desired["ASSIGNED_BY_ID"] = preferred_assigned_by_id
 
         if company:

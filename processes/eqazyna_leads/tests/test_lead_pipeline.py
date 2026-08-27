@@ -720,7 +720,9 @@ def test_director_contact_owner_outside_approved_pool_is_ignored():
 
     assert result.assigned_by_id == 44
     assert result.assignment_reason == "least_loaded_random"
-    assert client.updated_company_fields["ASSIGNED_BY_ID"] == 44
+    # Existing company owner is preserved by the parser. Company ownership is
+    # reconciled separately from the earliest linked lead.
+    assert "ASSIGNED_BY_ID" not in client.updated_company_fields
     assert client.updated_contact_fields["ASSIGNED_BY_ID"] == 44
 
 
