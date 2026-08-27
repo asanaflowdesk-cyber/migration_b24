@@ -116,3 +116,48 @@ def test_apply_updates_changes_only_mismatches_to_first_lead_owner():
     assert client.updates == [("10", {"ASSIGNED_BY_ID": 16})]
     assert rows[0]["action"] == "updated"
     assert rows[1]["action"] == "already_matches"
+
+
+def test_apply_skips_company_with_three_or_more_distinct_lead_owners():
+    from sync_company_owners import apply_updates
+
+    rows = [
+        {
+            "company_id": 30,
+            "first_lead_owner_id": 16,
+            "needs_update": "Y",
+            "unique_owner_count": 3,
+            "action": "manual_review_3plus",
+            "error": "",
+        }
+    ]
+    client = FakeClient()
+
+    apply_updates(client, rows)
+
+    assert client.updates == []
+    assert rows[0]["action"] == "manual_review_3plus"
+
+
+def test_desync_selection_includes_three_plus_for_report_but_apply_still_skips_it():
+    from sync_company_owners import apply_updates
+
+    companies = [
+        {"ID": "10", "TITLE": "A", "ASSIGNED_BY_ID": "99"},
+        {"ID": "20", "TITLE": "B", "ASSIGNED_BY_ID": "88"},
+    ]
+    leads = [
+        {"ID": "1", "COMPANY_ID": "10", "ASSIGNED_BY_ID": "16", "DATE_CREATE": "2026-01-01"},
+        {"ID": "2", "COMPANY_ID": "20", "ASSIGNED_BY_ID": "17", "DATE_CREATE": "2026-01-01"},
+        {"ID": "3", "COMPANY_ID": "20", "ASSIGNED_BY_ID": "18", "DATE_CREATE": "2026-01-02"},
+        {"ID": "4", "COMPANY_ID": "20", "ASSIGNED_BY_ID": "19", "DATE_CREATE": "2026-01-03"},
+    ]
+    rows = build_audit_rows(companies, leads)
+    desync = [row for row in rows if row["needs_update"] == "Y"]
+
+    assert {row["company_title"] for row in desync} == {"A", "B"}
+
+    client = FakeClient()
+    apply_updates(client, rows)
+    assert client.updates == [("10", {"ASSIGNED_BY_ID": 16})]
+    assert next(row for row in rows if row["company_title"] == "B")["action"] == "manual_review_3plus"
