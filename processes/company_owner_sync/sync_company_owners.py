@@ -184,7 +184,9 @@ def build_audit_rows(
                 "owner_names": "; ".join(owner_names),
                 "needs_update": "Y" if needs_update else "N",
                 "action": (
-                    "pending_update"
+                    "manual_review_3plus"
+                    if needs_update and len(owner_ids) >= 3
+                    else "pending_update"
                     if needs_update
                     else "skipped_first_lead_no_owner"
                     if first_owner is None
@@ -200,6 +202,16 @@ def apply_updates(client: BitrixClient, rows: list[dict[str, Any]]) -> None:
     for row in rows:
         if row["needs_update"] != "Y":
             continue
+
+        # Companies whose linked leads are already split between 3+ managers
+        # are intentionally never changed automatically. They stay in the
+        # desync report for manual review. Check the count directly instead of
+        # trusting the action label so apply remains safe even for rows built
+        # by older report versions.
+        if int(row.get("unique_owner_count") or 0) >= 3:
+            row["action"] = "manual_review_3plus"
+            continue
+
         company_id = int(row["company_id"])
         target_owner = normalized_id(row["first_lead_owner_id"])
         if target_owner is None:
@@ -211,6 +223,28 @@ def apply_updates(client: BitrixClient, rows: list[dict[str, Any]]) -> None:
         except Exception as exc:  # noqa: BLE001 - continue auditing other companies
             row["action"] = "update_error"
             row["error"] = str(exc)
+
+
+def write_desync_xlsx(path: Path, rows: list[dict[str, Any]]) -> None:
+    """Write the only human-facing scan report: company + current owner."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    workbook = xlsxwriter.Workbook(path)
+    ws = workbook.add_worksheet("Рассинхрон")
+
+    header = workbook.add_format({"bold": True, "valign": "vcenter"})
+    cell = workbook.add_format({"valign": "vcenter"})
+    ws.write(0, 0, "Компания", header)
+    ws.write(0, 1, "Текущий ответственный", header)
+
+    for row_idx, row in enumerate(rows, start=1):
+        ws.write(row_idx, 0, row.get("company_title", ""), cell)
+        ws.write(row_idx, 1, row.get("company_owner_name", ""), cell)
+
+    ws.freeze_panes(1, 0)
+    ws.autofilter(0, 0, max(0, len(rows)), 1)
+    ws.set_column(0, 0, 48)
+    ws.set_column(1, 1, 32)
+    workbook.close()
 
 
 def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -273,17 +307,9 @@ def run(client: BitrixClient, output_dir: Path, apply: bool) -> dict[str, int]:
     errors = [row for row in rows if row["action"] == "update_error"]
     no_first_owner = [row for row in rows if row["action"] == "skipped_first_lead_no_owner"]
 
-    write_csv(output_dir / "company_owner_audit.csv", rows)
-    write_csv(output_dir / "company_owner_mismatches.csv", mismatches)
-    write_csv(output_dir / "company_lead_owner_spread_3plus.csv", spread)
-    write_xlsx(
-        output_dir / "company_owner_sync.xlsx",
-        [
-            ("Несовпадения", mismatches),
-            ("3+ ответственных", spread),
-            ("Все с лидами", rows),
-        ],
-    )
+    # Human-facing result is deliberately minimal. 3+ cases are included in
+    # this same desync list, but apply_updates() always leaves them untouched.
+    write_desync_xlsx(output_dir / "company_owner_desync.xlsx", mismatches)
 
     summary = {
         "companies_total": len(companies),
