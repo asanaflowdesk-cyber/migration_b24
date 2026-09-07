@@ -44,7 +44,7 @@ COLUMNS = [
     ("assignment_reason", "Правило ответственного"),
     ("status_id", "Стадия лида"),
     ("status_reason", "Правило стадии"),
-    ("failure_reason", "Наследованная причина неудачи"),
+    ("failure_reason", "Причина исключения / неудачи"),
     ("status_reference_lead_id", "Лид-источник стадии"),
     ("warning", "Предупреждение"),
     ("error", "Ошибка"),

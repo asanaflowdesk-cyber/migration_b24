@@ -87,7 +87,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--failure-reason-field",
         default=os.getenv("BITRIX_LEAD_FAILURE_REASON_FIELD", "UF_CRM_1785508658316"),
-        help="Lead field copied together with a failed stage",
+        help="Lead failure-reason field used for the «Уже работает с Евразией» exception",
     )
     parser.add_argument(
         "--overwrite-assigned-by-on-update",

@@ -10,6 +10,8 @@ from eqazyna_bitrix.models import Application, CompanyEnrichment
 FIELD = "UF_CRM_1785917145255"
 VALUE = "ГПО Недропользователя"
 FAILURE_FIELD = "UF_CRM_1785508658316"
+EURASIA_REASON = "Уже работает с Евразией"
+EURASIA_REASON_ID = "903"
 
 
 def application(doc_number: str = "APP-1") -> Application:
@@ -96,7 +98,18 @@ class FakeClient:
         meta = {"type": self.field_type, "title": "Тип лидогенерации"}
         if self.field_items is not None:
             meta["items"] = self.field_items
-        return {FIELD: meta}
+        return {
+            FIELD: meta,
+            FAILURE_FIELD: {
+                "type": "enumeration",
+                "title": "Причина неудачи",
+                "items": [
+                    {"ID": "901", "VALUE": "Клиент отказался"},
+                    {"ID": "902", "VALUE": "Не дозвонились"},
+                    {"ID": EURASIA_REASON_ID, "VALUE": EURASIA_REASON},
+                ],
+            },
+        }
 
     def get_requisite_fields(self):
         return {
@@ -316,7 +329,7 @@ def test_existing_migrated_company_requisite_and_contact_are_reused():
     assert client.created_contact_fields is None
 
 
-def test_failed_previous_company_lead_inherits_stage_reason_but_not_company_owner():
+def test_failed_previous_company_lead_does_not_inherit_non_eurasia_failure():
     company = {
         "ID": "601",
         "TITLE": "ТОО Тест Недра",
@@ -347,13 +360,13 @@ def test_failed_previous_company_lead_inherits_stage_reason_but_not_company_owne
     assert result.action == "created_lead"
     assert result.assigned_by_id == 44
     assert result.assignment_reason == "least_loaded_random"
-    assert result.status_id == "JUNK"
-    assert result.status_reason == "failed_related_lead_inherited"
-    assert result.failure_reason == "Клиент отказался"
+    assert result.status_id == "NEW"
+    assert result.status_reason == "default_new"
+    assert result.failure_reason is None
     assert result.status_reference_lead_id == "77"
     assert client.created_lead_fields["ASSIGNED_BY_ID"] == 44
-    assert client.created_lead_fields["STATUS_ID"] == "JUNK"
-    assert client.created_lead_fields[FAILURE_FIELD] == "Клиент отказался"
+    assert client.created_lead_fields["STATUS_ID"] == "NEW"
+    assert FAILURE_FIELD not in client.created_lead_fields
     assert client.created_lead_fields["ORIGIN_ID"] == "APP-2"
     assert client.created_lead_fields["TITLE"].endswith("e-Qazyna № APP-2")
 
@@ -578,7 +591,7 @@ def test_director_contact_owner_is_only_assignment_source_when_owners_conflict()
     assert client.created_lead_fields["ASSIGNED_BY_ID"] == 17
 
 
-def test_latest_related_lead_controls_failed_stage_and_reason():
+def test_latest_related_non_eurasia_failure_still_creates_new_stage():
     company = {
         "ID": "601",
         "TITLE": "ТОО Тест Недра",
@@ -620,10 +633,11 @@ def test_latest_related_lead_controls_failed_stage_and_reason():
 
     assert result.assigned_by_id == 17
     assert result.assignment_reason == "director_contact_owner"
-    assert result.status_id == "JUNK"
-    assert result.failure_reason == "Не дозвонились"
+    assert result.status_id == "NEW"
+    assert result.status_reason == "default_new"
+    assert result.failure_reason is None
     assert result.status_reference_lead_id == "91"
-    assert client.created_lead_fields[FAILURE_FIELD] == "Не дозвонились"
+    assert FAILURE_FIELD not in client.created_lead_fields
 
 
 def test_newer_active_lead_means_new_stage_even_when_older_lead_failed():
@@ -752,7 +766,7 @@ def test_dry_run_reuses_planned_contact_owner_for_same_director_and_bin():
     assert second.requisite_action == "dry_run_reuse_planned_requisite"
 
 
-def test_failure_reason_uses_migrated_lead_enumeration_field():
+def test_eurasia_failure_reason_label_keeps_failed_stage():
     company = {
         "ID": "601",
         "TITLE": "ТОО Тест Недра",
@@ -763,7 +777,7 @@ def test_failure_reason_uses_migrated_lead_enumeration_field():
         "ID": "77",
         "STATUS_ID": "JUNK",
         "STATUS_SEMANTIC_ID": "F",
-        FAILURE_FIELD: "901",
+        FAILURE_FIELD: EURASIA_REASON,
         "COMPANY_ID": "601",
         "DATE_MODIFY": "2026-08-05T10:00:00+05:00",
     }
@@ -772,8 +786,34 @@ def test_failure_reason_uses_migrated_lead_enumeration_field():
     result = pipeline(client).process(application("APP-2"), enrichment())
 
     assert result.status_id == "JUNK"
-    assert result.failure_reason == "901"
-    assert client.created_lead_fields[FAILURE_FIELD] == "901"
+    assert result.status_reason == "existing_eurasia_client_inherited"
+    assert result.failure_reason == EURASIA_REASON
+    assert client.created_lead_fields[FAILURE_FIELD] == EURASIA_REASON
+
+
+def test_eurasia_failure_reason_enum_id_keeps_failed_stage():
+    company = {
+        "ID": "601",
+        "TITLE": "ТОО Тест Недра",
+        "ORIGINATOR_ID": "EQAZYNA",
+        "ORIGIN_ID": "123456789012",
+    }
+    previous = {
+        "ID": "77",
+        "STATUS_ID": "JUNK",
+        "STATUS_SEMANTIC_ID": "F",
+        FAILURE_FIELD: EURASIA_REASON_ID,
+        "COMPANY_ID": "601",
+        "DATE_MODIFY": "2026-08-05T10:00:00+05:00",
+    }
+    client = FakeClient(company=company, lead=previous)
+
+    result = pipeline(client).process(application("APP-2"), enrichment())
+
+    assert result.status_id == "JUNK"
+    assert result.status_reason == "existing_eurasia_client_inherited"
+    assert result.failure_reason == EURASIA_REASON_ID
+    assert client.created_lead_fields[FAILURE_FIELD] == EURASIA_REASON_ID
 
 
 def test_same_director_on_another_company_has_priority_for_new_bundle_assignment():

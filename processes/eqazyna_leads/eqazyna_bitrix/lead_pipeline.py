@@ -24,6 +24,7 @@ DEFAULT_ORIGINATOR_ID = "EQAZYNA_LEAD"
 DEFAULT_COMPANY_ORIGINATOR_ID = "EQAZYNA"
 DEFAULT_REQUISITE_PRESET_ID = "1"
 DEFAULT_FAILURE_REASON_FIELD = "UF_CRM_1785508658316"
+DEFAULT_EXISTING_CLIENT_FAILURE_REASON = "Уже работает с Евразией"
 DEFAULT_MANAGER_IDS = (22, 23, 16, 17, 18, 38, 44, 39, 19, 15)
 
 
@@ -36,9 +37,10 @@ class LeadPipelineConfig:
     director name is available, one linked director contact. The responsible
     manager is inherited only from the director contact card. If that contact
     has no approved responsible manager, a manager is selected randomly among
-    the least-loaded approved managers. A new lead inherits a failed stage and
-    its reason only when the latest related lead ended unsuccessfully;
-    otherwise it starts NEW.
+    the least-loaded approved managers. Every new application starts in NEW.
+    The only exception is a latest related failed lead with the reason
+    «Уже работает с Евразией»: that failed stage and reason are preserved so an
+    existing Eurasia client is not sent back into new-business processing.
     """
 
     lead_status_id: str = "NEW"
@@ -55,6 +57,7 @@ class LeadPipelineConfig:
     validate_custom_field: bool = True
     manager_ids: tuple[int, ...] = DEFAULT_MANAGER_IDS
     failure_reason_field: str = DEFAULT_FAILURE_REASON_FIELD
+    existing_client_failure_reason: str = DEFAULT_EXISTING_CLIENT_FAILURE_REASON
     random_seed: int | None = None
 
 
@@ -102,6 +105,9 @@ class LeadPipeline:
         self._run_requisites_by_bin: dict[str, dict[str, Any]] = {}
         self._failed_status_ids: set[str] = {"JUNK"}
         self._terminal_status_ids: set[str] = {"JUNK", "CONVERTED"}
+        self._existing_client_failure_reason_values: set[str] = {
+            self._normalise_label(config.existing_client_failure_reason)
+        }
         self._random = (
             random.Random(config.random_seed)
             if config.random_seed is not None
@@ -122,6 +128,7 @@ class LeadPipeline:
         """
         if self.config.validate_custom_field:
             self._validate_lead_generation_field()
+        self._load_existing_client_failure_reason_values()
 
         try:
             requisite_fields = self.client.get_requisite_fields()
@@ -197,6 +204,55 @@ class LeadPipeline:
             self._failed_status_ids = failed
         if terminal:
             self._terminal_status_ids = terminal
+
+    def _load_existing_client_failure_reason_values(self) -> None:
+        """Resolve the enum ID for «Уже работает с Евразией».
+
+        Bitrix24 returns enumeration user fields as option IDs, while tests and
+        legacy data may expose the human-readable label. Keep both forms so the
+        exception is stable across migrated and newly created records.
+        """
+        try:
+            fields = self.client.get_lead_fields()
+        except Exception as exc:  # noqa: BLE001 - text fallback remains available
+            self.validation_warnings.append(
+                "Не удалось прочитать справочник причин неудачи; "
+                f"исключение «{self.config.existing_client_failure_reason}» "
+                f"будет распознаваться только по тексту: {exc}"
+            )
+            return
+
+        field_meta = fields.get(self.config.failure_reason_field)
+        if not isinstance(field_meta, dict):
+            return
+
+        wanted = self._normalise_label(self.config.existing_client_failure_reason)
+        for key in ("items", "ITEMS", "list", "LIST", "values", "VALUES"):
+            raw = field_meta.get(key)
+            if not isinstance(raw, list):
+                continue
+            for item in raw:
+                if not isinstance(item, dict):
+                    continue
+                label = (
+                    item.get("VALUE")
+                    or item.get("value")
+                    or item.get("NAME")
+                    or item.get("name")
+                )
+                if self._normalise_label(label) != wanted:
+                    continue
+                option_id = (
+                    item.get("ID")
+                    or item.get("id")
+                    or item.get("VALUE_ID")
+                    or item.get("valueId")
+                )
+                self._existing_client_failure_reason_values.add(wanted)
+                if option_id not in (None, ""):
+                    self._existing_client_failure_reason_values.add(
+                        self._normalise_label(option_id)
+                    )
 
     def _load_manager_workloads(self) -> None:
         if not self._manager_ids:
@@ -628,12 +684,16 @@ class LeadPipeline:
         company_reference_lead: dict[str, Any] | None,
     ) -> tuple[str, str, str | None, dict[str, Any] | None]:
         reference = self._newest_lead(contact_reference_lead, company_reference_lead)
-        if reference and self._is_failed_lead(reference):
+        if (
+            reference
+            and self._is_failed_lead(reference)
+            and self._is_existing_eurasia_client(reference)
+        ):
             status_id = str(reference.get("STATUS_ID") or "").strip()
             if status_id:
                 return (
                     status_id,
-                    "failed_related_lead_inherited",
+                    "existing_eurasia_client_inherited",
                     self._record_failure_reason(reference),
                     reference,
                 )
@@ -643,6 +703,12 @@ class LeadPipeline:
             None,
             reference,
         )
+
+    def _is_existing_eurasia_client(self, lead: dict[str, Any]) -> bool:
+        reason = self._record_failure_reason(lead)
+        if not reason:
+            return False
+        return self._normalise_label(reason) in self._existing_client_failure_reason_values
 
     def _is_failed_lead(self, lead: dict[str, Any]) -> bool:
         semantic = str(lead.get("STATUS_SEMANTIC_ID") or "").strip().upper()
