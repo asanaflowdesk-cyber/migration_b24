@@ -68,8 +68,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--lead-status-id",
-        default=os.getenv("BITRIX_LEAD_STATUS_ID", "NEW"),
-        help="Initial status for newly created leads only",
+        default="NEW",
+        help="Compatibility option; new e-Qazyna applications are always forced to NEW",
     )
     parser.add_argument(
         "--assigned-by-id",
@@ -264,7 +264,7 @@ def main() -> int:
         lead_pipeline = LeadPipeline(
             client,
             LeadPipelineConfig(
-                lead_status_id=args.lead_status_id,
+                lead_status_id="NEW",
                 assigned_by_id=args.assigned_by_id,
                 overwrite_assigned_by_on_update=args.overwrite_assigned_by_on_update,
                 lead_generation_field=args.lead_generation_field,

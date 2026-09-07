@@ -766,6 +766,30 @@ def test_dry_run_reuses_planned_contact_owner_for_same_director_and_bin():
     assert second.requisite_action == "dry_run_reuse_planned_requisite"
 
 
+def test_non_eurasia_enum_failure_reason_still_creates_new_stage():
+    company = {
+        "ID": "601",
+        "TITLE": "ТОО Тест Недра",
+        "ORIGINATOR_ID": "EQAZYNA",
+        "ORIGIN_ID": "123456789012",
+    }
+    previous = {
+        "ID": "77",
+        "STATUS_ID": "JUNK",
+        "STATUS_SEMANTIC_ID": "F",
+        FAILURE_FIELD: "901",
+        "COMPANY_ID": "601",
+        "DATE_MODIFY": "2026-08-05T10:00:00+05:00",
+    }
+    client = FakeClient(company=company, lead=previous)
+
+    result = pipeline(client).process(application("APP-2"), enrichment())
+
+    assert result.status_id == "NEW"
+    assert result.failure_reason is None
+    assert FAILURE_FIELD not in client.created_lead_fields
+
+
 def test_eurasia_failure_reason_label_keeps_failed_stage():
     company = {
         "ID": "601",
@@ -786,9 +810,9 @@ def test_eurasia_failure_reason_label_keeps_failed_stage():
     result = pipeline(client).process(application("APP-2"), enrichment())
 
     assert result.status_id == "JUNK"
-    assert result.status_reason == "existing_eurasia_client_inherited"
-    assert result.failure_reason == EURASIA_REASON
-    assert client.created_lead_fields[FAILURE_FIELD] == EURASIA_REASON
+    assert result.status_reason == "existing_eurasia_client_exception"
+    assert result.failure_reason == EURASIA_REASON_ID
+    assert client.created_lead_fields[FAILURE_FIELD] == EURASIA_REASON_ID
 
 
 def test_eurasia_failure_reason_enum_id_keeps_failed_stage():
@@ -811,7 +835,90 @@ def test_eurasia_failure_reason_enum_id_keeps_failed_stage():
     result = pipeline(client).process(application("APP-2"), enrichment())
 
     assert result.status_id == "JUNK"
-    assert result.status_reason == "existing_eurasia_client_inherited"
+    assert result.status_reason == "existing_eurasia_client_exception"
+    assert result.failure_reason == EURASIA_REASON_ID
+    assert client.created_lead_fields[FAILURE_FIELD] == EURASIA_REASON_ID
+
+
+def test_configured_default_stage_cannot_move_new_application_out_of_new():
+    client = FakeClient()
+
+    result = pipeline(client, lead_status_id="JUNK").process(application("APP-2"), enrichment())
+
+    assert result.status_id == "NEW"
+    assert result.status_reason == "default_new"
+    assert client.created_lead_fields["STATUS_ID"] == "NEW"
+    assert FAILURE_FIELD not in client.created_lead_fields
+
+
+def test_eurasia_exception_uses_canonical_junk_not_arbitrary_old_failed_stage():
+    company = {
+        "ID": "601",
+        "TITLE": "ТОО Тест Недра",
+        "ORIGINATOR_ID": "EQAZYNA",
+        "ORIGIN_ID": "123456789012",
+    }
+    previous = {
+        "ID": "77",
+        "STATUS_ID": "UC_OLD_FAIL",
+        "STATUS_SEMANTIC_ID": "F",
+        FAILURE_FIELD: EURASIA_REASON_ID,
+        "COMPANY_ID": "601",
+        "DATE_MODIFY": "2026-08-05T10:00:00+05:00",
+    }
+    client = FakeClient(company=company, lead=previous)
+
+    result = pipeline(client).process(application("APP-2"), enrichment())
+
+    assert result.status_id == "JUNK"
+    assert client.created_lead_fields["STATUS_ID"] == "JUNK"
+    assert client.created_lead_fields[FAILURE_FIELD] == EURASIA_REASON_ID
+
+
+def test_active_lead_with_stale_eurasia_reason_does_not_trigger_failure():
+    company = {
+        "ID": "601",
+        "TITLE": "ТОО Тест Недра",
+        "ORIGINATOR_ID": "EQAZYNA",
+        "ORIGIN_ID": "123456789012",
+    }
+    previous = {
+        "ID": "77",
+        "STATUS_ID": "IN_PROCESS",
+        "STATUS_SEMANTIC_ID": "",
+        FAILURE_FIELD: EURASIA_REASON_ID,
+        "COMPANY_ID": "601",
+        "DATE_MODIFY": "2026-08-05T10:00:00+05:00",
+    }
+    client = FakeClient(company=company, lead=previous)
+
+    result = pipeline(client).process(application("APP-2"), enrichment())
+
+    assert result.status_id == "NEW"
+    assert result.failure_reason is None
+    assert FAILURE_FIELD not in client.created_lead_fields
+
+
+def test_eurasia_reason_returned_as_single_item_list_is_recognized():
+    company = {
+        "ID": "601",
+        "TITLE": "ТОО Тест Недра",
+        "ORIGINATOR_ID": "EQAZYNA",
+        "ORIGIN_ID": "123456789012",
+    }
+    previous = {
+        "ID": "77",
+        "STATUS_ID": "JUNK",
+        "STATUS_SEMANTIC_ID": "F",
+        FAILURE_FIELD: [EURASIA_REASON_ID],
+        "COMPANY_ID": "601",
+        "DATE_MODIFY": "2026-08-05T10:00:00+05:00",
+    }
+    client = FakeClient(company=company, lead=previous)
+
+    result = pipeline(client).process(application("APP-2"), enrichment())
+
+    assert result.status_id == "JUNK"
     assert result.failure_reason == EURASIA_REASON_ID
     assert client.created_lead_fields[FAILURE_FIELD] == EURASIA_REASON_ID
 

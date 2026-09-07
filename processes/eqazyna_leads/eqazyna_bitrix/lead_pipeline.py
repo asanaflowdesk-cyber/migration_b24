@@ -25,6 +25,8 @@ DEFAULT_COMPANY_ORIGINATOR_ID = "EQAZYNA"
 DEFAULT_REQUISITE_PRESET_ID = "1"
 DEFAULT_FAILURE_REASON_FIELD = "UF_CRM_1785508658316"
 DEFAULT_EXISTING_CLIENT_FAILURE_REASON = "Уже работает с Евразией"
+DEFAULT_NEW_LEAD_STATUS_ID = "NEW"
+DEFAULT_EXISTING_CLIENT_FAILURE_STATUS_ID = "JUNK"
 DEFAULT_MANAGER_IDS = (22, 23, 16, 17, 18, 38, 44, 39, 19, 15)
 
 
@@ -37,13 +39,15 @@ class LeadPipelineConfig:
     director name is available, one linked director contact. The responsible
     manager is inherited only from the director contact card. If that contact
     has no approved responsible manager, a manager is selected randomly among
-    the least-loaded approved managers. Every new application starts in NEW.
-    The only exception is a latest related failed lead with the reason
-    «Уже работает с Евразией»: that failed stage and reason are preserved so an
-    existing Eurasia client is not sent back into new-business processing.
+    the least-loaded approved managers. Every genuinely new application starts
+    in NEW. The only exception is a latest related failed lead with the reason
+    «Уже работает с Евразией»: the new lead is created in JUNK with that reason.
+    No other historical stage or failure reason is inherited.
     """
 
-    lead_status_id: str = "NEW"
+    # Kept for backwards compatibility with older callers. New applications
+    # are forced to NEW by business rule; this value no longer overrides it.
+    lead_status_id: str = DEFAULT_NEW_LEAD_STATUS_ID
     assigned_by_id: str | None = None
     overwrite_assigned_by_on_update: bool = False
     lead_generation_field: str = DEFAULT_LEAD_GENERATION_FIELD
@@ -103,8 +107,11 @@ class LeadPipeline:
         self._run_companies_by_bin: dict[str, dict[str, Any]] = {}
         self._run_contacts_by_key: dict[str, dict[str, Any]] = {}
         self._run_requisites_by_bin: dict[str, dict[str, Any]] = {}
-        self._failed_status_ids: set[str] = {"JUNK"}
-        self._terminal_status_ids: set[str] = {"JUNK", "CONVERTED"}
+        self._failed_status_ids: set[str] = {DEFAULT_EXISTING_CLIENT_FAILURE_STATUS_ID}
+        self._terminal_status_ids: set[str] = {DEFAULT_EXISTING_CLIENT_FAILURE_STATUS_ID, "CONVERTED"}
+        self._lead_fields_meta: dict[str, Any] | None = None
+        self._failure_reason_field_type: str | None = None
+        self._existing_client_failure_reason_encoded_value: str | None = None
         self._existing_client_failure_reason_values: set[str] = {
             self._normalise_label(config.existing_client_failure_reason)
         }
@@ -205,15 +212,22 @@ class LeadPipeline:
         if terminal:
             self._terminal_status_ids = terminal
 
-    def _load_existing_client_failure_reason_values(self) -> None:
-        """Resolve the enum ID for «Уже работает с Евразией».
+    def _get_lead_fields_meta(self) -> dict[str, Any]:
+        if self._lead_fields_meta is None:
+            fields = self.client.get_lead_fields()
+            self._lead_fields_meta = fields if isinstance(fields, dict) else {}
+        return self._lead_fields_meta
 
-        Bitrix24 returns enumeration user fields as option IDs, while tests and
-        legacy data may expose the human-readable label. Keep both forms so the
-        exception is stable across migrated and newly created records.
+    def _load_existing_client_failure_reason_values(self) -> None:
+        """Resolve the target enum value for «Уже работает с Евразией».
+
+        The target field is an enumeration after migration. Existing records
+        normally return the option ID, while old test/legacy records can expose
+        the label. We recognise both, but when creating a new lead we write the
+        target option ID whenever the field is an enumeration.
         """
         try:
-            fields = self.client.get_lead_fields()
+            fields = self._get_lead_fields_meta()
         except Exception as exc:  # noqa: BLE001 - text fallback remains available
             self.validation_warnings.append(
                 "Не удалось прочитать справочник причин неудачи; "
@@ -224,7 +238,15 @@ class LeadPipeline:
 
         field_meta = fields.get(self.config.failure_reason_field)
         if not isinstance(field_meta, dict):
+            self.validation_warnings.append(
+                f"В crm.lead.fields не найдено поле причины {self.config.failure_reason_field}; "
+                "текстовое значение из старых записей будет распознано, но ID списка проверить нельзя."
+            )
             return
+
+        self._failure_reason_field_type = str(
+            field_meta.get("type") or field_meta.get("USER_TYPE_ID") or ""
+        ).strip().casefold() or None
 
         wanted = self._normalise_label(self.config.existing_client_failure_reason)
         for key in ("items", "ITEMS", "list", "LIST", "values", "VALUES"):
@@ -250,9 +272,21 @@ class LeadPipeline:
                 )
                 self._existing_client_failure_reason_values.add(wanted)
                 if option_id not in (None, ""):
+                    encoded = str(option_id).strip()
+                    self._existing_client_failure_reason_encoded_value = encoded
                     self._existing_client_failure_reason_values.add(
-                        self._normalise_label(option_id)
+                        self._normalise_label(encoded)
                     )
+
+        if (
+            self._failure_reason_field_type == "enumeration"
+            and self._existing_client_failure_reason_encoded_value is None
+        ):
+            self.validation_warnings.append(
+                f"В списке {self.config.failure_reason_field} не найдено значение "
+                f"«{self.config.existing_client_failure_reason}». "
+                "Лиды с текстовой исторической причиной будут распознаны, но записать причину в enum без ID нельзя."
+            )
 
     def _load_manager_workloads(self) -> None:
         if not self._manager_ids:
@@ -276,7 +310,7 @@ class LeadPipeline:
         self._manager_loads = loads
 
     def _validate_lead_generation_field(self) -> None:
-        fields = self.client.get_lead_fields()
+        fields = self._get_lead_fields_meta()
         field_meta = fields.get(self.config.lead_generation_field)
         if not isinstance(field_meta, dict):
             raise BitrixError(
@@ -689,26 +723,44 @@ class LeadPipeline:
             and self._is_failed_lead(reference)
             and self._is_existing_eurasia_client(reference)
         ):
-            status_id = str(reference.get("STATUS_ID") or "").strip()
-            if status_id:
-                return (
-                    status_id,
-                    "existing_eurasia_client_inherited",
-                    self._record_failure_reason(reference),
-                    reference,
-                )
+            return (
+                DEFAULT_EXISTING_CLIENT_FAILURE_STATUS_ID,
+                "existing_eurasia_client_exception",
+                self._existing_client_failure_reason_for_write(reference),
+                reference,
+            )
         return (
-            str(self.config.lead_status_id or "NEW"),
+            DEFAULT_NEW_LEAD_STATUS_ID,
             "default_new",
             None,
             reference,
         )
 
     def _is_existing_eurasia_client(self, lead: dict[str, Any]) -> bool:
-        reason = self._record_failure_reason(lead)
-        if not reason:
-            return False
-        return self._normalise_label(reason) in self._existing_client_failure_reason_values
+        return any(
+            self._normalise_label(reason) in self._existing_client_failure_reason_values
+            for reason in self._record_failure_reason_values(lead)
+        )
+
+    def _existing_client_failure_reason_for_write(self, lead: dict[str, Any]) -> str:
+        raw_values = self._record_failure_reason_values(lead)
+        matching = next(
+            (
+                value
+                for value in raw_values
+                if self._normalise_label(value)
+                in self._existing_client_failure_reason_values
+            ),
+            None,
+        )
+        if self._existing_client_failure_reason_encoded_value:
+            return self._existing_client_failure_reason_encoded_value
+        if self._failure_reason_field_type == "enumeration":
+            raise BitrixError(
+                f"Нельзя создать исключение «{self.config.existing_client_failure_reason}»: "
+                f"для enum-поля {self.config.failure_reason_field} не определён ID значения."
+            )
+        return matching or self.config.existing_client_failure_reason
 
     def _is_failed_lead(self, lead: dict[str, Any]) -> bool:
         semantic = str(lead.get("STATUS_SEMANTIC_ID") or "").strip().upper()
@@ -766,12 +818,27 @@ class LeadPipeline:
             return None
         return manager_id
 
+    @staticmethod
+    def _flatten_scalar_values(value: Any) -> list[str]:
+        if isinstance(value, (list, tuple, set)):
+            result: list[str] = []
+            for item in value:
+                result.extend(LeadPipeline._flatten_scalar_values(item))
+            return result
+        if value in (None, ""):
+            return []
+        text = str(value).strip()
+        return [text] if text else []
+
+    def _record_failure_reason_values(self, record: dict[str, Any]) -> list[str]:
+        values = self._flatten_scalar_values(record.get(self.config.failure_reason_field))
+        if values:
+            return values
+        return self._flatten_scalar_values(record.get("STATUS_DESCRIPTION"))
+
     def _record_failure_reason(self, record: dict[str, Any]) -> str | None:
-        for field_name in (self.config.failure_reason_field, "STATUS_DESCRIPTION"):
-            value = str(record.get(field_name) or "").strip()
-            if value:
-                return value
-        return None
+        values = self._record_failure_reason_values(record)
+        return values[0] if values else None
 
     # ---------- company ----------
 
