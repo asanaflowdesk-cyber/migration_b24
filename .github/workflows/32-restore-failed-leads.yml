@@ -1,0 +1,107 @@
+name: 32 | Лиды — вернуть ошибочный провал в Новые
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "dry_run — только показать список; apply — вернуть лиды в NEW"
+        required: true
+        default: dry_run
+        type: choice
+        options: [dry_run, apply]
+      days:
+        description: "За сколько последних дней искать перевод в провал"
+        required: true
+        default: "7"
+        type: string
+      moved_by_id:
+        description: "ID пользователя, который перевёл лиды в провал. Пусто = пользователь webhook"
+        required: false
+        default: ""
+        type: string
+      confirm:
+        description: "Для apply введите RESTORE_FAILED_LEADS"
+        required: false
+        default: ""
+        type: string
+
+concurrency:
+  group: restore-failed-leads
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  NODE_USE_SYSTEM_CA: "1"
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: "utf-8"
+
+jobs:
+  restore-failed-leads:
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: cmd
+        working-directory: processes/lead_recovery
+
+    steps:
+      - name: Получить код репозитория
+        uses: actions/checkout@v5
+
+      - name: Найти Python и создать локальное окружение
+        run: call ..\..\scripts\prepare-python.cmd
+
+      - name: Установить зависимости
+        env:
+          CUSTOM_PIP_INDEX_URL: ${{ vars.PIP_INDEX_URL }}
+        run: |
+          if not "%CUSTOM_PIP_INDEX_URL%"=="" set "PIP_INDEX_URL=%CUSTOM_PIP_INDEX_URL%"
+          ".venv\Scripts\python.exe" -m pip install -r requirements.txt
+
+      - name: Проверить код
+        env:
+          PYTHONPATH: ${{ github.workspace }};${{ github.workspace }}\processes\lead_recovery
+        run: |
+          chcp 65001 >nul
+          ".venv\Scripts\python.exe" -m pytest -q tests
+          if errorlevel 1 exit /b 1
+          ".venv\Scripts\python.exe" recover_failed_leads.py --help >nul
+
+      - name: Проверить подтверждение боевого запуска
+        if: ${{ inputs.mode == 'apply' && inputs.confirm != 'RESTORE_FAILED_LEADS' }}
+        run: |
+          echo Для записи в Bitrix24 введите RESTORE_FAILED_LEADS
+          exit /b 1
+
+      - name: Найти и вернуть лиды
+        env:
+          PYTHONPATH: ${{ github.workspace }};${{ github.workspace }}\processes\lead_recovery
+          TARGET_BITRIX_WEBHOOK_URL: ${{ secrets.TARGET_BITRIX_WEBHOOK_URL }}
+          BITRIX_REQUEST_TIMEOUT: ${{ vars.BITRIX_REQUEST_TIMEOUT || '45' }}
+          BITRIX_LEAD_FAILURE_REASON_FIELD: "UF_CRM_1785508658316"
+        run: |
+          chcp 65001 >nul
+          if "%TARGET_BITRIX_WEBHOOK_URL%"=="" (
+            echo Не задан secret TARGET_BITRIX_WEBHOOK_URL
+            exit /b 1
+          )
+          if not exist output mkdir output
+          if "${{ inputs.mode }}"=="apply" (
+            ".venv\Scripts\python.exe" -u recover_failed_leads.py --apply --days "${{ inputs.days }}" --moved-by-id "${{ inputs.moved_by_id }}" --output-dir output
+          ) else (
+            ".venv\Scripts\python.exe" -u recover_failed_leads.py --days "${{ inputs.days }}" --moved-by-id "${{ inputs.moved_by_id }}" --output-dir output
+          )
+          if errorlevel 1 exit /b 1
+          type output\lead_recovery_summary.json
+          type output\lead_recovery_journal.txt
+
+      - name: Загрузить отчет
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: 32-restore-failed-leads-${{ github.run_number }}
+          path: processes/lead_recovery/output/
+          if-no-files-found: warn
+          retention-days: 14
