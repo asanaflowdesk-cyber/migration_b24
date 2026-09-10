@@ -1,3 +1,12 @@
+## 2026-09-10 — v7: возврат к рабочей модели Python на self-hosted Windows
+
+- За эталон взят архив, в котором Windows self-hosted runner уже работал с локально установленным Python 3.12.
+- `scripts/prepare-python.cmd` восстановлен на прямой путь `C:\\Users\\Alyona.Sachyova\\AppData\\Local\\Programs\\Python\\Python312\\python.exe` и только создаёт локальную `.venv`.
+- Из всех Windows self-hosted workflow удалён `actions/setup-python`; из потока 30 удалён PowerShell bootstrap.
+- `scripts/bootstrap-python.ps1` удалён: workflow больше не скачивает и не устанавливает Python на runner.
+- Добавлена регрессионная проверка: Windows self-hosted workflow не может снова получить `setup-python`, PowerShell bootstrap или другой путь Python.
+- GitHub-hosted Linux workflow `00-ci.yml` и `01-cloud-export.yml` не относятся к Windows runner и сохраняют собственный `actions/setup-python`.
+
 ## 2026-09-08 — Поток 32 защищён от роботов стадии NEW
 
 - Убрана зависимость от `user.current`: ID пользователя берётся из input `moved_by_id` или repository variable `LEAD_RECOVERY_MOVED_BY_ID`; без ID поток останавливается до записи.

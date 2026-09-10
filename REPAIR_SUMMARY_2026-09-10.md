@@ -65,19 +65,15 @@
 - company owner sync запускается напрямую из репозитория без ручной настройки `PYTHONPATH`;
 - исходный dump повторно проверен: manifest 53/53, source integrity OK, 907 уникальных адресов, 589 переносимых задач.
 
-### Additional runner fix after live GitHub Actions validation
+### Final Windows self-hosted runner correction
 
-A Windows self-hosted run exposed an environment dependency that offline tests could not reproduce: the runner service account had no Python 3.11+ on `PATH`. The Windows workflows previously called `scripts/prepare-python.cmd` directly and therefore stopped before tests or migration logic ran.
+Live validation plus comparison with the known-working archive showed that the previous repair changed the execution model unnecessarily. The working runner already has Python 3.12 installed at `C:\\Users\\Alyona.Sachyova\\AppData\\Local\\Programs\\Python\\Python312\\python.exe`.
 
-Corrective action:
-- added pinned `actions/setup-python` (Python 3.12 x64) to every Windows self-hosted workflow before `prepare-python.cmd`;
-- changed `prepare-python.cmd` to consume the interpreter provisioned by the action rather than searching user-profile installations;
-- preserved `PYTHON_EXE` only as a manual-run override;
-- recreate `.venv` on each job so a persistent self-hosted workspace cannot reuse an environment from an older run.
+Final state:
+- Windows self-hosted workflows do not call `actions/setup-python`;
+- workflow 30 does not call PowerShell;
+- `scripts/bootstrap-python.ps1` is removed;
+- `scripts/prepare-python.cmd` uses the known workstation Python and creates only the process-local `.venv`;
+- a quality guard fails if setup/bootstrap logic is reintroduced into Windows self-hosted workflows.
 
-## GPO / e-Qazyna runner fix
-
-For workflow `30-eqazyna-leads.yml`, the Python interpreter is now passed explicitly from `actions/setup-python` via its `python-path` output to `PYTHON_EXE`. This removes the dependency on PATH propagation between steps on persistent Windows self-hosted runners. `prepare-python.cmd` also falls back to `pythonLocation` and `Python3_ROOT_DIR` before consulting PATH.
-
-Validation: e-Qazyna test suite `42 passed`; workflow YAML parsed successfully.
-
+The two GitHub-hosted Linux workflows (`00-ci.yml` and `01-cloud-export.yml`) keep `actions/setup-python`, because they do not run on the Windows workstation.

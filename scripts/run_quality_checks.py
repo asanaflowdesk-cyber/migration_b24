@@ -47,50 +47,48 @@ def run_suite(name: str, cwd: Path) -> None:
 
 
 
-def check_powershell_interpolation() -> None:
-    """Catch PowerShell's `$name:` parser trap inside expandable strings.
 
-    Scope-qualified variables such as $env:PATH are valid. Other `$name:`
-    sequences inside double-quoted strings are parsed as scoped variables and
-    can fail before the script executes.
+def check_windows_runner_python_contract() -> None:
+    """Keep Windows self-hosted jobs on the workstation's existing Python.
+
+    These jobs must not install/bootstrap Python through GitHub Actions or
+    PowerShell. They create only a job-local .venv via scripts/prepare-python.cmd.
     """
-    allowed_scopes = {"env", "global", "script", "local", "private", "using"}
-    pattern = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*):")
     failures: list[str] = []
-    for path in ROOT.rglob("*.ps1"):
-        for lineno, line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1):
-            # Only expandable string content is relevant to this parser pitfall.
-            if '"' not in line:
-                continue
-            for match in pattern.finditer(line):
-                if match.group(1).lower() not in allowed_scopes:
-                    failures.append(f"{path.relative_to(ROOT)}:{lineno}: {match.group(0)}")
-    if failures:
-        raise RuntimeError("Unsafe PowerShell variable interpolation found:\n" + "\n".join(failures))
+    workflows = ROOT / ".github" / "workflows"
+    for path in sorted(workflows.glob("*.yml")):
+        text = path.read_text(encoding="utf-8")
+        if "runs-on: [self-hosted, Windows, X64]" not in text:
+            continue
+        forbidden = {
+            "actions/setup-python": "actions/setup-python",
+            "bootstrap-python": "bootstrap-python",
+            "shell: powershell": "PowerShell shell",
+        }
+        for needle, label in forbidden.items():
+            if needle in text:
+                failures.append(f"{path.relative_to(ROOT)}: forbidden {label}")
+        if "prepare-python.cmd" not in text:
+            failures.append(f"{path.relative_to(ROOT)}: prepare-python.cmd is missing")
 
+    prepare = ROOT / "scripts" / "prepare-python.cmd"
+    prepare_text = prepare.read_text(encoding="utf-8-sig")
+    expected = r"C:\Users\Alyona.Sachyova\AppData\Local\Programs\Python\Python312\python.exe"
+    if expected not in prepare_text:
+        failures.append("scripts/prepare-python.cmd: workstation Python 3.12 path changed")
+    if "powershell" in prepare_text.lower() or "bootstrap-python" in prepare_text.lower():
+        failures.append("scripts/prepare-python.cmd: bootstrap/PowerShell must not be used")
+    if (ROOT / "scripts" / "bootstrap-python.ps1").exists():
+        failures.append("scripts/bootstrap-python.ps1 must not exist")
 
-def check_powershell_home_assignment() -> None:
-    """Prevent assignments to PowerShell's read-only automatic $HOME variable."""
-    pattern = re.compile(r"^\s*\$home\s*=", re.IGNORECASE)
-    failures: list[str] = []
-    for path in ROOT.rglob("*.ps1"):
-        for lineno, line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1):
-            if pattern.search(line):
-                failures.append(f"{path.relative_to(ROOT)}:{lineno}: {line.strip()}")
     if failures:
-        raise RuntimeError(
-            "Assignment to read-only PowerShell automatic variable $HOME found:\n"
-            + "\n".join(failures)
-        )
+        raise RuntimeError("Windows runner Python contract violated:\n" + "\n".join(failures))
 
 
 def main() -> int:
-    print("=== PowerShell interpolation check ===", flush=True)
-    check_powershell_interpolation()
-    print("PowerShell interpolation check: OK", flush=True)
-    print("=== PowerShell automatic-variable check ===", flush=True)
-    check_powershell_home_assignment()
-    print("PowerShell automatic-variable check: OK", flush=True)
+    print("=== Windows self-hosted Python contract ===", flush=True)
+    check_windows_runner_python_contract()
+    print("Windows self-hosted Python contract: OK", flush=True)
     print("=== compileall ===", flush=True)
     if not compileall.compile_dir(ROOT / "common", quiet=1):
         return 1

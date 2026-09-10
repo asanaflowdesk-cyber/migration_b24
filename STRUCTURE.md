@@ -48,7 +48,7 @@ processes/lead_recovery/      восстановление ошибочно пр
 processes/user_registration/  регистрация пользователей из Excel
 
 scripts/
-  prepare-python.cmd          создание локальной .venv из Python 3.12, установленного workflow через setup-python
+  prepare-python.cmd          создание локальной .venv из Python 3.12, уже установленного на self-hosted Windows runner
   run_quality_checks.py       compileall + все 8 тестовых пакетов
 
 requirements-ci.txt           единый точный набор прямых CI-зависимостей
