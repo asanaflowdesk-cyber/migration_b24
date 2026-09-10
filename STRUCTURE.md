@@ -2,48 +2,60 @@
 
 ```text
 .github/workflows/
+  00-ci.yml                   автоматический read-only CI на push/PR/manual
+  01-cloud-export.yml         read-only экспорт облачного snapshot
   10-migration-plan.yml       проверка дампа, коробки и конфигурации
-  11-migration-users.yml      только сопоставление существующих пользователей
+  11-migration-users.yml      сопоставление существующих пользователей
   12-migration-import.yml     dry-run и реальный перенос
-  13-migration-verify.yml     итоговая сверка по маркерам и картам ID
-  20-user-registration.yml    отдельный инструмент; сейчас не используется
+  13-migration-verify.yml     итоговая field/relation сверка
+  20-user-registration.yml    отдельная регистрация пользователей из Excel
   30-eqazyna-leads.yml        постоянный парсер e-Qazyna → лиды коробки
+  31-company-owner-sync.yml   ответственный компании по руководителю той же компании
+  32-restore-failed-leads.yml контролируемый возврат ошибочно закрытых лидов
+  40-flowdesk.yml             FlowDesk event → идемпотентная задача
+  50-create-departments.yml   отдельное создание подразделений
 
 common/
-  bitrix.py                   общий REST-клиент миграции и регистрации
+  bitrix.py                   общий REST-клиент: fail-closed pagination, safe read retry
+  security.py                 санитизация webhook/PII и защита CSV/Excel literals
+  naming.py                   нормализация наименований CRM
 
 processes/cloud_to_box/
   input/
-    bitrix24_dump_20260805_072425.zip   зафиксированный разовый дамп облака
+    bitrix24_dump_20260805_072425.zip   immutable source snapshot
+    bitrix24_export.xlsx                человекочитаемая сверка
   config/
-    migration.json            маршрутизация стадий, поля и справочники коробки
+    migration.json            маршрутизация, поля, source integrity policy
     users.csv                 ручные соответствия пользователей
-    source_plan.json          контрольные количества по дампу
+    source_plan.json          raw/expected counts и approved exclusions
   src/
-    dump_reader.py            чтение JSON из ZIP
-    migration.py              основная логика переноса
-    file_transfer.py          скачивание и загрузка вложений
-    reporting.py              отчеты и карты ID
+    dump_reader.py            чтение ZIP + проверка manifest/SHA-256/counts
+    migration.py              preflight, mapping, import, additive relations, verify
+    file_transfer.py          перенос вложений с SHA-256 именованием
+    live_source.py            live enrichment только когда явно выбран/нужен
+    reporting.py              отчёты, redaction, ID maps и state identity
   tests/
-    test_migration.py         автономные проверки дампа и правил
-  migrate.py                  командная строка для workflow
+    test_migration.py         дамп, failure policy, relations, verify, workflows
+  migrate.py                  CLI для workflow
+  run_from_env.py             безопасная сборка workflow inputs из env
 
-processes/eqazyna_leads/
-  eqazyna_bitrix/
-    main.py                   последовательность обработки
-    scraper.py                чтение реестра e-Qazyna
-    egov_client.py            необязательное обогащение через data.egov.kz
-    bitrix_client.py          REST-клиент коробки и поиск старых мигрированных лидов
-    lead_pipeline.py          один БИН → один основной лид
-    formatter.py              текст карточки и таймлайна
-    exporter.py               Excel/JSON журнала запуска
-  scripts/
-    run_from_env.py           безопасная сборка аргументов для Windows cmd
-    check_run_result.py       итоговая проверка журнала
-  tests/                      автономные тесты парсера
+processes/cloud_export/       read-only экспорт cloud snapshot
+processes/company_owner_sync/ сверка владельца компании по director contact этой компании
+processes/departments/        отдельное создание подразделений
+processes/eqazyna_leads/      e-Qazyna parser
+processes/flowdesk/           FlowDesk → задачи с event deduplication marker
+processes/lead_recovery/      восстановление ошибочно проваленных лидов
+processes/user_registration/  регистрация пользователей из Excel
 
-processes/user_registration/  отдельный процесс регистрации пользователей
-scripts/prepare-python.cmd     подготовка Python на Windows runner
+scripts/
+  prepare-python.cmd          создание локальной .venv из Python 3.12, установленного workflow через setup-python
+  run_quality_checks.py       compileall + все 8 тестовых пакетов
+
+requirements-ci.txt           единый точный набор прямых CI-зависимостей
 ```
 
-Папки `output/` создаются только во время выполнения. Миграционный поток 12 сохраняет карты ID в GitHub Actions Cache. Парсер e-Qazyna не использует миграционные карты и не изменяет файлы разовой миграции.
+Папки `output/`, `.venv`, cache/bytecode создаются только во время выполнения и не должны попадать в поставку.
+
+Workflow 12 не восстанавливает общий «последний» GitHub Actions Cache. Идемпотентность повторного запуска строится на migration markers и reconciliation целевого портала; сохранённые ID-карты принимаются только с совпадающим state identity.
+
+Входной snapshot содержит ПДн и включён в handoff ZIP только для самодостаточности. `.gitignore` запрещает случайный новый commit ZIP/XLSX/input-файлов.

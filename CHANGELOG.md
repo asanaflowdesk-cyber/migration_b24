@@ -84,3 +84,10 @@
 - Убран `working-directory: processes/lead_recovery` из job defaults: self-hosted Windows runner больше не пытается стартовать `cmd.exe` в несуществующем каталоге до выполнения шага.
 - Workflow 32 запускается из корня репозитория и использует явные пути `processes\lead_recovery\...`.
 - Добавлена ранняя проверка наличия `recover_failed_leads.py` после checkout с диагностикой содержимого репозитория.
+
+## 2026-09-10 — self-hosted Windows Python bootstrap fix
+
+- All Windows self-hosted workflows now run pinned `actions/setup-python` with Python 3.12 x64 before creating `.venv`.
+- `scripts/prepare-python.cmd` now uses the interpreter placed on `PATH` by `setup-python` instead of assuming Python is preinstalled for the runner service account.
+- Manual execution remains supported through `PYTHON_EXE`.
+- Persistent `.venv` directories are removed before creating a job-local environment.
