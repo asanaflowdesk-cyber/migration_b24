@@ -12,7 +12,7 @@
   30-eqazyna-leads.yml        постоянный парсер e-Qazyna → лиды коробки
   31-company-owner-sync.yml   ответственный компании по руководителю той же компании
   32-restore-failed-leads.yml контролируемый возврат ошибочно закрытых лидов
-  33-eqazyna-status-sync.yml  сверка статусов e-Qazyna по точному номеру заявки → стадии лидов
+  33-eqazyna-status-sync.yml  сверка 1 лид = 1 заявка по номеру из TITLE → стадия + причина срыва
   40-flowdesk.yml             FlowDesk event → идемпотентная задача
   50-create-departments.yml   отдельное создание подразделений
 
@@ -44,7 +44,7 @@ processes/cloud_export/       read-only экспорт cloud snapshot
 processes/company_owner_sync/ сверка владельца компании по director contact этой компании
 processes/departments/        отдельное создание подразделений
 processes/eqazyna_leads/      e-Qazyna parser
-processes/eqazyna_status_sync/ точная сверка статуса уже загруженных заявок e-Qazyna и стадий лидов
+processes/eqazyna_status_sync/ точная сверка статуса заявки e-Qazyna: номер из TITLE, стадия лида + UF_CRM_1785508658316
 processes/flowdesk/           FlowDesk → задачи с event deduplication marker
 processes/lead_recovery/      восстановление ошибочно проваленных лидов
 processes/user_registration/  регистрация пользователей из Excel

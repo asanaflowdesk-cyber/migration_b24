@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from eqazyna_bitrix.models import Application
 from sync_eqazyna_statuses import (
+    DEFAULT_FAILURE_REASON_FIELD,
     StatusSyncError,
-    extract_application_numbers,
+    extract_application_number,
     map_external_status,
     resolve_lead_stage,
     sync_statuses,
@@ -28,9 +29,15 @@ class FakeClient:
 
     def list_all(self, method, payload):
         assert method == "crm.lead.list"
-        originator = payload["filter"]["ORIGINATOR_ID"]
-        self.list_filters.append(originator)
-        return [row for row in self.leads if row.get("ORIGINATOR_ID") == originator]
+        filter_ = payload.get("filter", {})
+        self.list_filters.append(dict(filter_))
+        if "ORIGINATOR_ID" in filter_:
+            originator = filter_["ORIGINATOR_ID"]
+            return [row for row in self.leads if row.get("ORIGINATOR_ID") == originator]
+        if "%TITLE" in filter_:
+            needle = str(filter_["%TITLE"]).casefold()
+            return [row for row in self.leads if needle in str(row.get("TITLE") or "").casefold()]
+        raise AssertionError(f"unexpected filter: {filter_}")
 
     def update_lead(self, lead_id, fields):
         self.updated.append((str(lead_id), dict(fields)))
@@ -57,15 +64,35 @@ class FakeScraper:
         )
 
 
-def lead(lead_id, doc_number, status_id="NEW", *, originator="EQAZYNA_LEAD"):
+def lead(
+    lead_id,
+    doc_number,
+    status_id="NEW",
+    *,
+    originator="EQAZYNA_LEAD",
+    reason=None,
+    title=None,
+):
     return {
         "ID": str(lead_id),
-        "TITLE": f"ТОО Test. e-Qazyna № {doc_number}",
-        "COMMENTS": f"Номер заявки: {doc_number}",
+        "TITLE": title if title is not None else f"ТОО Test. e-Qazyna № {doc_number}",
+        "COMMENTS": "COMMENTS MUST NOT BE USED FOR THE APPLICATION NUMBER",
         "STATUS_ID": status_id,
         "ORIGINATOR_ID": originator,
-        "ORIGIN_ID": doc_number,
+        "ORIGIN_ID": "ORIGIN_ID_MUST_NOT_BE_USED",
+        DEFAULT_FAILURE_REASON_FIELD: reason,
     }
+
+
+def run_sync(client, scraper, mode="apply"):
+    return sync_statuses(
+        client=client,
+        scraper=scraper,
+        mode=mode,
+        doc_type="Заявка на разведку ТПИ",
+        failure_stage_name="Провал",
+        potential_stage_name="Потенциальные сделки",
+    )
 
 
 def test_external_status_mapping():
@@ -77,26 +104,23 @@ def test_external_status_mapping():
     assert map_external_status("Завершено") is None
 
 
-def test_extract_application_number_from_canonical_origin():
-    assert extract_application_numbers(lead(1, "47408-NEA")) == ["47408-NEA"]
+def test_application_number_is_everything_after_number_marker_in_title():
+    row = lead(1, "ignored", title="ТОО Конор Н.А. e-Qazyna № 49667-NEA")
+    assert extract_application_number(row) == "49667-NEA"
 
 
-def test_extract_application_number_from_legacy_composite_origin():
+def test_application_number_is_not_read_from_origin_or_comments():
     row = {
-        "ORIGIN_ID": "eQazyna|47408-NEA|123456789012",
-        "TITLE": "Legacy lead",
-        "COMMENTS": "",
+        "TITLE": "ТОО Test без номера в заголовке",
+        "ORIGIN_ID": "47408-NEA",
+        "COMMENTS": "Номер заявки: 47408-NEA",
     }
-    assert extract_application_numbers(row) == ["47408-NEA"]
+    assert extract_application_number(row) is None
 
 
-def test_extract_multiple_application_numbers_is_detectable():
-    row = {
-        "ORIGIN_ID": "123456789012",
-        "TITLE": "Old consolidated",
-        "COMMENTS": "Номер заявки: 47408-NEA\nНомер заявки: 47409-NEA",
-    }
-    assert extract_application_numbers(row) == ["47408-NEA", "47409-NEA"]
+def test_one_lead_one_application_no_regex_split_of_title_suffix():
+    row = lead(1, "ignored", title="ТОО Test. e-Qazyna № ABC/2026 77-NEA")
+    assert extract_application_number(row) == "ABC/2026 77-NEA"
 
 
 def test_resolve_potential_stage_uses_singular_alias():
@@ -118,120 +142,135 @@ def test_resolve_missing_stage_fails_closed():
         raise AssertionError("missing stage must fail")
 
 
-def test_dry_run_plans_failure_and_potential_without_writing():
+def test_apply_maps_all_four_statuses_to_stage_and_failure_reason_enum():
     client = FakeClient([
         lead(1, "47408-NEA"),
         lead(2, "47409-NEA"),
         lead(3, "47410-NEA"),
-    ])
-    scraper = FakeScraper(
-        {
-            "47408-NEA": "Отозвано",
-            "47409-NEA": "Выдана лицензия",
-            "47410-NEA": "Принято",
-        }
-    )
-
-    summary, rows = sync_statuses(
-        client=client,
-        scraper=scraper,
-        mode="dry_run",
-        doc_type="Заявка на разведку ТПИ",
-        failure_stage_name="Провал",
-        potential_stage_name="Потенциальные сделки",
-    )
-
-    assert summary.changes_planned == 2
-    assert summary.no_rule == 1
-    assert summary.changes_applied == 0
-    assert client.updated == []
-    assert [row.action for row in rows] == [
-        "would_update",
-        "would_update",
-        "no_change_for_external_status",
-    ]
-
-
-def test_apply_updates_exact_target_stages():
-    client = FakeClient([
-        lead(1, "47408-NEA"),
-        lead(2, "47409-NEA"),
+        lead(4, "47411-NEA"),
     ])
     scraper = FakeScraper(
         {
             "47408-NEA": "Аннулировано",
-            "47409-NEA": "Выдана лицензия",
+            "47409-NEA": "Отозвано",
+            "47410-NEA": "Отклонено",
+            "47411-NEA": "Выдана лицензия",
         }
     )
 
-    summary, rows = sync_statuses(
-        client=client,
-        scraper=scraper,
-        mode="apply",
-        doc_type="Заявка на разведку ТПИ",
-        failure_stage_name="Провал",
-        potential_stage_name="Потенциальные сделки",
-    )
+    summary, rows = run_sync(client, scraper)
 
-    assert summary.changes_applied == 2
+    assert summary.changes_applied == 4
     assert client.updated == [
-        ("1", {"STATUS_ID": "JUNK"}),
-        ("2", {"STATUS_ID": "UC_POTENTIAL"}),
+        ("1", {"STATUS_ID": "JUNK", DEFAULT_FAILURE_REASON_FIELD: "66"}),
+        ("2", {"STATUS_ID": "JUNK", DEFAULT_FAILURE_REASON_FIELD: "67"}),
+        ("3", {"STATUS_ID": "JUNK", DEFAULT_FAILURE_REASON_FIELD: "68"}),
+        ("4", {"STATUS_ID": "UC_POTENTIAL", DEFAULT_FAILURE_REASON_FIELD: "69"}),
     ]
-    assert [row.action for row in rows] == ["updated", "updated"]
+    assert [row.target_failure_reason_name for row in rows] == [
+        "Заявка аннулирована на сайте",
+        "Заявка отменена на сайте",
+        "Заявка отклонена на сайте",
+        "По заявке уже выдана лицензия",
+    ]
 
 
-def test_same_target_stage_is_not_rewritten():
-    client = FakeClient([lead(1, "47408-NEA", status_id="JUNK")])
+def test_correct_stage_but_missing_reason_is_still_updated():
+    client = FakeClient([lead(1, "47408-NEA", status_id="JUNK", reason=None)])
     scraper = FakeScraper({"47408-NEA": "Отклонено"})
 
-    summary, rows = sync_statuses(
-        client=client,
-        scraper=scraper,
-        mode="apply",
-        doc_type="Заявка на разведку ТПИ",
-        failure_stage_name="Провал",
-        potential_stage_name="Потенциальные сделки",
-    )
+    summary, rows = run_sync(client, scraper)
+
+    assert summary.changes_applied == 1
+    assert client.updated == [
+        ("1", {"STATUS_ID": "JUNK", DEFAULT_FAILURE_REASON_FIELD: "68"})
+    ]
+    assert rows[0].action == "updated"
+
+
+def test_correct_reason_but_wrong_stage_is_still_updated():
+    client = FakeClient([lead(1, "47408-NEA", status_id="NEW", reason="69")])
+    scraper = FakeScraper({"47408-NEA": "Выдана лицензия"})
+
+    summary, rows = run_sync(client, scraper)
+
+    assert summary.changes_applied == 1
+    assert client.updated == [
+        ("1", {"STATUS_ID": "UC_POTENTIAL", DEFAULT_FAILURE_REASON_FIELD: "69"})
+    ]
+    assert rows[0].action == "updated"
+
+
+def test_stage_and_reason_already_correct_are_not_rewritten():
+    client = FakeClient([lead(1, "47408-NEA", status_id="JUNK", reason="68")])
+    scraper = FakeScraper({"47408-NEA": "Отклонено"})
+
+    summary, rows = run_sync(client, scraper)
 
     assert summary.already_in_target_stage == 1
     assert client.updated == []
-    assert rows[0].action == "already_in_target_stage"
+    assert rows[0].action == "already_synced"
 
 
-def test_missing_application_does_not_change_lead():
+def test_dry_run_shows_stage_and_reason_without_writing():
+    client = FakeClient([lead(1, "47408-NEA")])
+    scraper = FakeScraper({"47408-NEA": "Отозвано"})
+
+    summary, rows = run_sync(client, scraper, mode="dry_run")
+
+    assert summary.changes_planned == 1
+    assert client.updated == []
+    assert rows[0].target_status_id == "JUNK"
+    assert rows[0].target_failure_reason_id == "67"
+    assert rows[0].action == "would_update"
+
+
+def test_unmapped_external_status_changes_nothing():
+    client = FakeClient([lead(1, "47408-NEA")])
+    scraper = FakeScraper({"47408-NEA": "Принято"})
+
+    summary, rows = run_sync(client, scraper)
+
+    assert summary.no_rule == 1
+    assert client.updated == []
+    assert rows[0].action == "no_change_for_external_status"
+
+
+def test_missing_application_changes_nothing():
     client = FakeClient([lead(1, "47408-NEA")])
     scraper = FakeScraper({})
 
-    summary, rows = sync_statuses(
-        client=client,
-        scraper=scraper,
-        mode="apply",
-        doc_type="Заявка на разведку ТПИ",
-        failure_stage_name="Провал",
-        potential_stage_name="Потенциальные сделки",
-    )
+    summary, rows = run_sync(client, scraper)
 
     assert summary.application_not_found == 1
     assert client.updated == []
     assert rows[0].action == "application_not_found"
 
 
-def test_duplicate_application_number_uses_one_eqazyna_lookup():
+def test_lead_without_title_number_is_not_looked_up():
     client = FakeClient([
-        lead(1, "47408-NEA"),
-        lead(2, "47408-NEA", originator="EQAZYNA"),
+        lead(
+            1,
+            "47408-NEA",
+            title="ТОО Test. e-Qazyna без символа номера",
+        )
     ])
-    scraper = FakeScraper({"47408-NEA": "Отозвано"})
+    scraper = FakeScraper({"47408-NEA": "Отклонено"})
 
-    summary, _ = sync_statuses(
-        client=client,
-        scraper=scraper,
-        mode="dry_run",
-        doc_type="Заявка на разведку ТПИ",
-        failure_stage_name="Провал",
-        potential_stage_name="Потенциальные сделки",
-    )
+    summary, rows = run_sync(client, scraper)
 
-    assert summary.leads_discovered == 2
+    assert summary.leads_without_title_number == 1
+    assert scraper.calls == []
+    assert client.updated == []
+    assert rows[0].action == "skipped_no_application_number"
+
+
+def test_title_search_recovers_eqazyna_lead_without_originator_marker():
+    row = lead(1, "47408-NEA", originator="")
+    client = FakeClient([row])
+    scraper = FakeScraper({"47408-NEA": "Отклонено"})
+
+    summary, _ = run_sync(client, scraper, mode="dry_run")
+
+    assert summary.leads_discovered == 1
     assert scraper.calls == [("47408-NEA", "Заявка на разведку ТПИ")]

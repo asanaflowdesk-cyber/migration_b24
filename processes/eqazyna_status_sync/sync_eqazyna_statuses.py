@@ -18,11 +18,35 @@ DEFAULT_DOC_TYPE = "Заявка на разведку ТПИ"
 DEFAULT_FAILURE_STAGE = "Провал"
 DEFAULT_POTENTIAL_STAGE = "Потенциальные сделки"
 DEFAULT_ORIGINATORS = ("EQAZYNA_LEAD", "EQAZYNA")
-FAILURE_EXTERNAL_STATUSES = {"отклонено", "отозвано", "аннулировано"}
-POTENTIAL_EXTERNAL_STATUSES = {"выдана лицензия"}
+DEFAULT_FAILURE_REASON_FIELD = "UF_CRM_1785508658316"
 
-DOC_NUMBER_RE = re.compile(r"\b\d{3,}-[A-ZА-ЯЁ0-9]+\b", re.IGNORECASE)
-COMPOSITE_ORIGIN_RE = re.compile(r"^eQazyna\|([^|]+)\|", re.IGNORECASE)
+# The enum IDs below are the actual values of the Bitrix24 field
+# UF_CRM_1785508658316 supplied for this portal.  The external e-Qazyna status
+# determines both the CRM stage and the value written to this field.
+STATUS_RULES: dict[str, dict[str, str]] = {
+    "аннулировано": {
+        "stage": "failure",
+        "reason_id": "66",
+        "reason_name": "Заявка аннулирована на сайте",
+    },
+    "отозвано": {
+        "stage": "failure",
+        "reason_id": "67",
+        "reason_name": "Заявка отменена на сайте",
+    },
+    "отклонено": {
+        "stage": "failure",
+        "reason_id": "68",
+        "reason_name": "Заявка отклонена на сайте",
+    },
+    "выдана лицензия": {
+        "stage": "potential",
+        "reason_id": "69",
+        "reason_name": "По заявке уже выдана лицензия",
+    },
+}
+
+TITLE_NUMBER_MARKER = "№ "
 
 
 @dataclass(slots=True)
@@ -34,6 +58,9 @@ class SyncRow:
     old_status_name: str | None
     target_status_id: str | None
     target_status_name: str | None
+    old_failure_reason: str | None
+    target_failure_reason_id: str | None
+    target_failure_reason_name: str | None
     action: str
     error: str | None = None
 
@@ -49,7 +76,7 @@ class SyncSummary:
     changes_planned: int = 0
     changes_applied: int = 0
     application_not_found: int = 0
-    ambiguous_application_number: int = 0
+    leads_without_title_number: int = 0
     errors: int = 0
     failure_stage_id: str | None = None
     failure_stage_name: str | None = None
@@ -108,36 +135,24 @@ def resolve_lead_stage(
 
 def map_external_status(eqazyna_status: str) -> str | None:
     key = normalise(eqazyna_status)
-    if key in FAILURE_EXTERNAL_STATUSES:
-        return "failure"
-    if key in POTENTIAL_EXTERNAL_STATUSES:
-        return "potential"
-    return None
+    rule = STATUS_RULES.get(key)
+    return rule["stage"] if rule else None
 
 
-def extract_application_numbers(lead: dict[str, Any]) -> list[str]:
-    numbers: list[str] = []
+def extract_application_number(lead: dict[str, Any]) -> str | None:
+    """Return the one e-Qazyna application number stored in the lead title.
 
-    origin_id = str(lead.get("ORIGIN_ID") or "").strip()
-    if origin_id:
-        composite = COMPOSITE_ORIGIN_RE.match(origin_id)
-        if composite:
-            numbers.append(composite.group(1).strip())
-        elif DOC_NUMBER_RE.fullmatch(origin_id):
-            numbers.append(origin_id)
-
-    for field in ("TITLE", "COMMENTS"):
-        text = str(lead.get(field) or "")
-        numbers.extend(match.group(0) for match in DOC_NUMBER_RE.finditer(text))
-
-    result: list[str] = []
-    seen: set[str] = set()
-    for number in numbers:
-        cleaned = number.strip().upper()
-        if cleaned and cleaned not in seen:
-            seen.add(cleaned)
-            result.append(cleaned)
-    return result
+    Business rule: one lead is always one application.  The application number
+    is not reconstructed from ORIGIN_ID/comments and is not searched with a
+    loose regex.  Everything after the literal ``№ `` marker in TITLE is the
+    application number.
+    """
+    title = str(lead.get("TITLE") or "")
+    marker_index = title.rfind(TITLE_NUMBER_MARKER)
+    if marker_index < 0:
+        return None
+    number = title[marker_index + len(TITLE_NUMBER_MARKER) :].strip()
+    return number or None
 
 
 def list_eqazyna_leads(client: BitrixClient, originators: Iterable[str]) -> list[dict[str, Any]]:
@@ -149,6 +164,7 @@ def list_eqazyna_leads(client: BitrixClient, originators: Iterable[str]) -> list
         "STATUS_SEMANTIC_ID",
         "ORIGINATOR_ID",
         "ORIGIN_ID",
+        DEFAULT_FAILURE_REASON_FIELD,
     ]
     by_id: dict[str, dict[str, Any]] = {}
     for originator in originators:
@@ -167,7 +183,43 @@ def list_eqazyna_leads(client: BitrixClient, originators: Iterable[str]) -> list
             lead_id = str(row.get("ID") or "").strip()
             if lead_id:
                 by_id[lead_id] = row
+    # Also recover migrated/manual e-Qazyna cards by their title.  The title is
+    # the source of truth for the application number, so ORIGINATOR_ID must not
+    # be a hard dependency for status synchronisation.
+    rows = client.list_all(
+        "crm.lead.list",
+        {
+            "order": {"ID": "ASC"},
+            "filter": {"%TITLE": "e-Qazyna"},
+            "select": select,
+        },
+    )
+    for row in rows:
+        lead_id = str(row.get("ID") or "").strip()
+        if lead_id and TITLE_NUMBER_MARKER in str(row.get("TITLE") or ""):
+            by_id[lead_id] = row
+
     return sorted(by_id.values(), key=lambda row: int(str(row.get("ID") or "0")))
+
+
+def scalar_value(value: Any) -> str | None:
+    """Normalise Bitrix scalar/enum response shapes to one comparable value."""
+    if value in (None, ""):
+        return None
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            result = scalar_value(item)
+            if result:
+                return result
+        return None
+    if isinstance(value, dict):
+        for key in ("ID", "id", "VALUE", "value"):
+            if key in value:
+                result = scalar_value(value.get(key))
+                if result:
+                    return result
+        return None
+    return str(value).strip() or None
 
 
 def _stage_name_map(statuses: Iterable[dict[str, Any]]) -> dict[str, str]:
@@ -220,9 +272,11 @@ def sync_statuses(
         lead_id = str(lead.get("ID") or "")
         old_id = str(lead.get("STATUS_ID") or "") or None
         old_name = names.get(old_id or "") or None
-        application_numbers = extract_application_numbers(lead)
+        doc_number = extract_application_number(lead)
+        old_failure_reason = scalar_value(lead.get(DEFAULT_FAILURE_REASON_FIELD))
 
-        if not application_numbers:
+        if not doc_number:
+            summary.leads_without_title_number += 1
             rows.append(
                 SyncRow(
                     lead_id=lead_id,
@@ -232,28 +286,15 @@ def sync_statuses(
                     old_status_name=old_name,
                     target_status_id=None,
                     target_status_name=None,
+                    old_failure_reason=old_failure_reason,
+                    target_failure_reason_id=None,
+                    target_failure_reason_name=None,
                     action="skipped_no_application_number",
-                )
-            )
-            continue
-        if len(application_numbers) != 1:
-            summary.ambiguous_application_number += 1
-            rows.append(
-                SyncRow(
-                    lead_id=lead_id,
-                    doc_number=", ".join(application_numbers),
-                    eqazyna_status=None,
-                    old_status_id=old_id,
-                    old_status_name=old_name,
-                    target_status_id=None,
-                    target_status_name=None,
-                    action="skipped_ambiguous_application_number",
-                    error="У лида найдено несколько номеров заявок; автоматическое изменение запрещено.",
+                    error="В TITLE не найден номер после маркера '№ '.",
                 )
             )
             continue
 
-        doc_number = application_numbers[0]
         summary.leads_with_application_number += 1
         print(f"[{index}/{len(leads)}] lead={lead_id} application={doc_number}", flush=True)
 
@@ -268,6 +309,9 @@ def sync_statuses(
                     old_status_name=old_name,
                     target_status_id=None,
                     target_status_name=None,
+                    old_failure_reason=old_failure_reason,
+                    target_failure_reason_id=None,
+                    target_failure_reason_name=None,
                     action="error",
                     error=fetch_error_cache[doc_number],
                 )
@@ -291,6 +335,9 @@ def sync_statuses(
                         old_status_name=old_name,
                         target_status_id=None,
                         target_status_name=None,
+                        old_failure_reason=old_failure_reason,
+                        target_failure_reason_id=None,
+                        target_failure_reason_name=None,
                         action="error",
                         error=message,
                     )
@@ -309,13 +356,17 @@ def sync_statuses(
                     old_status_name=old_name,
                     target_status_id=None,
                     target_status_name=None,
+                    old_failure_reason=old_failure_reason,
+                    target_failure_reason_id=None,
+                    target_failure_reason_name=None,
                     action="application_not_found",
                 )
             )
             continue
 
         summary.applications_found += 1
-        rule = map_external_status(external_status)
+        rule_key = normalise(external_status)
+        rule = STATUS_RULES.get(rule_key)
         if rule is None:
             summary.no_rule += 1
             rows.append(
@@ -327,17 +378,25 @@ def sync_statuses(
                     old_status_name=old_name,
                     target_status_id=None,
                     target_status_name=None,
+                    old_failure_reason=old_failure_reason,
+                    target_failure_reason_id=None,
+                    target_failure_reason_name=None,
                     action="no_change_for_external_status",
                 )
             )
             continue
 
-        if rule == "failure":
+        if rule["stage"] == "failure":
             target_id, target_name = failure_id, failure_resolved_name
         else:
             target_id, target_name = potential_id, potential_resolved_name
 
-        if old_id == target_id:
+        target_reason_id = rule["reason_id"]
+        target_reason_name = rule["reason_name"]
+        stage_matches = old_id == target_id
+        reason_matches = old_failure_reason == target_reason_id
+
+        if stage_matches and reason_matches:
             summary.already_in_target_stage += 1
             rows.append(
                 SyncRow(
@@ -348,7 +407,10 @@ def sync_statuses(
                     old_status_name=old_name,
                     target_status_id=target_id,
                     target_status_name=target_name,
-                    action="already_in_target_stage",
+                    old_failure_reason=old_failure_reason,
+                    target_failure_reason_id=target_reason_id,
+                    target_failure_reason_name=target_reason_name,
+                    action="already_synced",
                 )
             )
             continue
@@ -364,13 +426,22 @@ def sync_statuses(
                     old_status_name=old_name,
                     target_status_id=target_id,
                     target_status_name=target_name,
+                    old_failure_reason=old_failure_reason,
+                    target_failure_reason_id=target_reason_id,
+                    target_failure_reason_name=target_reason_name,
                     action="would_update",
                 )
             )
             continue
 
         try:
-            client.update_lead(lead_id, {"STATUS_ID": target_id})
+            client.update_lead(
+                lead_id,
+                {
+                    "STATUS_ID": target_id,
+                    DEFAULT_FAILURE_REASON_FIELD: target_reason_id,
+                },
+            )
         except (BitrixError, OSError, ValueError) as exc:
             summary.errors += 1
             rows.append(
@@ -382,6 +453,9 @@ def sync_statuses(
                     old_status_name=old_name,
                     target_status_id=target_id,
                     target_status_name=target_name,
+                    old_failure_reason=old_failure_reason,
+                    target_failure_reason_id=target_reason_id,
+                    target_failure_reason_name=target_reason_name,
                     action="error",
                     error=f"Bitrix24 update failed: {exc}",
                 )
@@ -398,6 +472,9 @@ def sync_statuses(
                 old_status_name=old_name,
                 target_status_id=target_id,
                 target_status_name=target_name,
+                old_failure_reason=old_failure_reason,
+                target_failure_reason_id=target_reason_id,
+                target_failure_reason_name=target_reason_name,
                 action="updated",
             )
         )
@@ -428,16 +505,18 @@ def write_outputs(output_dir: Path, summary: SyncSummary, rows: list[SyncRow]) -
     journal_lines = [
         "e-Qazyna -> Bitrix24 status sync",
         f"mode: {summary.mode}",
+        f"failure reason field: {DEFAULT_FAILURE_REASON_FIELD}",
         f"failure stage: {summary.failure_stage_name} ({summary.failure_stage_id})",
         f"potential stage: {summary.potential_stage_name} ({summary.potential_stage_id})",
         f"leads discovered: {summary.leads_discovered}",
+        f"leads with application number in TITLE: {summary.leads_with_application_number}",
+        f"leads without '№ ' in TITLE: {summary.leads_without_title_number}",
         f"applications found: {summary.applications_found}",
         f"changes planned: {summary.changes_planned}",
         f"changes applied: {summary.changes_applied}",
-        f"already target: {summary.already_in_target_stage}",
+        f"already synced: {summary.already_in_target_stage}",
         f"no rule: {summary.no_rule}",
         f"not found: {summary.application_not_found}",
-        f"ambiguous: {summary.ambiguous_application_number}",
         f"errors: {summary.errors}",
         "",
     ]
@@ -447,6 +526,14 @@ def write_outputs(output_dir: Path, summary: SyncSummary, rows: list[SyncRow]) -
             f"e-Qazyna={row.eqazyna_status or '-'} | "
             f"Bitrix={row.old_status_name or row.old_status_id or '-'} -> "
             f"{row.target_status_name or row.target_status_id or '-'} | "
+            f"reason={row.old_failure_reason or '-'} -> "
+            f"{row.target_failure_reason_id or '-'}"
+            + (
+                f" ({row.target_failure_reason_name})"
+                if row.target_failure_reason_name
+                else ""
+            )
+            + " | "
             f"action={row.action}"
             + (f" | error={row.error}" if row.error else "")
         )
@@ -458,9 +545,11 @@ def write_outputs(output_dir: Path, summary: SyncSummary, rows: list[SyncRow]) -
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Сверяет существующие e-Qazyna лиды Bitrix24 по точному номеру заявки: "
+            "Сверяет существующие e-Qazyna лиды Bitrix24. Номер заявки берётся только "
+            "из TITLE как всё после '№ '. "
             "Отклонено/Отозвано/Аннулировано -> Провал; "
-            "Выдана лицензия -> Потенциальные сделки."
+            "Выдана лицензия -> Потенциальные сделки. Одновременно записывает "
+            "соответствующую причину в UF_CRM_1785508658316."
         )
     )
     parser.add_argument("--mode", choices=("dry_run", "apply"), default="dry_run")
