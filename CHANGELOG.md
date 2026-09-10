@@ -91,3 +91,8 @@
 - `scripts/prepare-python.cmd` now uses the interpreter placed on `PATH` by `setup-python` instead of assuming Python is preinstalled for the runner service account.
 - Manual execution remains supported through `PYTHON_EXE`.
 - Persistent `.venv` directories are removed before creating a job-local environment.
+
+## 2026-09-10 — GPO runner Python bootstrap v4
+- Workflow `30 | e-Qazyna — ГПО в лиды` no longer depends on a preinstalled Python or on `actions/setup-python` PATH propagation.
+- Added `scripts/bootstrap-python.ps1`: on Windows self-hosted runner it reuses Python 3.11+ when present, otherwise downloads the signed official CPython 3.12.10 installer and installs it job-locally into `RUNNER_TEMP` without administrator rights.
+- `prepare-python.cmd` has the same bootstrap as a fallback, so even an older workflow step that only calls this script can recover automatically.

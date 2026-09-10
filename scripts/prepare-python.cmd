@@ -1,20 +1,15 @@
 @echo off
 setlocal EnableExtensions
 
-rem GitHub Actions workflows install Python with actions/setup-python before
-rem calling this script. PYTHON_EXE remains available for local/manual runs.
+rem Resolve Python 3.11+. On GitHub Actions this script can bootstrap a local
+rem Python automatically if the runner has no interpreter installed.
 if defined PYTHON_EXE (
-  if not exist "%PYTHON_EXE%" (
-    echo ERROR: PYTHON_EXE is set but the file does not exist: %PYTHON_EXE%
-    exit /b 1
+  if exist "%PYTHON_EXE%" (
+    set "PYTHON_RESOLVED=%PYTHON_EXE%"
+    goto :validate
   )
-  set "PYTHON_RESOLVED=%PYTHON_EXE%"
-  goto :validate
 )
 
-rem actions/setup-python also exports pythonLocation/Python3_ROOT_DIR.
-rem Prefer those stable absolute locations before PATH because some persistent
-rem self-hosted Windows runners do not reliably propagate GITHUB_PATH.
 if defined pythonLocation (
   if exist "%pythonLocation%\python.exe" (
     set "PYTHON_RESOLVED=%pythonLocation%\python.exe"
@@ -33,8 +28,26 @@ for /f "delims=" %%P in ('where python 2^>nul') do (
   goto :validate
 )
 
+rem Self-healing fallback for GitHub Actions/self-hosted Windows runners.
+rem bootstrap-python.ps1 downloads the signed official CPython installer and
+rem installs it only into RUNNER_TEMP; no admin rights or machine PATH needed.
+if /I "%GITHUB_ACTIONS%"=="true" (
+  set "_PY_PATH_FILE=%TEMP%\b24-python-path-%RANDOM%-%RANDOM%.txt"
+  powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%~dp0bootstrap-python.ps1" -PathFile "%_PY_PATH_FILE%"
+  if errorlevel 1 (
+    echo ERROR: Automatic Python bootstrap failed.
+    if exist "%_PY_PATH_FILE%" del /q "%_PY_PATH_FILE%" >nul 2>&1
+    exit /b 1
+  )
+  if exist "%_PY_PATH_FILE%" (
+    set /p PYTHON_RESOLVED=<"%_PY_PATH_FILE%"
+    del /q "%_PY_PATH_FILE%" >nul 2>&1
+  )
+  if defined PYTHON_RESOLVED goto :validate
+)
+
 echo ERROR: Python 3.11+ could not be resolved.
-echo In GitHub Actions pass steps.setup_python.outputs.python-path as PYTHON_EXE.
+echo GitHub Actions should bootstrap it automatically.
 echo For a manual run, set PYTHON_EXE to the full path of Python 3.11+ python.exe.
 exit /b 1
 
