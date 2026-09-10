@@ -73,7 +73,7 @@ jobs:
 
     steps:
       - name: Получить код репозитория
-        uses: actions/checkout@v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Найти Python и создать локальное окружение
         run: call ..\..\scripts\prepare-python.cmd
@@ -138,10 +138,6 @@ jobs:
             echo Не задан secret TARGET_BITRIX_WEBHOOK_URL
             exit /b 1
           )
-          if "%EGOV_API_KEY%"=="" (
-            echo Не задан secret EGOV_API_KEY
-            exit /b 1
-          )
           if not exist output mkdir output
           echo RUNNER=%RUNNER_NAME% / %RUNNER_OS% / %RUNNER_ARCH%
           ".venv\Scripts\python.exe" -u scripts\run_from_env.py
@@ -158,9 +154,9 @@ jobs:
 
       - name: Загрузить журнал запуска
         if: ${{ always() }}
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: 30-eqazyna-leads-${{ github.run_number }}
           path: processes/eqazyna_leads/output/
           if-no-files-found: warn
-          retention-days: 14
+          retention-days: 3

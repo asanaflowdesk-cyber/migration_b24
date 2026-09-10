@@ -1,4 +1,4 @@
-name: 31 | Компании — ответственный по первому лиду
+name: 31 | Компании — ответственный по руководителю компании
 
 on:
   workflow_dispatch:
@@ -16,7 +16,7 @@ on:
         type: string
 
 concurrency:
-  group: company-owner-first-lead-sync
+  group: company-owner-director-contact-sync
   cancel-in-progress: false
 
 permissions:
@@ -38,7 +38,7 @@ jobs:
 
     steps:
       - name: Получить код репозитория
-        uses: actions/checkout@v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Найти Python и создать локальное окружение
         run: call ..\..\scripts\prepare-python.cmd
@@ -72,6 +72,7 @@ jobs:
           BITRIX_VERIFY_SSL: ${{ vars.BITRIX_VERIFY_SSL || 'true' }}
           BITRIX_CA_BUNDLE: ${{ vars.BITRIX_CA_BUNDLE }}
           BITRIX_REQUEST_TIMEOUT: ${{ vars.BITRIX_REQUEST_TIMEOUT || '45' }}
+          INPUT_MODE: ${{ inputs.mode }}
         run: |
           chcp 65001 >nul
           if "%TARGET_BITRIX_WEBHOOK_URL%"=="" (
@@ -79,7 +80,7 @@ jobs:
             exit /b 1
           )
           if not exist output mkdir output
-          if "${{ inputs.mode }}"=="apply" (
+          if "%INPUT_MODE%"=="apply" (
             ".venv\Scripts\python.exe" -u sync_company_owners.py --apply --output-dir output
           ) else (
             ".venv\Scripts\python.exe" -u sync_company_owners.py --output-dir output
@@ -90,9 +91,9 @@ jobs:
 
       - name: Загрузить отчет
         if: ${{ always() }}
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: 31-company-owner-sync-${{ github.run_number }}
           path: processes/company_owner_sync/output/
           if-no-files-found: warn
-          retention-days: 14
+          retention-days: 3

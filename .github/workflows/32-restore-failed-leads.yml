@@ -15,7 +15,7 @@ on:
         default: "7"
         type: string
       moved_by_id:
-        description: "ID пользователя, который перевёл лиды в провал. Пусто = пользователь webhook"
+        description: "ID пользователя, который перевёл лиды в провал. Пусто = repository variable LEAD_RECOVERY_MOVED_BY_ID; если оба пусты — запуск остановится"
         required: false
         default: ""
         type: string
@@ -48,7 +48,7 @@ jobs:
 
     steps:
       - name: Получить код репозитория
-        uses: actions/checkout@v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Найти Python и создать локальное окружение
         run: call ..\..\scripts\prepare-python.cmd
@@ -81,6 +81,10 @@ jobs:
           TARGET_BITRIX_WEBHOOK_URL: ${{ secrets.TARGET_BITRIX_WEBHOOK_URL }}
           BITRIX_REQUEST_TIMEOUT: ${{ vars.BITRIX_REQUEST_TIMEOUT || '45' }}
           BITRIX_LEAD_FAILURE_REASON_FIELD: "UF_CRM_1785508658316"
+          LEAD_RECOVERY_MOVED_BY_ID: ${{ vars.LEAD_RECOVERY_MOVED_BY_ID }}
+          INPUT_MODE: ${{ inputs.mode }}
+          INPUT_DAYS: ${{ inputs.days }}
+          INPUT_MOVED_BY_ID: ${{ inputs.moved_by_id }}
         run: |
           chcp 65001 >nul
           if "%TARGET_BITRIX_WEBHOOK_URL%"=="" (
@@ -88,20 +92,16 @@ jobs:
             exit /b 1
           )
           if not exist output mkdir output
-          if "${{ inputs.mode }}"=="apply" (
-            ".venv\Scripts\python.exe" -u recover_failed_leads.py --apply --days "${{ inputs.days }}" --moved-by-id "${{ inputs.moved_by_id }}" --output-dir output
-          ) else (
-            ".venv\Scripts\python.exe" -u recover_failed_leads.py --days "${{ inputs.days }}" --moved-by-id "${{ inputs.moved_by_id }}" --output-dir output
-          )
+          ".venv\Scripts\python.exe" -u run_from_env.py
           if errorlevel 1 exit /b 1
           type output\lead_recovery_summary.json
           type output\lead_recovery_journal.txt
 
       - name: Загрузить отчет
         if: ${{ always() }}
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: 32-restore-failed-leads-${{ github.run_number }}
           path: processes/lead_recovery/output/
           if-no-files-found: warn
-          retention-days: 14
+          retention-days: 3

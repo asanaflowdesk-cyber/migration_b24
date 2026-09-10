@@ -13,6 +13,11 @@ on:
         required: true
         default: false
         type: boolean
+      upload_sensitive_snapshot:
+        description: "Загрузить полный CRM-снимок как artifact (ПДн/коммерческие данные, хранение 1 день)"
+        required: true
+        default: false
+        type: boolean
 
 jobs:
   export:
@@ -24,10 +29,10 @@ jobs:
 
     steps:
       - name: Получить репозиторий
-        uses: actions/checkout@v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Подготовить Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
           cache: pip
@@ -65,11 +70,22 @@ jobs:
           echo "Output tree:"
           find output -maxdepth 4 -type f -printf '%p %k KB\n' 2>/dev/null | sort || true
 
-      - name: Загрузить выгрузку
+      - name: Загрузить технический манифест
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
-          name: 01-cloud-export-${{ github.run_number }}
+          name: 01-cloud-export-manifest-${{ github.run_number }}
+          path: |
+            processes/cloud_export/output/**/manifest.json
+            processes/cloud_export/output/**/json/export_log.json
+          if-no-files-found: warn
+          retention-days: 3
+
+      - name: Загрузить полный снимок (содержит ПДн)
+        if: ${{ always() && inputs.upload_sensitive_snapshot }}
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: 01-cloud-export-sensitive-${{ github.run_number }}
           path: processes/cloud_export/output/
           if-no-files-found: warn
-          retention-days: 30
+          retention-days: 1
