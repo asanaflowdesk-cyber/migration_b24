@@ -72,12 +72,16 @@ def lead(
     originator="EQAZYNA_LEAD",
     reason=None,
     title=None,
+    semantic=None,
 ):
+    if semantic is None:
+        semantic = "F" if status_id == "JUNK" else "P"
     return {
         "ID": str(lead_id),
         "TITLE": title if title is not None else f"ТОО Test. e-Qazyna № {doc_number}",
         "COMMENTS": "COMMENTS MUST NOT BE USED FOR THE APPLICATION NUMBER",
         "STATUS_ID": status_id,
+        "STATUS_SEMANTIC_ID": semantic,
         "ORIGINATOR_ID": originator,
         "ORIGIN_ID": "ORIGIN_ID_MUST_NOT_BE_USED",
         DEFAULT_FAILURE_REASON_FIELD: reason,
@@ -175,41 +179,54 @@ def test_apply_maps_all_four_statuses_to_stage_and_failure_reason_enum():
     ]
 
 
-def test_correct_stage_but_missing_reason_is_still_updated():
+def test_inactive_failed_lead_without_external_reason_is_not_looked_up():
     client = FakeClient([lead(1, "47408-NEA", status_id="JUNK", reason=None)])
     scraper = FakeScraper({"47408-NEA": "Отклонено"})
 
     summary, rows = run_sync(client, scraper)
 
-    assert summary.changes_applied == 1
-    assert client.updated == [
-        ("1", {"STATUS_ID": "JUNK", DEFAULT_FAILURE_REASON_FIELD: "68"})
-    ]
-    assert rows[0].action == "updated"
-
-
-def test_correct_reason_but_wrong_stage_is_still_updated():
-    client = FakeClient([lead(1, "47408-NEA", status_id="NEW", reason="69")])
-    scraper = FakeScraper({"47408-NEA": "Выдана лицензия"})
-
-    summary, rows = run_sync(client, scraper)
-
-    assert summary.changes_applied == 1
-    assert client.updated == [
-        ("1", {"STATUS_ID": "UC_POTENTIAL", DEFAULT_FAILURE_REASON_FIELD: "69"})
-    ]
-    assert rows[0].action == "updated"
-
-
-def test_stage_and_reason_already_correct_are_not_rewritten():
-    client = FakeClient([lead(1, "47408-NEA", status_id="JUNK", reason="68")])
-    scraper = FakeScraper({"47408-NEA": "Отклонено"})
-
-    summary, rows = run_sync(client, scraper)
-
-    assert summary.already_in_target_stage == 1
+    assert summary.skipped_inactive_lead == 1
+    assert summary.active_leads_selected == 0
+    assert scraper.calls == []
     assert client.updated == []
-    assert rows[0].action == "already_synced"
+    assert rows[0].action == "skipped_inactive_lead"
+
+
+def test_any_of_four_terminal_reasons_skips_portal_even_if_stage_is_wrong():
+    client = FakeClient([
+        lead(1, "47408-NEA", reason="66"),
+        lead(2, "47409-NEA", reason="67"),
+        lead(3, "47410-NEA", reason="68"),
+        lead(4, "47411-NEA", reason="69"),
+    ])
+    scraper = FakeScraper({
+        "47408-NEA": "Принято",
+        "47409-NEA": "Принято",
+        "47410-NEA": "Принято",
+        "47411-NEA": "Принято",
+    })
+
+    summary, rows = run_sync(client, scraper)
+
+    assert summary.skipped_terminal_reason == 4
+    assert summary.active_leads_selected == 0
+    assert scraper.calls == []
+    assert client.updated == []
+    assert [row.action for row in rows] == ["skipped_terminal_reason"] * 4
+
+
+def test_terminal_reason_gate_runs_before_title_number_validation():
+    client = FakeClient([
+        lead(1, "ignored", reason="68", title="e-Qazyna card without number")
+    ])
+    scraper = FakeScraper({})
+
+    summary, rows = run_sync(client, scraper)
+
+    assert summary.skipped_terminal_reason == 1
+    assert summary.leads_without_title_number == 0
+    assert scraper.calls == []
+    assert rows[0].action == "skipped_terminal_reason"
 
 
 def test_dry_run_shows_stage_and_reason_without_writing():
@@ -274,3 +291,55 @@ def test_title_search_recovers_eqazyna_lead_without_originator_marker():
 
     assert summary.leads_discovered == 1
     assert scraper.calls == [("47408-NEA", "Заявка на разведку ТПИ")]
+
+
+class RaisingScraper:
+    def __init__(self):
+        self.calls = []
+
+    def fetch_application_by_number(self, doc_number, doc_type):
+        self.calls.append((doc_number, doc_type))
+        raise TimeoutError("portal timeout")
+
+
+def test_portal_failure_is_warning_not_fatal_sync_error():
+    client = FakeClient([lead(1, "47408-NEA")])
+    scraper = RaisingScraper()
+
+    summary, rows = run_sync(client, scraper)
+
+    assert summary.portal_lookup_warnings == 1
+    assert summary.errors == 0
+    assert summary.changes_applied == 0
+    assert rows[0].action == "portal_warning"
+    assert client.updated == []
+
+
+def test_max_items_limits_active_candidates_not_terminal_or_closed_leads():
+    client = FakeClient([
+        lead(1, "47401-NEA", reason="66"),
+        lead(2, "47402-NEA", status_id="JUNK", reason=None),
+        lead(3, "47403-NEA"),
+        lead(4, "47404-NEA"),
+    ])
+    scraper = FakeScraper({
+        "47403-NEA": "Принято",
+        "47404-NEA": "Принято",
+    })
+
+    summary, _ = sync_statuses(
+        client=client,
+        scraper=scraper,
+        mode="dry_run",
+        doc_type="Заявка на разведку ТПИ",
+        failure_stage_name="Провал",
+        potential_stage_name="Потенциальные сделки",
+        max_items=1,
+    )
+
+    assert summary.leads_discovered == 4
+    assert summary.skipped_terminal_reason == 1
+    assert summary.skipped_inactive_lead == 1
+    assert summary.active_leads_candidates == 2
+    assert summary.active_leads_selected == 1
+    assert scraper.calls == [("47403-NEA", "Заявка на разведку ТПИ")]

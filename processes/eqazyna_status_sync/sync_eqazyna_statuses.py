@@ -46,6 +46,10 @@ STATUS_RULES: dict[str, dict[str, str]] = {
     },
 }
 
+# Once one of these reasons is already present in Bitrix24, the e-Qazyna
+# application is considered terminal for this synchroniser.  Such a lead must
+# never be looked up on the public portal again.
+TERMINAL_REASON_IDS = frozenset(rule["reason_id"] for rule in STATUS_RULES.values())
 TITLE_NUMBER_MARKER = "№ "
 
 
@@ -69,6 +73,10 @@ class SyncRow:
 class SyncSummary:
     mode: str
     leads_discovered: int = 0
+    skipped_terminal_reason: int = 0
+    skipped_inactive_lead: int = 0
+    active_leads_candidates: int = 0
+    active_leads_selected: int = 0
     leads_with_application_number: int = 0
     applications_found: int = 0
     no_rule: int = 0
@@ -77,6 +85,7 @@ class SyncSummary:
     changes_applied: int = 0
     application_not_found: int = 0
     leads_without_title_number: int = 0
+    portal_lookup_warnings: int = 0
     errors: int = 0
     failure_stage_id: str | None = None
     failure_stage_name: str | None = None
@@ -222,6 +231,17 @@ def scalar_value(value: Any) -> str | None:
     return str(value).strip() or None
 
 
+def is_active_lead(lead: dict[str, Any]) -> bool:
+    """Return whether a Bitrix24 lead is still active for status monitoring.
+
+    Bitrix24 exposes STATUS_SEMANTIC_ID for lead stages. ``S`` and ``F`` are
+    terminal semantics (success/failure).  Missing/blank/P semantics are treated
+    as active so custom intermediate stages continue to be monitored.
+    """
+    semantic = normalise(lead.get("STATUS_SEMANTIC_ID")).upper()
+    return semantic not in {"S", "F"}
+
+
 def _stage_name_map(statuses: Iterable[dict[str, Any]]) -> dict[str, str]:
     return {status_id(row): status_name(row) for row in statuses if status_id(row)}
 
@@ -261,14 +281,78 @@ def sync_statuses(
     )
     rows: list[SyncRow] = []
     leads = list_eqazyna_leads(client, originators)
-    if max_items > 0:
-        leads = leads[:max_items]
     summary.leads_discovered = len(leads)
+
+    # Gate BEFORE any call to e-Qazyna.  A lead with one of the four terminal
+    # e-Qazyna reasons has already been classified by this process and is never
+    # compared with the portal again.  Other Bitrix24 terminal leads (semantic
+    # S/F) are also excluded: only active leads are eligible for portal checks.
+    active_leads: list[dict[str, Any]] = []
+    for lead in leads:
+        lead_id = str(lead.get("ID") or "")
+        old_id = str(lead.get("STATUS_ID") or "") or None
+        old_name = names.get(old_id or "") or None
+        old_failure_reason = scalar_value(lead.get(DEFAULT_FAILURE_REASON_FIELD))
+        doc_number = extract_application_number(lead)
+
+        if old_failure_reason in TERMINAL_REASON_IDS:
+            summary.skipped_terminal_reason += 1
+            rows.append(
+                SyncRow(
+                    lead_id=lead_id,
+                    doc_number=doc_number,
+                    eqazyna_status=None,
+                    old_status_id=old_id,
+                    old_status_name=old_name,
+                    target_status_id=None,
+                    target_status_name=None,
+                    old_failure_reason=old_failure_reason,
+                    target_failure_reason_id=None,
+                    target_failure_reason_name=None,
+                    action="skipped_terminal_reason",
+                )
+            )
+            continue
+
+        if not is_active_lead(lead):
+            summary.skipped_inactive_lead += 1
+            rows.append(
+                SyncRow(
+                    lead_id=lead_id,
+                    doc_number=doc_number,
+                    eqazyna_status=None,
+                    old_status_id=old_id,
+                    old_status_name=old_name,
+                    target_status_id=None,
+                    target_status_name=None,
+                    old_failure_reason=old_failure_reason,
+                    target_failure_reason_id=None,
+                    target_failure_reason_name=None,
+                    action="skipped_inactive_lead",
+                )
+            )
+            continue
+
+        active_leads.append(lead)
+
+    summary.active_leads_candidates = len(active_leads)
+    if max_items > 0:
+        active_leads = active_leads[:max_items]
+    summary.active_leads_selected = len(active_leads)
+    print(
+        "PRE-FILTER: "
+        f"discovered={summary.leads_discovered}; "
+        f"skip_reason_66_69={summary.skipped_terminal_reason}; "
+        f"skip_closed_S_F={summary.skipped_inactive_lead}; "
+        f"active_candidates={summary.active_leads_candidates}; "
+        f"active_to_check={summary.active_leads_selected}",
+        flush=True,
+    )
 
     status_cache: dict[str, str | None] = {}
     fetch_error_cache: dict[str, str] = {}
 
-    for index, lead in enumerate(leads, start=1):
+    for index, lead in enumerate(active_leads, start=1):
         lead_id = str(lead.get("ID") or "")
         old_id = str(lead.get("STATUS_ID") or "") or None
         old_name = names.get(old_id or "") or None
@@ -296,10 +380,10 @@ def sync_statuses(
             continue
 
         summary.leads_with_application_number += 1
-        print(f"[{index}/{len(leads)}] lead={lead_id} application={doc_number}", flush=True)
+        print(f"[{index}/{len(active_leads)}] lead={lead_id} application={doc_number}", flush=True)
 
         if doc_number in fetch_error_cache:
-            summary.errors += 1
+            summary.portal_lookup_warnings += 1
             rows.append(
                 SyncRow(
                     lead_id=lead_id,
@@ -312,7 +396,7 @@ def sync_statuses(
                     old_failure_reason=old_failure_reason,
                     target_failure_reason_id=None,
                     target_failure_reason_name=None,
-                    action="error",
+                    action="portal_warning",
                     error=fetch_error_cache[doc_number],
                 )
             )
@@ -325,7 +409,7 @@ def sync_statuses(
             except Exception as exc:  # noqa: BLE001 - journal every failed lookup
                 message = f"e-Qazyna lookup failed: {exc}"
                 fetch_error_cache[doc_number] = message
-                summary.errors += 1
+                summary.portal_lookup_warnings += 1
                 rows.append(
                     SyncRow(
                         lead_id=lead_id,
@@ -338,7 +422,7 @@ def sync_statuses(
                         old_failure_reason=old_failure_reason,
                         target_failure_reason_id=None,
                         target_failure_reason_name=None,
-                        action="error",
+                        action="portal_warning",
                         error=message,
                     )
                 )
@@ -509,6 +593,10 @@ def write_outputs(output_dir: Path, summary: SyncSummary, rows: list[SyncRow]) -
         f"failure stage: {summary.failure_stage_name} ({summary.failure_stage_id})",
         f"potential stage: {summary.potential_stage_name} ({summary.potential_stage_id})",
         f"leads discovered: {summary.leads_discovered}",
+        f"skipped: one of terminal reasons 66/67/68/69: {summary.skipped_terminal_reason}",
+        f"skipped: inactive Bitrix24 lead (semantic S/F): {summary.skipped_inactive_lead}",
+        f"active leads eligible for portal check: {summary.active_leads_candidates}",
+        f"active leads selected by max_items: {summary.active_leads_selected}",
         f"leads with application number in TITLE: {summary.leads_with_application_number}",
         f"leads without '№ ' in TITLE: {summary.leads_without_title_number}",
         f"applications found: {summary.applications_found}",
@@ -517,7 +605,8 @@ def write_outputs(output_dir: Path, summary: SyncSummary, rows: list[SyncRow]) -
         f"already synced: {summary.already_in_target_stage}",
         f"no rule: {summary.no_rule}",
         f"not found: {summary.application_not_found}",
-        f"errors: {summary.errors}",
+        f"portal lookup warnings: {summary.portal_lookup_warnings}",
+        f"fatal Bitrix24 update errors: {summary.errors}",
         "",
     ]
     for row in rows:
@@ -545,8 +634,9 @@ def write_outputs(output_dir: Path, summary: SyncSummary, rows: list[SyncRow]) -
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Сверяет существующие e-Qazyna лиды Bitrix24. Номер заявки берётся только "
-            "из TITLE как всё после '№ '. "
+            "Сверяет только активные e-Qazyna лиды Bitrix24. Лиды с причинами "
+            "66/67/68/69 и закрытые лиды (semantic S/F) не запрашиваются на портале. "
+            "Номер заявки берётся только из TITLE как всё после '№ '. "
             "Отклонено/Отозвано/Аннулировано -> Провал; "
             "Выдана лицензия -> Потенциальные сделки. Одновременно записывает "
             "соответствующую причину в UF_CRM_1785508658316."
@@ -602,9 +692,15 @@ def main(argv: list[str] | None = None) -> int:
 
     write_outputs(Path(args.output_dir), summary, rows)
     print(json.dumps(asdict(summary), ensure_ascii=False, indent=2), flush=True)
+    if summary.portal_lookup_warnings:
+        print(
+            f"WARN: e-Qazyna lookups failed after retries for "
+            f"{summary.portal_lookup_warnings} active lead(s); they were skipped and logged.",
+            file=sys.stderr,
+        )
     if summary.errors:
         print(
-            f"ERROR: status sync incomplete; per-lead errors={summary.errors}. See output journal.",
+            f"ERROR: Bitrix24 updates failed for {summary.errors} lead(s). See output journal.",
             file=sys.stderr,
         )
         return 1
