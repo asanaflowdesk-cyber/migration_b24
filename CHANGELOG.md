@@ -101,3 +101,8 @@
 - Исправлена PowerShell parser error в `scripts/bootstrap-python.ps1`: строка ошибки больше не использует неоднозначную конструкцию `$RequiredMinor:` и формируется через оператор `-f`.
 - Добавлена статическая проверка PowerShell-интерполяции в `scripts/run_quality_checks.py`, чтобы этот класс ошибки ловился до упаковки релиза.
 - Workflow `30 | e-Qazyna — ГПО в лиды` и fallback `prepare-python.cmd` продолжают использовать один и тот же job-local bootstrap Python 3.12.10.
+
+### 2026-09-10 — v6: PowerShell `$HOME` bootstrap fix
+
+- Исправлен `scripts/bootstrap-python.ps1`: локальная переменная `$Home` переименована в `$PythonHome`. PowerShell нечувствителен к регистру, поэтому `$Home` конфликтовал со встроенной read-only переменной `$HOME` и падал уже после успешной установки Python.
+- Добавлена регрессионная проверка, запрещающая повторное присваивание `$HOME` в PowerShell-скриптах.

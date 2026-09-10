@@ -69,10 +69,28 @@ def check_powershell_interpolation() -> None:
         raise RuntimeError("Unsafe PowerShell variable interpolation found:\n" + "\n".join(failures))
 
 
+def check_powershell_home_assignment() -> None:
+    """Prevent assignments to PowerShell's read-only automatic $HOME variable."""
+    pattern = re.compile(r"^\s*\$home\s*=", re.IGNORECASE)
+    failures: list[str] = []
+    for path in ROOT.rglob("*.ps1"):
+        for lineno, line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1):
+            if pattern.search(line):
+                failures.append(f"{path.relative_to(ROOT)}:{lineno}: {line.strip()}")
+    if failures:
+        raise RuntimeError(
+            "Assignment to read-only PowerShell automatic variable $HOME found:\n"
+            + "\n".join(failures)
+        )
+
+
 def main() -> int:
     print("=== PowerShell interpolation check ===", flush=True)
     check_powershell_interpolation()
     print("PowerShell interpolation check: OK", flush=True)
+    print("=== PowerShell automatic-variable check ===", flush=True)
+    check_powershell_home_assignment()
+    print("PowerShell automatic-variable check: OK", flush=True)
     print("=== compileall ===", flush=True)
     if not compileall.compile_dir(ROOT / "common", quiet=1):
         return 1

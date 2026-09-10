@@ -28,7 +28,7 @@ function Test-PythonExecutable {
 function Publish-Python {
     param([string]$Exe)
     $Exe = (Resolve-Path -LiteralPath $Exe).Path
-    $Home = Split-Path -Parent $Exe
+    $PythonHome = Split-Path -Parent $Exe
 
     Write-Host "Using Python: $Exe"
     & $Exe --version
@@ -42,11 +42,11 @@ function Publish-Python {
 
     if ($env:GITHUB_ENV) {
         "PYTHON_EXE=$Exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-        "PYTHON_HOME=$Home" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        "PYTHON_HOME=$PythonHome" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
     }
     if ($env:GITHUB_PATH) {
-        $Home | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-        (Join-Path $Home "Scripts") | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        $PythonHome | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        (Join-Path $PythonHome "Scripts") | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
     }
 
     return $Exe
