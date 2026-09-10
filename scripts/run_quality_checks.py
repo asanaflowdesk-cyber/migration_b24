@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import compileall
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -45,7 +46,33 @@ def run_suite(name: str, cwd: Path) -> None:
     )
 
 
+
+def check_powershell_interpolation() -> None:
+    """Catch PowerShell's `$name:` parser trap inside expandable strings.
+
+    Scope-qualified variables such as $env:PATH are valid. Other `$name:`
+    sequences inside double-quoted strings are parsed as scoped variables and
+    can fail before the script executes.
+    """
+    allowed_scopes = {"env", "global", "script", "local", "private", "using"}
+    pattern = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*):")
+    failures: list[str] = []
+    for path in ROOT.rglob("*.ps1"):
+        for lineno, line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1):
+            # Only expandable string content is relevant to this parser pitfall.
+            if '"' not in line:
+                continue
+            for match in pattern.finditer(line):
+                if match.group(1).lower() not in allowed_scopes:
+                    failures.append(f"{path.relative_to(ROOT)}:{lineno}: {match.group(0)}")
+    if failures:
+        raise RuntimeError("Unsafe PowerShell variable interpolation found:\n" + "\n".join(failures))
+
+
 def main() -> int:
+    print("=== PowerShell interpolation check ===", flush=True)
+    check_powershell_interpolation()
+    print("PowerShell interpolation check: OK", flush=True)
     print("=== compileall ===", flush=True)
     if not compileall.compile_dir(ROOT / "common", quiet=1):
         return 1

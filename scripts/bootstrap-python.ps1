@@ -121,7 +121,7 @@ if ($Process.ExitCode -notin @(0, 3010)) {
 Remove-Item -LiteralPath $Installer -Force -ErrorAction SilentlyContinue
 
 if (-not (Test-PythonExecutable $LocalPython)) {
-    throw "Python installation finished, but python.exe was not found or is older than $RequiredMajor.$RequiredMinor: $LocalPython"
+    throw ("Python installation finished, but python.exe was not found or is older than {0}.{1}: {2}" -f $RequiredMajor, $RequiredMinor, $LocalPython)
 }
 
 Publish-Python $LocalPython | Out-Null

@@ -96,3 +96,8 @@
 - Workflow `30 | e-Qazyna — ГПО в лиды` no longer depends on a preinstalled Python or on `actions/setup-python` PATH propagation.
 - Added `scripts/bootstrap-python.ps1`: on Windows self-hosted runner it reuses Python 3.11+ when present, otherwise downloads the signed official CPython 3.12.10 installer and installs it job-locally into `RUNNER_TEMP` without administrator rights.
 - `prepare-python.cmd` has the same bootstrap as a fallback, so even an older workflow step that only calls this script can recover automatically.
+
+## 2026-09-10 — GPO runner Python bootstrap v5
+- Исправлена PowerShell parser error в `scripts/bootstrap-python.ps1`: строка ошибки больше не использует неоднозначную конструкцию `$RequiredMinor:` и формируется через оператор `-f`.
+- Добавлена статическая проверка PowerShell-интерполяции в `scripts/run_quality_checks.py`, чтобы этот класс ошибки ловился до упаковки релиза.
+- Workflow `30 | e-Qazyna — ГПО в лиды` и fallback `prepare-python.cmd` продолжают использовать один и тот же job-local bootstrap Python 3.12.10.
