@@ -12,6 +12,7 @@
   30-eqazyna-leads.yml        постоянный парсер e-Qazyna → лиды коробки
   31-company-owner-sync.yml   ответственный компании по руководителю той же компании
   32-restore-failed-leads.yml контролируемый возврат ошибочно закрытых лидов
+  33-eqazyna-status-sync.yml  сверка статусов e-Qazyna по точному номеру заявки → стадии лидов
   40-flowdesk.yml             FlowDesk event → идемпотентная задача
   50-create-departments.yml   отдельное создание подразделений
 
@@ -43,13 +44,14 @@ processes/cloud_export/       read-only экспорт cloud snapshot
 processes/company_owner_sync/ сверка владельца компании по director contact этой компании
 processes/departments/        отдельное создание подразделений
 processes/eqazyna_leads/      e-Qazyna parser
+processes/eqazyna_status_sync/ точная сверка статуса уже загруженных заявок e-Qazyna и стадий лидов
 processes/flowdesk/           FlowDesk → задачи с event deduplication marker
 processes/lead_recovery/      восстановление ошибочно проваленных лидов
 processes/user_registration/  регистрация пользователей из Excel
 
 scripts/
   prepare-python.cmd          создание локальной .venv из Python 3.12, уже установленного на self-hosted Windows runner
-  run_quality_checks.py       compileall + все 8 тестовых пакетов
+  run_quality_checks.py       compileall + все 9 тестовых пакетов
 
 requirements-ci.txt           единый точный набор прямых CI-зависимостей
 ```

@@ -14,6 +14,7 @@ TEST_SUITES = [
     ("cloud_to_box", ROOT / "processes" / "cloud_to_box"),
     ("company_owner_sync", ROOT / "processes" / "company_owner_sync"),
     ("eqazyna_leads", ROOT / "processes" / "eqazyna_leads"),
+    ("eqazyna_status_sync", ROOT / "processes" / "eqazyna_status_sync"),
     ("lead_recovery", ROOT / "processes" / "lead_recovery"),
     ("flowdesk", ROOT / "processes" / "flowdesk"),
     ("departments", ROOT / "processes" / "departments"),
@@ -24,10 +25,10 @@ TEST_SUITES = [
 def run_suite(name: str, cwd: Path) -> None:
     env = os.environ.copy()
     paths = [str(ROOT)]
-    if name == "company_owner_sync":
+    if name in {"company_owner_sync", "eqazyna_status_sync"}:
         paths.extend(
             [
-                str(ROOT / "processes" / "company_owner_sync"),
+                str(cwd),
                 str(ROOT / "processes" / "eqazyna_leads"),
             ]
         )

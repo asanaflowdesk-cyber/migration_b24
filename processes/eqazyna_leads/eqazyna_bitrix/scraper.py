@@ -167,7 +167,13 @@ class EqazynaScraper:
         self.session = requests.Session()
         self._configure_session(self.session)
 
-    def build_url(self, page: int, doc_type: str | None, statuses: Iterable[str]) -> str:
+    def build_url(
+        self,
+        page: int,
+        doc_type: str | None,
+        statuses: Iterable[str],
+        doc_number: str | None = None,
+    ) -> str:
         params: list[tuple[str, str]] = [
             ("oq", ""),
             ("flMineralUserXin", ""),
@@ -179,7 +185,7 @@ class EqazynaScraper:
             if filter_status:
                 params.append(("flStatus", filter_status))
 
-        params.append(("flDocNum", ""))
+        params.append(("flDocNum", (doc_number or "").strip()))
 
         doc_type = doc_type.strip() if doc_type else None
         if doc_type:
@@ -192,8 +198,14 @@ class EqazynaScraper:
 
         return f"{BASE_URL}?{urlencode(params, doseq=True)}"
 
-    def fetch_page(self, page: int, doc_type: str | None, statuses: Iterable[str]) -> tuple[str, str]:
-        url = self.build_url(page, doc_type, statuses)
+    def fetch_page(
+        self,
+        page: int,
+        doc_type: str | None,
+        statuses: Iterable[str],
+        doc_number: str | None = None,
+    ) -> tuple[str, str]:
+        url = self.build_url(page, doc_type, statuses, doc_number=doc_number)
         last_error: Exception | None = None
         connect_timeout = min(15, self.timeout)
         request_timeout = (connect_timeout, self.timeout)
@@ -231,6 +243,51 @@ class EqazynaScraper:
                     time.sleep(sleep_for)
 
         raise last_error or RuntimeError(f"e-Qazyna page {page} failed")
+
+    def fetch_application_by_number(
+        self,
+        doc_number: str,
+        doc_type: str | None = "Заявка на разведку ТПИ",
+    ) -> Application | None:
+        """Read one application by its exact public registry document number.
+
+        The request deliberately does not filter by application status. This makes
+        the lookup independent of the current state and also keeps it working if
+        e-Qazyna adds a new status that is not yet present in KNOWN_STATUSES.
+        """
+        wanted = clean_text(doc_number)
+        if not wanted:
+            raise ValueError("doc_number is required")
+
+        html, url = self.fetch_page(
+            1,
+            doc_type,
+            (),
+            doc_number=wanted,
+        )
+        rows = parse_applications(
+            html,
+            url,
+            doc_types=[doc_type] if doc_type else None,
+        )
+        exact = [row for row in rows if clean_text(row.doc_number).casefold() == wanted.casefold()]
+        if doc_type:
+            exact_doc_type = [row for row in exact if clean_text(row.doc_type) == clean_text(doc_type)]
+            if exact_doc_type:
+                exact = exact_doc_type
+        if not exact:
+            return None
+
+        def _created_sort_key(app: Application) -> tuple[datetime, str]:
+            raw = clean_text(app.created_at_raw)
+            for fmt in ("%d.%m.%Y %H:%M:%S", "%d.%m.%Y"):
+                try:
+                    return datetime.strptime(raw[:19] if "%H" in fmt else raw[:10], fmt), raw
+                except ValueError:
+                    continue
+            return datetime.min, raw
+
+        return max(exact, key=_created_sort_key)
 
     @staticmethod
     def parse_page_list(value: str | None) -> list[int] | None:
