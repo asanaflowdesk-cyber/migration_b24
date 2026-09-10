@@ -74,3 +74,10 @@ Corrective action:
 - changed `prepare-python.cmd` to consume the interpreter provisioned by the action rather than searching user-profile installations;
 - preserved `PYTHON_EXE` only as a manual-run override;
 - recreate `.venv` on each job so a persistent self-hosted workspace cannot reuse an environment from an older run.
+
+## GPO / e-Qazyna runner fix
+
+For workflow `30-eqazyna-leads.yml`, the Python interpreter is now passed explicitly from `actions/setup-python` via its `python-path` output to `PYTHON_EXE`. This removes the dependency on PATH propagation between steps on persistent Windows self-hosted runners. `prepare-python.cmd` also falls back to `pythonLocation` and `Python3_ROOT_DIR` before consulting PATH.
+
+Validation: e-Qazyna test suite `42 passed`; workflow YAML parsed successfully.
+

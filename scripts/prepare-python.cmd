@@ -12,15 +12,29 @@ if defined PYTHON_EXE (
   goto :validate
 )
 
-rem setup-python prepends its interpreter to PATH. Resolve that interpreter
-rem instead of relying on a Python installation tied to the runner account.
+rem actions/setup-python also exports pythonLocation/Python3_ROOT_DIR.
+rem Prefer those stable absolute locations before PATH because some persistent
+rem self-hosted Windows runners do not reliably propagate GITHUB_PATH.
+if defined pythonLocation (
+  if exist "%pythonLocation%\python.exe" (
+    set "PYTHON_RESOLVED=%pythonLocation%\python.exe"
+    goto :validate
+  )
+)
+if defined Python3_ROOT_DIR (
+  if exist "%Python3_ROOT_DIR%\python.exe" (
+    set "PYTHON_RESOLVED=%Python3_ROOT_DIR%\python.exe"
+    goto :validate
+  )
+)
+
 for /f "delims=" %%P in ('where python 2^>nul') do (
   set "PYTHON_RESOLVED=%%P"
   goto :validate
 )
 
-echo ERROR: Python is not available on PATH.
-echo GitHub Actions must run actions/setup-python before this script.
+echo ERROR: Python 3.11+ could not be resolved.
+echo In GitHub Actions pass steps.setup_python.outputs.python-path as PYTHON_EXE.
 echo For a manual run, set PYTHON_EXE to the full path of Python 3.11+ python.exe.
 exit /b 1
 
