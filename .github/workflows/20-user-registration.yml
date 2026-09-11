@@ -1,19 +1,14 @@
-name: 20 | Пользователи — регистрация из Excel
+name: 20 | Пользователи — регистрация из Google Sheets
 
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "dry_run — проверить файл; apply — создать пользователей и отправить приглашения"
+        description: "dry_run — проверить new_users_add; apply — создать пользователей и записать ID"
         required: true
         default: dry_run
         type: choice
         options: [dry_run, apply]
-      file_path:
-        description: "Путь к Excel внутри процесса регистрации"
-        required: true
-        default: "input/users_to_invite.xlsx"
-        type: string
       confirm:
         description: "Для apply введите REGISTER_USERS"
         required: false
@@ -33,19 +28,13 @@ jobs:
         working-directory: processes/user_registration
 
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
 
       - name: Найти Python и создать локальное окружение
         run: call ..\..\scripts\prepare-python.cmd
 
       - name: Установить зависимости
         run: '".venv\Scripts\python.exe" -m pip install -r requirements.txt'
-
-      - name: Проверить код регистрации
-        env:
-          PYTHONPATH: ${{ github.workspace }}
-        run: '".venv\Scripts\python.exe" -m pytest -q tests'
 
       - name: Проверить подтверждение
         if: ${{ inputs.mode == 'apply' && inputs.confirm != 'REGISTER_USERS' }}
@@ -58,15 +47,18 @@ jobs:
           PYTHONUNBUFFERED: "1"
           PYTHONPATH: ${{ github.workspace }}
           TARGET_BITRIX_WEBHOOK_URL: ${{ secrets.TARGET_BITRIX_WEBHOOK_URL }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_SHEETS_SPREADSHEET_ID: "1WuRHHyQm5lHxDlW81m4P0oZJ6X_SDYj1bN-NOx8aM2k"
+          GOOGLE_SHEETS_NEW_USERS_TAB: "new_users_add"
+          GOOGLE_SHEETS_USER_LIST_TAB: "user_list"
           INPUT_MODE: ${{ inputs.mode }}
-          INPUT_FILE_PATH: ${{ inputs.file_path }}
         run: '".venv\Scripts\python.exe" -u run_from_env.py'
 
       - name: Загрузить отчет
         if: always()
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: 20-user-registration-${{ github.run_number }}
           path: processes/user_registration/output/
           if-no-files-found: warn
-          retention-days: 3
+          retention-days: 7

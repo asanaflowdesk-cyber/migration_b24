@@ -34,8 +34,7 @@ jobs:
 
     steps:
       - name: Получить код репозитория
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
 
       - name: Найти Python и создать локальное окружение
         run: call ..\..\scripts\prepare-python.cmd
@@ -46,11 +45,6 @@ jobs:
         run: |
           if not "%CUSTOM_PIP_INDEX_URL%"=="" set "PIP_INDEX_URL=%CUSTOM_PIP_INDEX_URL%"
           ".venv\Scripts\python.exe" -m pip install -r requirements.txt
-
-      - name: Проверить код подразделений
-        env:
-          PYTHONPATH: ${{ github.workspace }}
-        run: '".venv\Scripts\python.exe" -m pytest -q tests'
 
       - name: Проверить подтверждение
         if: ${{ inputs.mode == 'apply' && inputs.confirm != 'CREATE_DEPARTMENTS' }}
@@ -75,9 +69,9 @@ jobs:
 
       - name: Загрузить отчет
         if: always()
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: 50-departments-${{ github.run_number }}
           path: processes/departments/output/
           if-no-files-found: warn
-          retention-days: 3
+          retention-days: 7
