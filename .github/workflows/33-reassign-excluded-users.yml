@@ -11,7 +11,7 @@ on:
       mode:
         description: "dry_run — только план; apply — выполнить перенос"
         required: true
-        default: dry_run
+        default: apply
         type: choice
         options:
           - dry_run
@@ -19,7 +19,7 @@ on:
       confirm:
         description: "Для apply введите REASSIGN_EXCLUDED_USERS"
         required: false
-        default: ""
+        default: "REASSIGN_EXCLUDED_USERS"
         type: string
 
 concurrency:
