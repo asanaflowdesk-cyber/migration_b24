@@ -96,6 +96,11 @@ class Package:
     target_reason: str = ""
     context_owner_ids: set[int] = field(default_factory=set)
     context_lead_ids: set[int] = field(default_factory=set)
+    # Every CRM lead linked to this package by company or founder contact.
+    # Values are current ASSIGNED_BY_ID (or None when Bitrix returned no owner).
+    # This is intentionally separate from entity owners: the protection rule is
+    # based on the MAJORITY OF LINKED LEADS, not on company/contact owners.
+    context_lead_owner_ids: dict[int, int | None] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -310,22 +315,45 @@ def add_package_context(
             if lid in package.lead_ids or company_id in package.company_ids or contact_id in package.contact_ids:
                 package.context_lead_ids.add(lid)
                 owner = normalized_id(lead.get("ASSIGNED_BY_ID"))
+                package.context_lead_owner_ids[lid] = owner
                 if owner:
                     owners.add(owner)
         package.context_owner_ids = owners
 
 
-
-def protected_taldyk_managers(
+def protected_majority_counts(
     package: Package,
     protected_manager_ids: set[int],
-) -> set[int]:
-    """Managers whose linked package must stay untouched.
+) -> tuple[int, int, int]:
+    """Return (protected, other, total) for ALL leads linked to the package.
 
-    Business rule: Taldykorgan packages linked to managers 16/18/38 are protected.
-    The manager IDs are authoritative; department-name heuristics are intentionally not used.
+    The package is linked through its company and/or founder contact.  Company
+    and contact owners are deliberately ignored here: only lead ownership votes.
+    Managers 16/18/38 are one protected group, so their votes are summed.
+    A missing lead owner counts as ``other`` because that lead is not assigned to
+    16/18/38.
     """
-    return package.context_owner_ids & protected_manager_ids
+    total = len(package.context_lead_ids)
+    protected = sum(
+        1
+        for lid in package.context_lead_ids
+        if package.context_lead_owner_ids.get(lid) in protected_manager_ids
+    )
+    other = total - protected
+    return protected, other, total
+
+
+def package_has_nonprotected_majority(
+    package: Package,
+    protected_manager_ids: set[int],
+) -> bool:
+    """True only when leads NOT on 16/18/38 are a strict majority.
+
+    Example: 3 other vs 2 protected -> redistribute.
+    Example: 1 other vs 1 protected -> do not redistribute (no majority).
+    """
+    protected, other, total = protected_majority_counts(package, protected_manager_ids)
+    return total > 0 and other > protected
 
 
 def assign_targets(
@@ -357,12 +385,14 @@ def plan_packages(
 ) -> tuple[list[Package], list[PackageDecision]]:
     """Apply the final package gate.
 
-    Only two things can stop a package:
-    1) it contains an explicitly protected lead (401 by default);
-    2) it is linked to one of the protected Taldykorgan managers (16/18/38 by default).
+    1) An explicitly protected lead (401 by default) still blocks the whole package.
+    2) For managers 16/18/38, protection is decided by a LEAD MAJORITY across
+       all leads linked to the same company/contact package.  If leads NOT on
+       16/18/38 are a strict majority, the package is redistributed to the ROPs.
+       If 16/18/38 are the majority, or the vote is tied, the package is untouched.
 
-    Every other package is redistributed from scratch, evenly between the target ROPs.
-    Existing non-excluded owners do not anchor or block the package.
+    Company/contact owners themselves do not vote. Existing non-protected owners
+    do not anchor or block the package.
     """
     eligible: list[Package] = []
     skipped: list[PackageDecision] = []
@@ -378,18 +408,26 @@ def plan_packages(
             )
             continue
 
-        protected_managers = protected_taldyk_managers(package, protected_manager_ids)
-        if protected_managers:
+        protected_count, other_count, total_count = protected_majority_counts(
+            package, protected_manager_ids
+        )
+        if not package_has_nonprotected_majority(package, protected_manager_ids):
+            protected_present = sorted({
+                owner
+                for owner in package.context_lead_owner_ids.values()
+                if owner in protected_manager_ids
+            })
             skipped.append(
                 PackageDecision(
                     package,
-                    "protected_taldyk_manager:"
-                    + ",".join(map(str, sorted(protected_managers))),
+                    "protected_taldyk_majority:"
+                    f"protected={protected_count};other={other_count};total={total_count};"
+                    f"managers={','.join(map(str, protected_present))}",
                 )
             )
             continue
 
-        # Final rule: every other package goes to the ROP balancing pool.
+        # Leads outside 16/18/38 are the strict majority: redistribute this package.
         package.target_owner_id = None
         package.target_reason = ""
         eligible.append(package)
@@ -494,6 +532,15 @@ def build_rows(
             "package_contacts": len(package.contact_ids),
             "source_owner_ids": ",".join(map(str, sorted(package.source_owner_ids))),
             "context_owner_ids": ",".join(map(str, sorted(package.context_owner_ids))),
+            "context_leads_total": len(package.context_lead_ids),
+            "protected_16_18_38_leads": sum(
+                1 for owner in package.context_lead_owner_ids.values()
+                if owner in DEFAULT_PROTECTED_TALDYK_MANAGER_IDS
+            ),
+            "other_leads": sum(
+                1 for owner in package.context_lead_owner_ids.values()
+                if owner not in DEFAULT_PROTECTED_TALDYK_MANAGER_IDS
+            ),
             "company_ids": ",".join(map(str, sorted(package.company_ids))),
             "company_titles": " | ".join(companies_names),
             "founder_contact_ids": ",".join(map(str, sorted(package.contact_ids))),
@@ -543,8 +590,8 @@ def build_rows(
         meta = package_meta(package)
         if decision.skip_reason.startswith("protected_lead:"):
             action = "skipped_protected_lead"
-        elif decision.skip_reason.startswith("protected_taldyk_manager:"):
-            action = "skipped_protected_taldyk_manager"
+        elif decision.skip_reason.startswith("protected_taldyk_majority:"):
+            action = "skipped_protected_taldyk_majority"
         else:
             action = "skipped"
         for lid in sorted(package.lead_ids):
@@ -694,7 +741,8 @@ def verify_rows(
 def write_report(path: Path, rows: list[dict[str, Any]]) -> None:
     columns = [
         "package_key", "package_leads", "package_companies", "package_contacts",
-        "source_owner_ids", "context_owner_ids", "company_ids", "company_titles",
+        "source_owner_ids", "context_owner_ids", "context_leads_total",
+        "protected_16_18_38_leads", "other_leads", "company_ids", "company_titles",
         "founder_contact_ids", "founder_names", "package_warning",
         "entity_type", "entity_id", "title", "old_owner_id", "old_owner_name",
         "new_owner_id", "new_owner_name", "lead_status_id", "target_reason",
@@ -759,8 +807,8 @@ def run(
 
     transfer_rows = [r for r in rows if not str(r["action"]).startswith("skipped_")]
     pending_rows = [r for r in transfer_rows if r["action"] == "pending"]
-    skipped_taldyk_managers = [
-        d for d in skipped if d.skip_reason.startswith("protected_taldyk_manager:")
+    skipped_taldyk_majority = [
+        d for d in skipped if d.skip_reason.startswith("protected_taldyk_majority:")
     ]
     skipped_protected = [d for d in skipped if d.skip_reason.startswith("protected_lead:")]
 
@@ -770,9 +818,8 @@ def run(
     print(
         "[ПЛАН] "
         f"исходных пакетов: {len(packages)}; к переносу: {len(eligible)}; "
-        f"защищено Талдыкорган (менеджеры {','.join(map(str, sorted(protected_taldyk_manager_ids)))}): "
-        f"{len(skipped_taldyk_managers)} пакетов/"
-        f"{sum(len(d.package.lead_ids) for d in skipped_taldyk_managers)} лидов; "
+        f"без большинства вне 16/18/38: {len(skipped_taldyk_majority)} пакетов/"
+        f"{sum(len(d.package.lead_ids) for d in skipped_taldyk_majority)} переносимых лидов; "
         f"защищённые лиды: {sum(len(d.package.lead_ids) for d in skipped_protected)}; "
         f"изменений: {len(pending_rows)} "
         f"(лиды {count_type('lead', pending_rows)}, компании {count_type('company', pending_rows)}, контакты {count_type('contact', pending_rows)}).",
@@ -827,9 +874,9 @@ def run(
         "packages_total": len(packages),
         "packages_transfer": len(eligible),
         "protected_taldyk_manager_ids": sorted(protected_taldyk_manager_ids),
-        "packages_skipped_protected_taldyk_managers": len(skipped_taldyk_managers),
-        "leads_skipped_protected_taldyk_managers": sum(
-            len(d.package.lead_ids) for d in skipped_taldyk_managers
+        "packages_skipped_without_nonprotected_majority": len(skipped_taldyk_majority),
+        "leads_skipped_without_nonprotected_majority": sum(
+            len(d.package.lead_ids) for d in skipped_taldyk_majority
         ),
         "protected_lead_ids": sorted(protected_lead_ids),
         "rows_total_transfer": len(transfer_rows),
@@ -854,8 +901,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Переносит только ответственных у пакетов лидов исключённых пользователей. "
-            "Стадии лидов не меняет. Не трогает только пакеты, связанные с "
-            "защищёнными менеджерами Талдыкоргана."
+            "Стадии лидов не меняет. Для 16/18/38 считает все лиды, связанные "
+            "с компанией/контактом: если большинство НЕ на 16/18/38, пакет идёт РОПам."
         )
     )
     parser.add_argument(

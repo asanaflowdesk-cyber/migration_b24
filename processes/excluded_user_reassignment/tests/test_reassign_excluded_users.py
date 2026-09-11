@@ -8,7 +8,8 @@ from reassign_excluded_users import (
     build_rows,
     parse_id_set,
     plan_packages,
-    protected_taldyk_managers,
+    package_has_nonprotected_majority,
+    protected_majority_counts,
     update_owner_safely,
 )
 
@@ -110,34 +111,88 @@ def test_existing_partial_rop_assignment_does_not_anchor_package():
     assert eligible[0].target_owner_id in {72, 73}
 
 
-@pytest.mark.parametrize("manager_id", [16, 18, 38])
-def test_package_linked_to_protected_taldyk_manager_is_skipped(manager_id):
-    companies = [company(1, manager_id)]
-    contacts = [contact(11, 1, manager_id)]
-    leads = [lead(101, 1, 11, 15), lead(102, 1, 11, manager_id)]
-    packages = build_packages(companies, contacts, leads, {15})
-    add_package_context(packages, companies, contacts, leads)
-    eligible, skipped = plan_packages(packages, {16, 18, 38}, set(), (72, 73))
-    assert eligible == []
-    assert len(skipped) == 1
-    assert skipped[0].skip_reason == f"protected_taldyk_manager:{manager_id}"
-
-
-def test_other_manager_is_not_protected_even_if_package_has_existing_owner():
-    companies = [company(1, 13)]
-    contacts = [contact(11, 1, 13)]
-    leads = [lead(101, 1, 11, 15), lead(102, 1, 11, 13)]
+def test_one_protected_lead_does_not_block_when_other_leads_are_majority():
+    companies = [company(1, 16)]
+    contacts = [contact(11, 1, 16)]
+    leads = [
+        lead(101, 1, 11, 15),   # excluded, will be moved
+        lead(102, 1, 11, 16),   # protected manager
+        lead(103, 1, 11, 13),   # other
+    ]
     packages = build_packages(companies, contacts, leads, {15})
     add_package_context(packages, companies, contacts, leads)
     eligible, skipped = plan_packages(packages, {16, 18, 38}, set(), (72, 73))
     assert not skipped
     assert len(eligible) == 1
     assert eligible[0].target_owner_id in {72, 73}
+    assert protected_majority_counts(eligible[0], {16, 18, 38}) == (1, 2, 3)
 
 
-def test_protected_manager_detection_uses_context_owner_ids():
-    package = Package("x", lead_ids={101}, context_owner_ids={15, 18, 72})
-    assert protected_taldyk_managers(package, {16, 18, 38}) == {18}
+def test_protected_managers_win_combined_majority_and_package_is_skipped():
+    companies = [company(1, 13)]
+    contacts = [contact(11, 1, 13)]
+    leads = [
+        lead(101, 1, 11, 15),
+        lead(102, 1, 11, 16),
+        lead(103, 1, 11, 18),
+    ]
+    packages = build_packages(companies, contacts, leads, {15})
+    add_package_context(packages, companies, contacts, leads)
+    eligible, skipped = plan_packages(packages, {16, 18, 38}, set(), (72, 73))
+    assert eligible == []
+    assert len(skipped) == 1
+    assert skipped[0].skip_reason.startswith("protected_taldyk_majority:")
+    assert "protected=2" in skipped[0].skip_reason
+    assert "other=1" in skipped[0].skip_reason
+
+
+def test_tie_is_not_a_nonprotected_majority_so_package_is_skipped():
+    companies = [company(1, 16)]
+    contacts = [contact(11, 1, 16)]
+    leads = [lead(101, 1, 11, 15), lead(102, 1, 11, 16)]
+    packages = build_packages(companies, contacts, leads, {15})
+    add_package_context(packages, companies, contacts, leads)
+    eligible, skipped = plan_packages(packages, {16, 18, 38}, set(), (72, 73))
+    assert eligible == []
+    assert len(skipped) == 1
+    assert "protected=1" in skipped[0].skip_reason
+    assert "other=1" in skipped[0].skip_reason
+
+
+def test_company_or_contact_owner_16_does_not_vote_when_leads_are_not_on_16_18_38():
+    companies = [company(1, 16)]
+    contacts = [contact(11, 1, 18)]
+    leads = [lead(101, 1, 11, 15), lead(102, 1, 11, 13)]
+    packages = build_packages(companies, contacts, leads, {15})
+    add_package_context(packages, companies, contacts, leads)
+    package = packages[0]
+    assert protected_majority_counts(package, {16, 18, 38}) == (0, 2, 2)
+    assert package_has_nonprotected_majority(package, {16, 18, 38})
+    eligible, skipped = plan_packages(packages, {16, 18, 38}, set(), (72, 73))
+    assert not skipped
+    assert len(eligible) == 1
+
+
+def test_nonexcluded_context_leads_vote_in_majority_but_are_not_changed():
+    companies = [company(1, 13)]
+    contacts = [contact(11, 1, 13)]
+    leads = [
+        lead(101, 1, 11, 15),
+        lead(102, 1, 11, 16),
+        lead(103, 1, 11, 13),
+        lead(104, 1, 11, 40),
+    ]
+    packages = build_packages(companies, contacts, leads, {15})
+    add_package_context(packages, companies, contacts, leads)
+    eligible, skipped = plan_packages(packages, {16, 18, 38}, set(), (72, 73))
+    assert not skipped
+    assert protected_majority_counts(eligible[0], {16, 18, 38}) == (1, 3, 4)
+    rows = build_rows(
+        eligible, [], companies, contacts, leads, {15},
+        {13: "M13", 15: "Old", 16: "M16", 40: "M40", 72: "R72", 73: "R73"},
+    )
+    changed_leads = {r["entity_id"] for r in rows if r["entity_type"] == "lead"}
+    assert changed_leads == {101}
 
 
 def test_protected_lead_401_skips_whole_package():
