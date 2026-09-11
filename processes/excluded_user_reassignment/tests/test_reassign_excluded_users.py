@@ -136,3 +136,28 @@ def test_multiple_founders_of_one_company_are_merged_into_one_package():
     assert groups[0].contact_ids == {11, 12}
     assert groups[0].lead_ids == {101, 102}
     assert groups[0].key.startswith("founders:")
+
+
+def test_founders_are_merged_when_shared_company_exists_only_in_lead_links():
+    companies = [company(391, 900), company(501, 900), company(502, 900)]
+    contacts = [
+        director(11, 501, 900, last="Қабдрашев", name="Дидар", second="Айдарханұлы"),
+        director(12, 502, 900, last="Есенбаев", name="Мурат", second="Оразалынович"),
+    ]
+    leads = [lead(101, 391, 11, 900), lead(102, 391, 12, 900)]
+
+    groups = build_owner_groups(companies, contacts, leads, {900})
+
+    assert len(groups) == 1
+    assert groups[0].company_ids == {391, 501, 502}
+    assert groups[0].contact_ids == {11, 12}
+    assert groups[0].lead_ids == {101, 102}
+    assert "қабдрашев" in groups[0].key
+    assert "есенбаев" in groups[0].key
+
+    assign_targets(
+        groups, snapshot(user(77)), companies, contacts, leads, {}, {900}, {900: {10}}
+    )
+    rows = build_change_rows(groups, companies, contacts, leads)
+    assert {row["new_owner_id"] for row in rows} == {77}
+    assert {row["new_status_id"] for row in rows if row["entity_type"] == "lead"} == {"NEW"}

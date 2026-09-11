@@ -120,6 +120,20 @@ def build_owner_groups(
             founder_companies[key].add(company_id)
             company_founders[company_id].add(key)
 
+    # A contact can have another primary COMPANY_ID while a lead links that
+    # same person to the company being reassigned. These real CRM links must
+    # participate in founder merging too; relying only on contact.COMPANY_ID
+    # leaves two founders as separate groups and later reports a false conflict.
+    for lead in leads_list:
+        company_id = normalized_id(lead.get("COMPANY_ID"))
+        contact_id = normalized_id(lead.get("CONTACT_ID"))
+        contact = contact_by_id.get(contact_id or -1)
+        key = founder_key(contact) if contact else None
+        if company_id is not None and key:
+            founder_contacts[key].add(int(contact_id))
+            founder_companies[key].add(company_id)
+            company_founders[company_id].add(key)
+
     # Several directors/owners may be attached to one company. They are one
     # indivisible client package: every connected founder, company and lead
     # must receive the same manager.
