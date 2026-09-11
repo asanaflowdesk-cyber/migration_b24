@@ -87,7 +87,8 @@ jobs:
             echo Не задан secret TARGET_BITRIX_WEBHOOK_URL
             exit /b 1
           )
-          if not exist output mkdir output
+          if exist output rmdir /s /q output
+          mkdir output
           if "%RUN_MODE%"=="apply" (
             ".venv\Scripts\python.exe" -u reassign_excluded_users.py --apply --output-dir output
           ) else (
