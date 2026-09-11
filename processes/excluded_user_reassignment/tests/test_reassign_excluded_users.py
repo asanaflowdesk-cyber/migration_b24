@@ -8,6 +8,8 @@ from reassign_excluded_users import (
     build_owner_groups,
     collect_linkage_issues,
     parse_excluded_user_ids,
+    prepare_lead_statuses,
+    apply_owner_changes,
     split_reassignment_groups,
     verify_changes,
 )
@@ -41,6 +43,62 @@ def lead(lead_id, company_id, contact_id, owner, status="CONVERTED", semantic="S
         "CONTACT_ID": str(contact_id), "ASSIGNED_BY_ID": str(owner),
         "STATUS_ID": status, "STATUS_SEMANTIC_ID": semantic,
     }
+
+
+
+
+class RecordingClient:
+    def __init__(self):
+        self.calls = []
+
+    def update_lead(self, entity_id, fields):
+        self.calls.append(("lead", str(entity_id), dict(fields)))
+
+    def update_company(self, entity_id, fields):
+        self.calls.append(("company", str(entity_id), dict(fields)))
+
+    def update_contact(self, entity_id, fields):
+        self.calls.append(("contact", str(entity_id), dict(fields)))
+
+
+def test_lead_status_is_prepared_before_owner_reassignment():
+    client = RecordingClient()
+    rows = [
+        {
+            "entity_type": "lead", "entity_id": 101, "new_owner_id": 72,
+            "old_status_id": "JUNK", "action": "pending", "error": "",
+        },
+        {
+            "entity_type": "company", "entity_id": 201, "new_owner_id": 72,
+            "old_status_id": "", "action": "pending", "error": "",
+        },
+    ]
+
+    status_result = prepare_lead_statuses(client, rows)
+    assert status_result == {"planned": 1, "updated": 1, "errors": 0}
+    assert client.calls == [("lead", "101", {"STATUS_ID": "NEW"})]
+    assert rows[0]["action"] == "pending"
+
+    owner_result = apply_owner_changes(client, rows)
+    assert owner_result == {"planned": 2, "updated": 2, "errors": 0}
+    assert client.calls[1:] == [
+        ("lead", "101", {"ASSIGNED_BY_ID": 72}),
+        ("company", "201", {"ASSIGNED_BY_ID": 72}),
+    ]
+    assert all(row["action"] == "updated" for row in rows)
+
+
+def test_lead_already_new_skips_status_preparation_but_still_moves_owner():
+    client = RecordingClient()
+    rows = [{
+        "entity_type": "lead", "entity_id": 101, "new_owner_id": 73,
+        "old_status_id": "NEW", "action": "pending", "error": "",
+    }]
+
+    assert prepare_lead_statuses(client, rows) == {"planned": 0, "updated": 0, "errors": 0}
+    assert client.calls == []
+    assert apply_owner_changes(client, rows) == {"planned": 1, "updated": 1, "errors": 0}
+    assert client.calls == [("lead", "101", {"ASSIGNED_BY_ID": 73})]
 
 
 def test_parse_ids_accepts_commas_spaces_and_semicolons():

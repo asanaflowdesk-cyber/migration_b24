@@ -623,24 +623,95 @@ def build_change_rows(
     return rows
 
 
-def apply_changes(client: BitrixClient, rows: list[dict[str, Any]]) -> None:
+def _progress_every() -> int:
+    raw = str(os.getenv("REASSIGN_PROGRESS_EVERY", "25") or "25").strip()
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 25
+
+
+def _print_progress(
+    label: str,
+    done: int,
+    total: int,
+    *,
+    ok: int | None = None,
+    errors: int | None = None,
+    force: bool = False,
+) -> None:
+    if total <= 0:
+        return
+    every = _progress_every()
+    if not force and done not in {1, total} and done % every != 0:
+        return
+    pct = (done / total) * 100.0
+    suffix = ""
+    if ok is not None:
+        suffix += f" | успешно: {ok}"
+    if errors is not None:
+        suffix += f" | ошибок: {errors}"
+    print(f"[{label}] {done}/{total} ({pct:.1f}%){suffix}", flush=True)
+
+
+def prepare_lead_statuses(client: BitrixClient, rows: list[dict[str, Any]]) -> dict[str, int]:
+    """Move leads to NEW before ownership reassignment.
+
+    Stage robots may react to STATUS_ID changes and change the responsible user.  Therefore
+    the status transition is deliberately completed first; ownership is written only after
+    the robot stabilization pause.
+    """
+    lead_rows = [
+        row for row in rows
+        if row["action"] == "pending"
+        and row["entity_type"] == "lead"
+        and str(row.get("old_status_id") or "") != NEW_STATUS_ID
+    ]
+    total = len(lead_rows)
+    ok = 0
+    errors = 0
+    if total:
+        print(
+            f"Подготовка лидов: перевести в статус NEW до переназначения владельца — {total} шт.",
+            flush=True,
+        )
+    for index, row in enumerate(lead_rows, start=1):
+        try:
+            client.update_lead(str(row["entity_id"]), {"STATUS_ID": NEW_STATUS_ID})
+            ok += 1
+        except Exception as exc:  # noqa: BLE001
+            row["action"] = "update_error"
+            row["error"] = f"Не удалось перевести лид в NEW: {exc}"
+            errors += 1
+        _print_progress("СТАТУС NEW", index, total, ok=ok, errors=errors)
+    return {"planned": total, "updated": ok, "errors": errors}
+
+
+def apply_owner_changes(client: BitrixClient, rows: list[dict[str, Any]]) -> dict[str, int]:
+    """Assign owners after NEW-stage robots had time to finish."""
     update_methods = {
         "contact": client.update_contact,
         "company": client.update_company,
         "lead": client.update_lead,
     }
-    for row in rows:
-        if row["action"] != "pending":
-            continue
+    eligible = [row for row in rows if row["action"] == "pending"]
+    total = len(eligible)
+    ok = 0
+    errors = 0
+    if total:
+        print(f"Переназначение владельцев: всего {total} сущностей.", flush=True)
+    for index, row in enumerate(eligible, start=1):
         fields: dict[str, Any] = {"ASSIGNED_BY_ID": int(row["new_owner_id"])}
-        if row["entity_type"] == "lead":
-            fields["STATUS_ID"] = NEW_STATUS_ID
         try:
             update_methods[row["entity_type"]](str(row["entity_id"]), fields)
             row["action"] = "updated"
+            ok += 1
         except Exception as exc:  # noqa: BLE001
             row["action"] = "update_error"
             row["error"] = str(exc)
+            errors += 1
+        _print_progress("ПЕРЕНОС", index, total, ok=ok, errors=errors)
+    return {"planned": total, "updated": ok, "errors": errors}
 
 
 def verify_changes(
@@ -938,28 +1009,46 @@ def run(
         user_names=user_names,
         status_names=status_names,
     )
+    status_result = {"planned": 0, "updated": 0, "errors": 0}
+    owner_result = {"planned": 0, "updated": 0, "errors": 0}
     if apply:
-        apply_changes(client, rows)
         stabilize_seconds = float(os.getenv("REASSIGN_STABILIZE_SECONDS", "12"))
         final_wait_seconds = float(os.getenv("REASSIGN_FINAL_WAIT_SECONDS", "5"))
-        if stabilize_seconds > 0:
+
+        # Important: NEW first, owner second.  Robots attached to entering NEW can otherwise
+        # overwrite ASSIGNED_BY_ID after we have just reassigned the lead.
+        status_result = prepare_lead_statuses(client, rows)
+        if stabilize_seconds > 0 and status_result["planned"]:
             print(
-                f"Ожидание {stabilize_seconds:g} сек. перед проверкой роботов Bitrix24..."
+                f"Ожидание {stabilize_seconds:g} сек. — даём роботам Bitrix24 отработать после NEW...",
+                flush=True,
             )
             time.sleep(stabilize_seconds)
+
+        owner_result = apply_owner_changes(client, rows)
+        if final_wait_seconds > 0 and owner_result["planned"]:
+            print(
+                f"Ожидание {final_wait_seconds:g} сек. перед контрольным чтением...",
+                flush=True,
+            )
+            time.sleep(final_wait_seconds)
+
         refreshed_companies, refreshed_contacts, refreshed_leads = load_crm(client)
         verify_changes(rows, refreshed_companies, refreshed_contacts, refreshed_leads)
-        if not any(row["action"] == "verify_error" for row in rows):
-            if final_wait_seconds > 0:
-                print(
-                    f"Ожидание {final_wait_seconds:g} сек. перед итоговой проверкой..."
-                )
-                time.sleep(final_wait_seconds)
-            refreshed_companies, refreshed_contacts, refreshed_leads = load_crm(client)
-            verify_changes(rows, refreshed_companies, refreshed_contacts, refreshed_leads)
+        verify_errors_now = sum(row["action"] == "verify_error" for row in rows)
+        verified_now = sum(row["action"] == "updated" for row in rows)
+        verify_total = verified_now + verify_errors_now
+        if verify_total:
+            print(
+                f"[ПРОВЕРКА] подтверждено {verified_now}/{verify_total}; "
+                f"расхождений: {verify_errors_now}",
+                flush=True,
+            )
+
     write_report(output_dir / "excluded_user_reassignment.csv", rows)
     update_errors = sum(row["action"] == "update_error" for row in rows)
     verify_errors = sum(row["action"] == "verify_error" for row in rows)
+    verified_total = sum(row["action"] == "updated" for row in rows)
     summary = {
         "mode_apply": int(apply),
         "excluded_users": len(excluded_user_ids),
@@ -986,8 +1075,16 @@ def run(
         "leads": sum(row["entity_type"] == "lead" for row in rows),
         "companies": sum(row["entity_type"] == "company" for row in rows),
         "contacts": sum(row["entity_type"] == "contact" for row in rows),
+        "planned_total": len(rows),
+        "lead_status_updates_planned": status_result["planned"],
+        "lead_status_updates_ok": status_result["updated"],
+        "lead_status_update_errors": status_result["errors"],
+        "owner_updates_planned": owner_result["planned"],
+        "owner_updates_ok": owner_result["updated"],
+        "owner_update_errors": owner_result["errors"],
         "pending": sum(row["action"] == "pending" for row in rows),
-        "updated": sum(row["action"] == "updated" for row in rows),
+        "updated": verified_total,
+        "verified_total": verified_total,
         "already_matches": sum(row["action"] == "already_matches" for row in rows),
         "update_errors": update_errors,
         "verify_errors": verify_errors,
@@ -1002,6 +1099,15 @@ def run(
     (output_dir / "excluded_user_reassignment_summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    if apply:
+        verification_total = verified_total + verify_errors
+        print(
+            f"[ИТОГ] API принял переназначение владельца: "
+            f"{owner_result['updated']}/{owner_result['planned']}; "
+            f"контроль подтверждён: {verified_total}/{verification_total}; "
+            f"ошибок записи: {update_errors}; расхождений проверки: {verify_errors}",
+            flush=True,
+        )
     return summary
 
 
