@@ -147,6 +147,38 @@ def test_any_non_excluded_lead_owner_protects_entire_package():
         assert str(owner_id) in skipped[0]["error"]
 
 
+def test_missing_founder_becomes_short_company_lead_package():
+    companies = [company(1, 900)]
+    contacts = []
+    leads = [lead(101, 1, 0, 900)]
+    leads[0]["CONTACT_ID"] = ""
+
+    groups = build_owner_groups(companies, contacts, leads, {900})
+
+    assert len(groups) == 1
+    assert groups[0].key == "company:1"
+    assert groups[0].company_ids == {1}
+    assert groups[0].lead_ids == {101}
+    assert groups[0].contact_ids == set()
+    assert "Учредитель не определён" in groups[0].warning
+
+
+def test_missing_company_and_founder_becomes_single_lead_package():
+    companies = []
+    contacts = []
+    row = lead(101, 0, 0, 900)
+    row["COMPANY_ID"] = ""
+    row["CONTACT_ID"] = ""
+
+    groups = build_owner_groups(companies, contacts, [row], {900})
+
+    assert len(groups) == 1
+    assert groups[0].key == "lead:101"
+    assert groups[0].company_ids == set()
+    assert groups[0].contact_ids == set()
+    assert groups[0].lead_ids == {101}
+
+
 def test_packages_are_balanced_by_lead_count_between_rops():
     groups = [
         OwnerGroup("a", {900}, set(), set(), set(range(1, 6))),
@@ -173,7 +205,7 @@ def test_no_seed_leads_is_blocking():
         build_owner_groups([], [], [], {900})
 
 
-def test_taldykorgan_only_package_remains_eligible():
+def test_any_taldykorgan_package_is_skipped():
     companies = [company(224, 900)]
     contacts = [director(11, 224, 900)]
     leads = [lead(101, 224, 11, 900)]
@@ -183,10 +215,10 @@ def test_taldykorgan_only_package_remains_eligible():
         groups, companies, contacts, leads, {900}, {900: {"УП г. Талдыкорган"}}
     )
 
-    assert len(eligible) == 1
-    assert skipped == []
-    assign_targets(eligible, (72, 73))
-    assert eligible[0].target_owner_id in {72, 73}
+    assert eligible == []
+    assert len(skipped) == 1
+    assert skipped[0]["lead_id"] == 101
+    assert "skipped_taldykorgan" in skipped[0]["action"]
 
 
 def test_taldykorgan_plus_other_branch_skips_whole_package():
@@ -210,8 +242,8 @@ def test_taldykorgan_plus_other_branch_skips_whole_package():
 
     assert eligible == []
     assert {row["lead_id"] for row in skipped} == {101, 102}
-    assert all("skipped_multibranch_taldykorgan" in row["action"] for row in skipped)
-    assert all("по ответственным" in row["error"] for row in skipped)
+    assert all("skipped_taldykorgan" in row["action"] for row in skipped)
+    assert all("связан с Талдыкорганом" in row["error"] for row in skipped)
 
 
 def test_company_address_does_not_define_branch_for_taldykorgan_rule():
@@ -257,7 +289,7 @@ def test_package_owned_only_by_excluded_users_can_be_redistributed():
     assert skipped == []
 
 
-def test_verification_rejects_lead_that_did_not_move_to_new():
+def test_verification_keeps_owner_success_separate_from_status_robot_drift():
     rows = [{
         "entity_type": "lead", "entity_id": 101, "new_owner_id": 77,
         "action": "updated", "error": "",
@@ -266,7 +298,8 @@ def test_verification_rejects_lead_that_did_not_move_to_new():
         rows, [], [],
         [{"ID": "101", "ASSIGNED_BY_ID": "77", "STATUS_ID": "JUNK"}],
     )
-    assert rows[0]["action"] == "verify_error"
+    assert rows[0]["action"] == "updated"
+    assert "STATUS_ID='JUNK'" in rows[0]["warning"]
 
 
 def test_multiple_founders_of_one_company_are_merged_into_one_package():
