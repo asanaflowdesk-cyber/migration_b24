@@ -169,8 +169,30 @@ def test_linkage_validation_reports_missing_company_and_contact():
     issues = collect_linkage_issues([], [], leads, {101})
 
     assert len(issues) == 1
+    assert issues[0]["action"] == "blocked_missing_company"
     assert "COMPANY_ID" in issues[0]["error"]
     assert "CONTACT_ID" in issues[0]["error"]
+
+
+def test_lead_without_founder_is_skipped_without_moving_its_company():
+    companies = [company(1, 900), company(2, 900)]
+    contacts = [linked_contact(12, 2, 900, last="Петров", name="Пётр")]
+    leads = [
+        lead(101, 1, "", 900),
+        lead(102, 2, 12, 900),
+    ]
+    issues = collect_linkage_issues(companies, contacts, leads, {101, 102})
+    assert len(issues) == 1
+    assert issues[0]["lead_id"] == 101
+    assert issues[0]["action"] == "skipped_missing_founder"
+
+    groups = build_owner_groups(
+        companies, contacts, leads, {900}, skip_lead_ids={101}
+    )
+
+    assert len(groups) == 1
+    assert groups[0].lead_ids == {102}
+    assert groups[0].company_ids == {2}
 
 
 def test_extended_report_contains_decision_fields_on_lead_row():

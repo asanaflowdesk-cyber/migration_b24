@@ -100,7 +100,9 @@ def build_owner_groups(
     contacts: Iterable[dict[str, Any]],
     leads: Iterable[dict[str, Any]],
     excluded_user_ids: set[int],
+    skip_lead_ids: set[int] | None = None,
 ) -> list[OwnerGroup]:
+    skip_lead_ids = skip_lead_ids or set()
     companies_list = list(companies)
     contacts_list = list(contacts)
     leads_list = list(leads)
@@ -206,8 +208,11 @@ def build_owner_groups(
         lead
         for lead in leads_list
         if normalized_id(lead.get("ASSIGNED_BY_ID")) in excluded_user_ids
+        and _entity_id(lead) not in skip_lead_ids
     ]
     if not seed_leads:
+        if skip_lead_ids:
+            return []
         raise ReassignmentError(
             "У указанных пользователей не найдено ни одного лида; изменения не требуются"
         )
@@ -255,6 +260,8 @@ def build_owner_groups(
             group.company_ids.update(group_companies[group.key])
 
         for lead_id, lead in lead_by_id.items():
+            if lead_id in skip_lead_ids:
+                continue
             company_id = normalized_id(lead.get("COMPANY_ID"))
             contact_id = normalized_id(lead.get("CONTACT_ID"))
             if company_id in group.company_ids or contact_id in group.contact_ids:
@@ -325,6 +332,11 @@ def collect_linkage_issues(
             errors.append("у контакта учредителя не заполнены фамилия и имя")
         if not errors:
             continue
+        action = (
+            "blocked_missing_company"
+            if any("COMPANY_ID" in error or "компания ID=" in error for error in errors)
+            else "skipped_missing_founder"
+        )
         issues.append(
             {
                 "lead_id": lead_id or "",
@@ -336,6 +348,7 @@ def collect_linkage_issues(
                 "company_bin": str((company or {}).get("ORIGIN_ID") or ""),
                 "contact_id": contact_id or "",
                 "founder_name": contact_full_name(contact or {}),
+                "action": action,
                 "error": "; ".join(errors),
             }
         )
@@ -548,7 +561,8 @@ def write_linkage_report(path: Path, rows: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     columns = [
         "lead_id", "lead_title", "old_owner_id", "old_status_id", "company_id",
-        "company_title", "company_bin", "contact_id", "founder_name", "error",
+        "company_title", "company_bin", "contact_id", "founder_name", "action",
+        "error",
     ]
     with path.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=columns)
@@ -670,27 +684,77 @@ def run(
         raise ReassignmentError(
             "У указанных пользователей не найдено ни одного лида; изменения не требуются"
         )
-    seed_issues = collect_linkage_issues(companies, contacts, leads, seed_lead_ids)
-    if seed_issues:
-        write_linkage_report(
-            output_dir / "excluded_user_reassignment_linkage_errors.csv", seed_issues
-        )
-        raise ReassignmentError(
-            f"У {len(seed_issues)} исходных лидов отсутствует обязательная связка "
-            "учредитель–компания; подробности сохранены в отчёте"
-        )
-    groups = build_owner_groups(companies, contacts, leads, excluded_user_ids)
-    relevant_lead_ids = set().union(*(group.lead_ids for group in groups))
-    linkage_issues = collect_linkage_issues(
-        companies, contacts, leads, relevant_lead_ids
+    all_lead_ids = {
+        int(lead_id)
+        for lead in leads
+        if (lead_id := _entity_id(lead)) is not None
+    }
+    all_linkage_issues = collect_linkage_issues(
+        companies, contacts, leads, all_lead_ids
     )
-    if linkage_issues:
+    issue_by_lead_id = {
+        int(issue["lead_id"]): issue for issue in all_linkage_issues
+    }
+    seed_issues = [
+        issue_by_lead_id[lead_id]
+        for lead_id in sorted(seed_lead_ids)
+        if lead_id in issue_by_lead_id
+    ]
+    fatal_seed_issues = [
+        issue for issue in seed_issues
+        if issue["action"] == "blocked_missing_company"
+    ]
+    if fatal_seed_issues:
         write_linkage_report(
-            output_dir / "excluded_user_reassignment_linkage_errors.csv", linkage_issues
+            output_dir / "excluded_user_reassignment_linkage_errors.csv",
+            fatal_seed_issues,
         )
         raise ReassignmentError(
-            f"У {len(linkage_issues)} связанных лидов отсутствует обязательная связка "
-            "учредитель–компания; подробности сохранены в отчёте"
+            f"У {len(fatal_seed_issues)} исходных лидов отсутствует компания; "
+            "подробности сохранены в отчёте"
+        )
+    missing_founder_ids = {
+        lead_id
+        for lead_id, issue in issue_by_lead_id.items()
+        if issue["action"] == "skipped_missing_founder"
+    }
+    groups = build_owner_groups(
+        companies,
+        contacts,
+        leads,
+        excluded_user_ids,
+        skip_lead_ids=missing_founder_ids,
+    )
+    relevant_lead_ids = set().union(*(group.lead_ids for group in groups))
+    relevant_company_ids = set().union(*(group.company_ids for group in groups))
+    relevant_contact_ids = set().union(*(group.contact_ids for group in groups))
+    related_issues = [
+        issue
+        for issue in all_linkage_issues
+        if int(issue["lead_id"]) in seed_lead_ids
+        or normalized_id(issue["company_id"]) in relevant_company_ids
+        or normalized_id(issue["contact_id"]) in relevant_contact_ids
+    ]
+    skipped_issues = [
+        issue for issue in related_issues
+        if issue["action"] == "skipped_missing_founder"
+    ]
+    if skipped_issues:
+        write_linkage_report(
+            output_dir / "excluded_user_reassignment_skipped.csv", skipped_issues
+        )
+    fatal_related_issues = [
+        issue for issue in related_issues
+        if issue["action"] == "blocked_missing_company"
+    ]
+    if fatal_related_issues:
+        write_linkage_report(
+            output_dir / "excluded_user_reassignment_linkage_errors.csv",
+            fatal_related_issues,
+        )
+        raise ReassignmentError(
+            f"У {len(fatal_related_issues)} связанных лидов отсутствует компания; "
+            "подробности сохранены в отчёте"
         )
     assign_targets(groups, target_rop_ids)
     relevant_owner_ids = set(target_rop_ids) | set(excluded_user_ids)
@@ -746,6 +810,8 @@ def run(
         "excluded_users": len(excluded_user_ids),
         "excluded_user_ids": sorted(excluded_user_ids),
         "linkage_validation_errors": 0,
+        "skipped_missing_founder": len(skipped_issues),
+        "skipped_lead_ids": [int(issue["lead_id"]) for issue in skipped_issues],
         "founders": len(groups),
         "leads": sum(row["entity_type"] == "lead" for row in rows),
         "companies": sum(row["entity_type"] == "company" for row in rows),

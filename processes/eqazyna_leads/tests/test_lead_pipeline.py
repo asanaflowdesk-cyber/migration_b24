@@ -1022,7 +1022,7 @@ def test_company_fix_has_absolute_priority_and_does_not_consume_capacity():
     assert same_founder_result.assigned_by_id == 77
     assert same_founder_result.assignment_reason == "same_founder_in_run"
     assert other_result.assigned_by_id in {11, 12}
-    assert other_result.assignment_reason == "new_founder_least_loaded"
+    assert other_result.assignment_reason == "non_astana_least_loaded_no_rop_limit"
 
 
 def test_founder_binding_has_priority_over_astana_address():
@@ -1089,16 +1089,16 @@ def test_astana_without_founder_binding_uses_only_department_46():
     assert result.assignment_reason == "astana_new_founder_least_loaded"
 
 
-def test_owner_absent_from_user_list_goes_to_head_of_owners_branch():
+def test_owner_absent_from_user_list_goes_to_astana_head():
     users = [
-        AssignmentUser(11, "Manager", 10, "Алматинский филиал"),
-        AssignmentUser(12, "Manager 2", 10, "Алматинский филиал"),
-        AssignmentUser(99, "Head", 10, "Алматинский филиал", "РОП"),
+        AssignmentUser(11, "Manager", 46, "УП г. Астана"),
+        AssignmentUser(12, "Manager 2", 46, "УП г. Астана"),
+        AssignmentUser(99, "Head", 46, "УП г. Астана", "РОП"),
     ]
-    departments = {10: {"ID": "10", "NAME": "Алматинский филиал", "UF_HEAD": "99"}}
+    departments = {46: {"ID": "46", "NAME": "УП г. Астана", "UF_HEAD": "99"}}
     contact = {"ID": "801", "ASSIGNED_BY_ID": "77"}
     client = sheet_client(users, departments, contact=contact)
-    client.users[77] = {"ID": "77", "ACTIVE": "N", "UF_DEPARTMENT": [10]}
+    client.users[77] = {"ID": "77", "ACTIVE": "N", "UF_DEPARTMENT": [46]}
     subject = LeadPipeline(
         client,
         LeadPipelineConfig(dry_run=True, distribution=sheet_distribution(users)),
@@ -1135,13 +1135,13 @@ def test_single_user_in_branch_receives_all_new_founders_without_limit():
     assert {result.assignment_reason for result in results} == {"single_scope_user_no_limit"}
 
 
-def test_each_manager_gets_one_new_founder_then_overflow_goes_to_head():
+def test_astana_each_manager_gets_one_new_founder_then_overflow_goes_to_head():
     users = [
-        AssignmentUser(11, "Manager", 10, "Алматинский филиал"),
-        AssignmentUser(12, "Manager 2", 10, "Алматинский филиал"),
-        AssignmentUser(99, "Head", 10, "Алматинский филиал", "РОП"),
+        AssignmentUser(11, "Manager", 46, "УП г. Астана"),
+        AssignmentUser(12, "Manager 2", 46, "УП г. Астана"),
+        AssignmentUser(99, "Head", 46, "УП г. Астана", "РОП"),
     ]
-    departments = {10: {"ID": "10", "NAME": "Алматинский филиал", "UF_HEAD": "99"}}
+    departments = {46: {"ID": "46", "NAME": "УП г. Астана", "UF_HEAD": "99"}}
     client = sheet_client(users, departments)
     subject = LeadPipeline(
         client,
@@ -1160,12 +1160,79 @@ def test_each_manager_gets_one_new_founder_then_overflow_goes_to_head():
             enrichment(),
             bin=app.bin,
             director=f"Фамилия{index} Имя{index} Отчество{index}",
+            legal_address="г. Астана",
+            city="Астана",
+            region="г. Астана",
         )
         results.append(subject.process(app, info))
 
     assert {results[0].assigned_by_id, results[1].assigned_by_id} == {11, 12}
     assert results[2].assigned_by_id == 99
-    assert results[2].assignment_reason == "overflow_to_rop"
+    assert results[2].assignment_reason == "astana_overflow_to_rop"
+
+
+def test_non_astana_department_with_multiple_users_does_not_require_rop():
+    users = [
+        AssignmentUser(31, "Taldyk manager 1", 14, "УП г. Талдыкорган"),
+        AssignmentUser(32, "Taldyk manager 2", 14, "УП г. Талдыкорган"),
+        AssignmentUser(33, "Taldyk manager 3", 14, "УП г. Талдыкорган"),
+    ]
+    departments = {14: {"ID": "14", "NAME": "УП г. Талдыкорган", "UF_HEAD": ""}}
+    client = sheet_client(users, departments)
+    subject = LeadPipeline(
+        client,
+        LeadPipelineConfig(
+            dry_run=True,
+            random_seed=2,
+            distribution=sheet_distribution(users),
+        ),
+    )
+
+    subject.validate()
+    results = []
+    for index in range(5):
+        app = replace(application(f"APP-TALDYK-{index}"), bin=f"1234567890{index:02d}")
+        info = replace(
+            enrichment(),
+            bin=app.bin,
+            director=f"Тестов{index} Тест{index} Тестович{index}",
+            legal_address="г. Талдыкорган",
+            city="Талдыкорган",
+            region="область Жетісу",
+        )
+        results.append(subject.process(app, info))
+
+    assert {result.assigned_by_id for result in results} <= {31, 32, 33}
+    assert {result.assignment_reason for result in results} == {
+        "non_astana_least_loaded_no_rop_limit"
+    }
+
+
+def test_missing_non_astana_owner_falls_back_to_department_manager_not_rop():
+    users = [
+        AssignmentUser(31, "Taldyk manager 1", 14, "УП г. Талдыкорган"),
+        AssignmentUser(32, "Taldyk manager 2", 14, "УП г. Талдыкорган"),
+        AssignmentUser(33, "Taldyk manager 3", 14, "УП г. Талдыкорган"),
+    ]
+    departments = {14: {"ID": "14", "NAME": "УП г. Талдыкорган", "UF_HEAD": ""}}
+    contact = {"ID": "801", "ASSIGNED_BY_ID": "77"}
+    client = sheet_client(
+        users,
+        departments,
+        contact=contact,
+        manager_loads={31: 3, 32: 0, 33: 5},
+    )
+    client.users[77] = {"ID": "77", "ACTIVE": "N", "UF_DEPARTMENT": [14]}
+    subject = LeadPipeline(
+        client,
+        LeadPipelineConfig(dry_run=True, distribution=sheet_distribution(users)),
+    )
+
+    subject.validate()
+    result = subject.process(application(), enrichment())
+
+    assert result.assigned_by_id == 32
+    assert result.assignment_reason == "missing_owner_to_department_least_loaded"
 
 
 def test_same_founder_keeps_manager_across_different_bins_without_second_capacity():
@@ -1221,4 +1288,4 @@ def test_random_tie_break_is_applied_only_after_minimum_bitrix_load():
     result = subject.process(application(), enrichment())
 
     assert result.assigned_by_id == 12
-    assert result.assignment_reason == "new_founder_least_loaded"
+    assert result.assignment_reason == "non_astana_least_loaded_no_rop_limit"

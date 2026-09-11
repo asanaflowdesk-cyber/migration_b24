@@ -46,9 +46,10 @@ class LeadPipelineConfig:
     represented by one company, one company requisite and, when a valid
     director name is available, one linked director contact. The responsible
     assignment is taken from the live Google Sheets rules: an explicit BIN
-    binding wins, an active director owner is retained within the proper
-    branch, each regular manager receives at most one new founder per run, and
-    overflow goes to the branch head. Every genuinely new application starts
+    binding wins and an active director owner is retained. For Astana only,
+    each regular manager receives at most one new founder per run and overflow
+    goes to the Astana branch head. Outside Astana the current user list is
+    balanced without requiring a ROP. Every genuinely new application starts
     in NEW. The only exception is a latest related failed lead with the reason
     «Уже работает с Евразией»: the new lead is created in JUNK with that reason.
     No other historical stage or failure reason is inherited.
@@ -245,6 +246,10 @@ class LeadPipeline:
                 for user in self._assignment_users.values()
                 if user.department_id == department_id and is_branch_head(user.role)
             ]
+            if department_id != self.config.astana_department_id:
+                # Outside Astana no overflow-to-ROP rule is used. A branch may
+                # legitimately contain several managers and no ROP.
+                continue
             if len(heads) == 1:
                 self._department_heads[department_id] = heads[0]
             elif len(heads) > 1:
@@ -258,7 +263,7 @@ class LeadPipeline:
                 self._department_heads[department_id] = members[0]
             else:
                 raise DistributionError(
-                    f"Для DepartmentID={department_id} в user_list не указан РОП, "
+                    f"Для Астаны DepartmentID={department_id} в user_list не указан РОП, "
                     f"а в user_list указано {len(members)} сотрудников"
                 )
 
@@ -867,9 +872,9 @@ class LeadPipeline:
             owner_departments = self._owner_department_ids(owner_id)
             for department_id in owner_departments:
                 if department_id in self._users_by_department:
-                    selected = self._department_fallback(department_id)
+                    selected, reason = self._department_fallback(department_id)
                     self._founder_assignments[founder_key] = selected
-                    return selected, "missing_owner_to_department_head"
+                    return selected, reason
             raise DistributionError(
                 f"Ответственного учредителя ID={owner_id} нет в user_list, "
                 "а его подразделение нельзя сопоставить с актуальным РОПом"
@@ -915,6 +920,17 @@ class LeadPipeline:
             for user_id in scope_users
             if not is_branch_head(self._assignment_users[user_id].role)
         ]
+        if not is_astana:
+            # The one-founder limit and overflow to a ROP are Astana-specific.
+            # Other branches participate through their current managers as-is.
+            if not regular_users:
+                raise DistributionError(
+                    "В user_list нет менеджеров для распределения вне Астаны"
+                )
+            selected = self._select_sheet_least_loaded(regular_users)
+            self._founder_assignments[founder_key] = selected
+            return selected, "non_astana_least_loaded_no_rop_limit"
+
         available = [
             user_id
             for user_id in regular_users
@@ -957,19 +973,33 @@ class LeadPipeline:
             if str(value or "").strip().isdigit() and int(str(value)) > 0
         ]
 
-    def _department_fallback(self, department_id: int) -> int:
+    def _department_fallback(self, department_id: int) -> tuple[int, str]:
         members = sorted(set(self._users_by_department.get(department_id, [])))
         if len(members) == 1:
             selected = members[0]
+            reason = "missing_owner_to_single_department_user"
+        elif department_id != self.config.astana_department_id:
+            regular_members = [
+                user_id
+                for user_id in members
+                if not is_branch_head(self._assignment_users[user_id].role)
+            ]
+            if not regular_members:
+                raise DistributionError(
+                    f"Для DepartmentID={department_id} в user_list нет менеджеров"
+                )
+            selected = self._select_sheet_least_loaded(regular_members)
+            return selected, "missing_owner_to_department_least_loaded"
         else:
             head = self._department_heads.get(department_id)
             if head is None:
                 raise DistributionError(
-                    f"Для DepartmentID={department_id} не указан РОП в user_list"
+                    f"Для Астаны DepartmentID={department_id} не указан РОП в user_list"
                 )
             selected = head
+            reason = "missing_owner_to_department_head"
         self._manager_loads[selected] = self._manager_loads.get(selected, 0) + 1
-        return selected
+        return selected, reason
 
     def _select_sheet_least_loaded(self, user_ids: list[int]) -> int:
         minimum = min(self._manager_loads.get(user_id, 0) for user_id in user_ids)
