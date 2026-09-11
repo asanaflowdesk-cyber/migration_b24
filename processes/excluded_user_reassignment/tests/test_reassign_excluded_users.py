@@ -6,6 +6,7 @@ from reassign_excluded_users import (
     assign_targets,
     build_change_rows,
     build_owner_groups,
+    collect_linkage_issues,
     parse_excluded_user_ids,
     verify_changes,
 )
@@ -24,6 +25,13 @@ def director(contact_id, company_id, owner, last="Иванов", name="Иван"
         "ASSIGNED_BY_ID": str(owner), "LAST_NAME": last, "NAME": name,
         "SECOND_NAME": second, "POST": "Руководитель", "COMMENTS": "",
     }
+
+
+def linked_contact(contact_id, company_id, owner, last="Иванов", name="Иван", second="Иванович"):
+    row = director(contact_id, company_id, owner, last, name, second)
+    row["POST"] = ""
+    row["COMMENTS"] = ""
+    return row
 
 
 def lead(lead_id, company_id, contact_id, owner, status="CONVERTED", semantic="S"):
@@ -140,3 +148,54 @@ def test_founders_are_merged_when_shared_company_exists_only_in_lead_links():
     assert len({row["new_owner_id"] for row in rows}) == 1
     assert {row["new_owner_id"] for row in rows} <= {72, 73}
     assert {row["new_status_id"] for row in rows if row["entity_type"] == "lead"} == {"NEW"}
+
+
+def test_contact_linked_directly_to_lead_is_founder_without_service_marker():
+    companies = [company(1, 900, origin_id="123456789012")]
+    contacts = [linked_contact(11, 1, 900, last="Петров", name="Пётр")]
+    leads = [lead(101, 1, 11, 900)]
+
+    groups = build_owner_groups(companies, contacts, leads, {900})
+
+    assert len(groups) == 1
+    assert groups[0].key == "fio:петров|петр|иванович"
+    assert groups[0].contact_ids == {11}
+    assert groups[0].company_ids == {1}
+
+
+def test_linkage_validation_reports_missing_company_and_contact():
+    leads = [lead(101, "", "", 900)]
+
+    issues = collect_linkage_issues([], [], leads, {101})
+
+    assert len(issues) == 1
+    assert "COMPANY_ID" in issues[0]["error"]
+    assert "CONTACT_ID" in issues[0]["error"]
+
+
+def test_extended_report_contains_decision_fields_on_lead_row():
+    companies = [company(1, 900, title="ТОО Тест", origin_id="123456789012")]
+    contacts = [linked_contact(11, 1, 900, last="Петров", name="Пётр")]
+    leads = [lead(101, 1, 11, 900, status="JUNK")]
+    groups = build_owner_groups(companies, contacts, leads, {900})
+    assign_targets(groups, (72, 73))
+
+    rows = build_change_rows(
+        groups, companies, contacts, leads,
+        excluded_user_ids={900},
+        user_names={900: "Старый Менеджер", 72: "РОП 72"},
+        status_names={"JUNK": "Некачественный", "NEW": "Новый лид"},
+    )
+    lead_row = next(row for row in rows if row["entity_type"] == "lead")
+
+    assert lead_row["source_excluded_user_ids"] == "900"
+    assert lead_row["founder_names"] == "Петров Пётр Иванович"
+    assert lead_row["lead_company_id"] == 1
+    assert lead_row["lead_company_bin"] == "123456789012"
+    assert lead_row["lead_contact_id"] == 11
+    assert lead_row["lead_founder_name"] == "Петров Пётр Иванович"
+    assert lead_row["old_status_semantic_id"] == "S"
+    assert lead_row["old_owner_name"] == "Старый Менеджер"
+    assert lead_row["new_owner_name"] == "РОП 72"
+    assert lead_row["old_status_name"] == "Некачественный"
+    assert lead_row["new_status_name"] == "Новый лид"

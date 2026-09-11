@@ -55,6 +55,23 @@ def founder_key(contact: dict[str, Any]) -> str | None:
     return "fio:" + "|".join(parts)
 
 
+def contact_full_name(contact: dict[str, Any]) -> str:
+    return " ".join(
+        str(contact.get(field) or "").strip()
+        for field in ("LAST_NAME", "NAME", "SECOND_NAME")
+        if str(contact.get(field) or "").strip()
+    )
+
+
+def user_full_name(user: dict[str, Any], user_id: int) -> str:
+    name = " ".join(
+        str(user.get(field) or "").strip()
+        for field in ("LAST_NAME", "NAME", "SECOND_NAME")
+        if str(user.get(field) or "").strip()
+    )
+    return name or f"ID {user_id}"
+
+
 def is_director_contact(contact: dict[str, Any]) -> bool:
     return (
         "руковод" in str(contact.get("POST") or "").casefold()
@@ -85,17 +102,30 @@ def build_owner_groups(
     excluded_user_ids: set[int],
 ) -> list[OwnerGroup]:
     companies_list = list(companies)
-    director_contacts = [contact for contact in contacts if is_director_contact(contact)]
+    contacts_list = list(contacts)
     leads_list = list(leads)
     company_ids = {
         company_id
         for company in companies_list
         if (company_id := _entity_id(company)) is not None
     }
+    all_contact_by_id = {
+        contact_id: contact
+        for contact in contacts_list
+        if (contact_id := _entity_id(contact)) is not None
+    }
+    lead_contact_ids = {
+        contact_id
+        for lead in leads_list
+        if (contact_id := normalized_id(lead.get("CONTACT_ID"))) is not None
+    }
+    # CONTACT_ID in a lead is the primary evidence of its founder. Do not drop
+    # a real linked contact merely because POST/COMMENTS lacks a service marker.
     contact_by_id = {
         contact_id: contact
-        for contact in director_contacts
-        if (contact_id := _entity_id(contact)) is not None
+        for contact_id, contact in all_contact_by_id.items()
+        if founder_key(contact)
+        and (contact_id in lead_contact_ids or is_director_contact(contact))
     }
     founder_contacts: dict[str, set[int]] = defaultdict(set)
     founder_companies: dict[str, set[int]] = defaultdict(set)
@@ -265,6 +295,53 @@ def build_owner_groups(
     return sorted(groups.values(), key=lambda item: item.key)
 
 
+def collect_linkage_issues(
+    companies: Iterable[dict[str, Any]],
+    contacts: Iterable[dict[str, Any]],
+    leads: Iterable[dict[str, Any]],
+    lead_ids: set[int],
+) -> list[dict[str, Any]]:
+    company_by_id = {_entity_id(row): row for row in companies if _entity_id(row) is not None}
+    contact_by_id = {_entity_id(row): row for row in contacts if _entity_id(row) is not None}
+    issues: list[dict[str, Any]] = []
+    for lead in leads:
+        lead_id = _entity_id(lead)
+        if lead_id not in lead_ids:
+            continue
+        company_id = normalized_id(lead.get("COMPANY_ID"))
+        contact_id = normalized_id(lead.get("CONTACT_ID"))
+        company = company_by_id.get(company_id)
+        contact = contact_by_id.get(contact_id)
+        errors: list[str] = []
+        if company_id is None:
+            errors.append("не указан COMPANY_ID")
+        elif company is None:
+            errors.append(f"компания ID={company_id} не найдена")
+        if contact_id is None:
+            errors.append("не указан CONTACT_ID учредителя")
+        elif contact is None:
+            errors.append(f"контакт учредителя ID={contact_id} не найден")
+        elif founder_key(contact) is None:
+            errors.append("у контакта учредителя не заполнены фамилия и имя")
+        if not errors:
+            continue
+        issues.append(
+            {
+                "lead_id": lead_id or "",
+                "lead_title": str(lead.get("TITLE") or ""),
+                "old_owner_id": normalized_id(lead.get("ASSIGNED_BY_ID")) or "",
+                "old_status_id": str(lead.get("STATUS_ID") or ""),
+                "company_id": company_id or "",
+                "company_title": str((company or {}).get("TITLE") or ""),
+                "company_bin": str((company or {}).get("ORIGIN_ID") or ""),
+                "contact_id": contact_id or "",
+                "founder_name": contact_full_name(contact or {}),
+                "error": "; ".join(errors),
+            }
+        )
+    return issues
+
+
 def assign_targets(
     groups: list[OwnerGroup],
     target_rop_ids: tuple[int, int],
@@ -289,7 +366,14 @@ def build_change_rows(
     companies: Iterable[dict[str, Any]],
     contacts: Iterable[dict[str, Any]],
     leads: Iterable[dict[str, Any]],
+    *,
+    excluded_user_ids: Iterable[int] = (),
+    user_names: dict[int, str] | None = None,
+    status_names: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
+    user_names = user_names or {}
+    status_names = status_names or {}
+    excluded_ids_text = ",".join(map(str, sorted(set(excluded_user_ids))))
     company_by_id = {_entity_id(row): row for row in companies if _entity_id(row) is not None}
     contact_by_id = {_entity_id(row): row for row in contacts if _entity_id(row) is not None}
     lead_by_id = {_entity_id(row): row for row in leads if _entity_id(row) is not None}
@@ -297,6 +381,32 @@ def build_change_rows(
     for group in groups:
         if group.target_owner_id is None:
             raise ReassignmentError(f"Для группы {group.key} не выбран новый ответственный")
+        founder_names = sorted(
+            {contact_full_name(contact_by_id[contact_id]) for contact_id in group.contact_ids}
+        )
+        package_company_titles = sorted(
+            str(company_by_id[company_id].get("TITLE") or "")
+            for company_id in group.company_ids
+        )
+        package_company_bins = sorted(
+            {
+                str(company_by_id[company_id].get("ORIGIN_ID") or "").strip()
+                for company_id in group.company_ids
+                if str(company_by_id[company_id].get("ORIGIN_ID") or "").strip()
+            }
+        )
+        package_fields = {
+            "source_excluded_user_ids": excluded_ids_text,
+            "package_lead_count": len(group.lead_ids),
+            "package_company_count": len(group.company_ids),
+            "package_contact_count": len(group.contact_ids),
+            "package_seed_old_owner_ids": ",".join(map(str, sorted(group.seed_old_owner_ids))),
+            "founder_contact_ids": ",".join(map(str, sorted(group.contact_ids))),
+            "founder_names": " | ".join(founder_names),
+            "company_ids": ",".join(map(str, sorted(group.company_ids))),
+            "company_titles": " | ".join(package_company_titles),
+            "company_bins": ",".join(package_company_bins),
+        }
         for entity_type, ids, source in (
             ("contact", group.contact_ids, contact_by_id),
             ("company", group.company_ids, company_by_id),
@@ -306,12 +416,32 @@ def build_change_rows(
                 record = source.get(entity_id, {})
                 old_owner = normalized_id(record.get("ASSIGNED_BY_ID"))
                 old_status = str(record.get("STATUS_ID") or "") if entity_type == "lead" else ""
+                lead_company_id = (
+                    normalized_id(record.get("COMPANY_ID"))
+                    if entity_type == "lead" else None
+                )
+                lead_contact_id = (
+                    normalized_id(record.get("CONTACT_ID"))
+                    if entity_type == "lead" else None
+                )
+                lead_company = company_by_id.get(lead_company_id, {})
+                lead_contact = contact_by_id.get(lead_contact_id, {})
                 needs_change = old_owner != group.target_owner_id or (
                     entity_type == "lead" and old_status != NEW_STATUS_ID
                 )
                 rows.append(
                     {
+                        **package_fields,
                         "founder_key": group.key,
+                        "lead_company_id": lead_company_id or "",
+                        "lead_company_title": str(lead_company.get("TITLE") or ""),
+                        "lead_company_bin": str(lead_company.get("ORIGIN_ID") or ""),
+                        "lead_contact_id": lead_contact_id or "",
+                        "lead_founder_name": contact_full_name(lead_contact),
+                        "lead_date_create": (
+                            str(record.get("DATE_CREATE") or "")
+                            if entity_type == "lead" else ""
+                        ),
                         "entity_type": entity_type,
                         "entity_id": entity_id,
                         "title": str(
@@ -322,9 +452,20 @@ def build_change_rows(
                             ).strip()
                         ),
                         "old_owner_id": old_owner or "",
+                        "old_owner_name": user_names.get(old_owner or -1, ""),
                         "new_owner_id": group.target_owner_id,
+                        "new_owner_name": user_names.get(group.target_owner_id, ""),
                         "old_status_id": old_status,
+                        "old_status_name": status_names.get(old_status, "") if old_status else "",
+                        "old_status_semantic_id": (
+                            str(record.get("STATUS_SEMANTIC_ID") or "")
+                            if entity_type == "lead" else ""
+                        ),
                         "new_status_id": NEW_STATUS_ID if entity_type == "lead" else "",
+                        "new_status_name": (
+                            status_names.get(NEW_STATUS_ID, "Новый лид")
+                            if entity_type == "lead" else ""
+                        ),
                         "assignment_reason": group.assignment_reason,
                         "warning": group.warning,
                         "action": "pending" if needs_change else "already_matches",
@@ -386,9 +527,28 @@ def verify_changes(
 def write_report(path: Path, rows: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     columns = [
-        "founder_key", "entity_type", "entity_id", "title", "old_owner_id",
-        "new_owner_id", "old_status_id", "new_status_id", "assignment_reason",
-        "warning", "action", "error",
+        "source_excluded_user_ids", "founder_key", "package_lead_count",
+        "package_company_count", "package_contact_count", "package_seed_old_owner_ids",
+        "founder_contact_ids", "founder_names", "company_ids", "company_titles",
+        "company_bins", "lead_company_id", "lead_company_title", "lead_company_bin",
+        "lead_contact_id", "lead_founder_name", "lead_date_create", "entity_type",
+        "entity_id", "title",
+        "old_owner_id", "old_owner_name", "new_owner_id", "new_owner_name",
+        "old_status_id", "old_status_name", "old_status_semantic_id",
+        "new_status_id", "new_status_name",
+        "assignment_reason", "warning", "action", "error",
+    ]
+    with path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def write_linkage_report(path: Path, rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    columns = [
+        "lead_id", "lead_title", "old_owner_id", "old_status_id", "company_id",
+        "company_title", "company_bin", "contact_id", "founder_name", "error",
     ]
     with path.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=columns)
@@ -438,7 +598,8 @@ def validate_users(
     *,
     label: str,
     require_active: bool = False,
-) -> None:
+) -> dict[int, str]:
+    names: dict[int, str] = {}
     for user_id in sorted(user_ids):
         user = client.get_user(user_id)
         if not user:
@@ -446,6 +607,33 @@ def validate_users(
         active = str(user.get("ACTIVE", "true")).strip().casefold()
         if require_active and active in {"false", "n", "0", "нет"}:
             raise ReassignmentError(f"{label} ID={user_id} неактивен в Bitrix24")
+        names[user_id] = user_full_name(user, user_id)
+    return names
+
+
+def load_user_names(client: BitrixClient, user_ids: Iterable[int]) -> dict[int, str]:
+    names: dict[int, str] = {}
+    for user_id in sorted(set(user_ids)):
+        user = client.get_user(user_id)
+        if user:
+            names[user_id] = user_full_name(user, user_id)
+    return names
+
+
+def load_lead_status_names(client: BitrixClient) -> dict[str, str]:
+    statuses = client.list_all(
+        "crm.status.list",
+        {
+            "order": {"SORT": "ASC"},
+            "filter": {"ENTITY_ID": "STATUS"},
+            "select": ["STATUS_ID", "NAME"],
+        },
+    )
+    return {
+        str(row.get("STATUS_ID") or ""): str(row.get("NAME") or "")
+        for row in statuses
+        if str(row.get("STATUS_ID") or "")
+    }
 
 
 def run(
@@ -453,7 +641,7 @@ def run(
     excluded_user_ids: set[int],
     output_dir: Path,
     apply: bool,
-) -> dict[str, int]:
+) -> dict[str, Any]:
     target_rop_ids = tuple(
         sorted(parse_excluded_user_ids(os.getenv("REASSIGN_TARGET_ROP_IDS", "72,73")))
     )
@@ -465,12 +653,72 @@ def run(
             "ID одновременно указан как исключённый пользователь и целевой РОП: "
             + ", ".join(map(str, overlap))
         )
-    validate_users(client, excluded_user_ids, label="Исключённый пользователь")
-    validate_users(client, target_rop_ids, label="Целевой РОП", require_active=True)
+    excluded_names = validate_users(
+        client, excluded_user_ids, label="Исключённый пользователь"
+    )
+    target_names = validate_users(
+        client, target_rop_ids, label="Целевой РОП", require_active=True
+    )
     companies, contacts, leads = load_crm(client)
+    seed_lead_ids = {
+        int(lead_id)
+        for lead in leads
+        if normalized_id(lead.get("ASSIGNED_BY_ID")) in excluded_user_ids
+        and (lead_id := _entity_id(lead)) is not None
+    }
+    if not seed_lead_ids:
+        raise ReassignmentError(
+            "У указанных пользователей не найдено ни одного лида; изменения не требуются"
+        )
+    seed_issues = collect_linkage_issues(companies, contacts, leads, seed_lead_ids)
+    if seed_issues:
+        write_linkage_report(
+            output_dir / "excluded_user_reassignment_linkage_errors.csv", seed_issues
+        )
+        raise ReassignmentError(
+            f"У {len(seed_issues)} исходных лидов отсутствует обязательная связка "
+            "учредитель–компания; подробности сохранены в отчёте"
+        )
     groups = build_owner_groups(companies, contacts, leads, excluded_user_ids)
+    relevant_lead_ids = set().union(*(group.lead_ids for group in groups))
+    linkage_issues = collect_linkage_issues(
+        companies, contacts, leads, relevant_lead_ids
+    )
+    if linkage_issues:
+        write_linkage_report(
+            output_dir / "excluded_user_reassignment_linkage_errors.csv", linkage_issues
+        )
+        raise ReassignmentError(
+            f"У {len(linkage_issues)} связанных лидов отсутствует обязательная связка "
+            "учредитель–компания; подробности сохранены в отчёте"
+        )
     assign_targets(groups, target_rop_ids)
-    rows = build_change_rows(groups, companies, contacts, leads)
+    relevant_owner_ids = set(target_rop_ids) | set(excluded_user_ids)
+    entity_ids = {
+        "company": set().union(*(group.company_ids for group in groups)),
+        "contact": set().union(*(group.contact_ids for group in groups)),
+        "lead": relevant_lead_ids,
+    }
+    for entity_type, records in (
+        ("company", companies), ("contact", contacts), ("lead", leads)
+    ):
+        relevant_owner_ids.update(
+            owner_id
+            for record in records
+            if _entity_id(record) in entity_ids[entity_type]
+            and (owner_id := normalized_id(record.get("ASSIGNED_BY_ID"))) is not None
+        )
+    known_names = dict(excluded_names)
+    known_names.update(target_names)
+    user_names = load_user_names(client, relevant_owner_ids - set(known_names))
+    user_names.update(known_names)
+    status_names = load_lead_status_names(client)
+    rows = build_change_rows(
+        groups, companies, contacts, leads,
+        excluded_user_ids=excluded_user_ids,
+        user_names=user_names,
+        status_names=status_names,
+    )
     if apply:
         apply_changes(client, rows)
         stabilize_seconds = float(os.getenv("REASSIGN_STABILIZE_SECONDS", "12"))
@@ -496,6 +744,8 @@ def run(
     summary = {
         "mode_apply": int(apply),
         "excluded_users": len(excluded_user_ids),
+        "excluded_user_ids": sorted(excluded_user_ids),
+        "linkage_validation_errors": 0,
         "founders": len(groups),
         "leads": sum(row["entity_type"] == "lead" for row in rows),
         "companies": sum(row["entity_type"] == "company" for row in rows),
