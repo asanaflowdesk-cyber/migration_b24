@@ -80,6 +80,7 @@ jobs:
           EXCLUDED_USER_IDS: ${{ inputs.excluded_user_ids }}
           REASSIGN_TARGET_ROP_IDS: "72,73"
           REASSIGN_PROTECTED_LEAD_IDS: "401"
+          REASSIGN_PROTECTED_TALDYK_MANAGER_IDS: "16,18,38"
           REASSIGN_PROGRESS_EVERY: ${{ vars.REASSIGN_PROGRESS_EVERY || '25' }}
           REASSIGN_FINAL_WAIT_SECONDS: ${{ vars.REASSIGN_FINAL_WAIT_SECONDS || '2' }}
           BITRIX_VERIFY_SSL: ${{ vars.BITRIX_VERIFY_SSL || 'true' }}
