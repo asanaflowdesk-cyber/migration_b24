@@ -347,13 +347,52 @@ def package_has_nonprotected_majority(
     package: Package,
     protected_manager_ids: set[int],
 ) -> bool:
-    """True only when leads NOT on 16/18/38 are a strict majority.
+    """True when leads outside 16/18/38 are a strict majority.
 
-    Example: 3 other vs 2 protected -> redistribute.
-    Example: 1 other vs 1 protected -> do not redistribute (no majority).
+    Such a package goes to ROP 72/73. Otherwise the remaining excluded-user
+    entities are consolidated under whichever of 16/18/38 owns the most linked
+    leads.
     """
     protected, other, total = protected_majority_counts(package, protected_manager_ids)
     return total > 0 and other > protected
+
+
+def protected_manager_vote_counts(
+    package: Package,
+    protected_manager_ids: set[int],
+) -> dict[int, int]:
+    """Count linked leads separately for each protected manager."""
+    return {
+        manager_id: sum(
+            1
+            for owner in package.context_lead_owner_ids.values()
+            if owner == manager_id
+        )
+        for manager_id in sorted(protected_manager_ids)
+    }
+
+
+def select_protected_manager_target(
+    package: Package,
+    protected_manager_ids: set[int],
+) -> tuple[int, dict[int, int], bool]:
+    """Pick the protected manager with the most linked leads.
+
+    A package must not remain hanging. If two or more protected managers have
+    exactly the same maximum count, use the lowest manager ID as a deterministic
+    tie-breaker. The third return value flags that a tie-break was required.
+    """
+    counts = protected_manager_vote_counts(package, protected_manager_ids)
+    if not counts:
+        raise ReassignmentError("Не заданы менеджеры 16/18/38 для остаточного распределения")
+    max_count = max(counts.values())
+    if max_count <= 0:
+        raise ReassignmentError(
+            f"Пакет {package.key}: нет ни одного связанного лида у менеджеров "
+            f"{','.join(map(str, sorted(protected_manager_ids)))}"
+        )
+    winners = [manager_id for manager_id, count in counts.items() if count == max_count]
+    return min(winners), counts, len(winners) > 1
 
 
 def assign_targets(
@@ -383,16 +422,19 @@ def plan_packages(
     protected_lead_ids: set[int],
     target_rop_ids: tuple[int, int],
 ) -> tuple[list[Package], list[PackageDecision]]:
-    """Apply the final package gate.
+    """Choose one target for every package except explicitly protected lead 401.
 
-    1) An explicitly protected lead (401 by default) still blocks the whole package.
-    2) For managers 16/18/38, protection is decided by a LEAD MAJORITY across
-       all leads linked to the same company/contact package.  If leads NOT on
-       16/18/38 are a strict majority, the package is redistributed to the ROPs.
-       If 16/18/38 are the majority, or the vote is tied, the package is untouched.
+    Rule:
+    * if leads outside 16/18/38 are a strict majority -> whole transferable package
+      goes to ROP 72/73 and is balanced by transferable lead count;
+    * otherwise the package is no longer left hanging: all remaining excluded-user
+      leads plus package company/contact are consolidated under whichever of
+      16/18/38 currently owns the most linked leads;
+    * exact tie between protected managers is resolved deterministically by the
+      lowest manager ID so the package cannot remain unresolved;
+    * explicitly protected lead 401 still blocks the whole package.
 
-    Company/contact owners themselves do not vote. Existing non-protected owners
-    do not anchor or block the package.
+    Non-excluded context leads are votes only and are never reassigned.
     """
     eligible: list[Package] = []
     skipped: list[PackageDecision] = []
@@ -411,27 +453,28 @@ def plan_packages(
         protected_count, other_count, total_count = protected_majority_counts(
             package, protected_manager_ids
         )
-        if not package_has_nonprotected_majority(package, protected_manager_ids):
-            protected_present = sorted({
-                owner
-                for owner in package.context_lead_owner_ids.values()
-                if owner in protected_manager_ids
-            })
-            skipped.append(
-                PackageDecision(
-                    package,
-                    "protected_taldyk_majority:"
-                    f"protected={protected_count};other={other_count};total={total_count};"
-                    f"managers={','.join(map(str, protected_present))}",
-                )
-            )
-            continue
 
-        # Leads outside 16/18/38 are the strict majority: redistribute this package.
-        package.target_owner_id = None
-        package.target_reason = ""
+        if package_has_nonprotected_majority(package, protected_manager_ids):
+            package.target_owner_id = None
+            package.target_reason = (
+                "nonprotected_majority_to_rops:"
+                f"protected={protected_count};other={other_count};total={total_count}"
+            )
+        else:
+            target, counts, tie_break = select_protected_manager_target(
+                package, protected_manager_ids
+            )
+            votes = ",".join(f"{manager_id}:{counts[manager_id]}" for manager_id in sorted(counts))
+            package.target_owner_id = target
+            package.target_reason = (
+                f"protected_majority_to_{target}:votes={votes};"
+                f"other={other_count};total={total_count};"
+                f"tie_break={'yes' if tie_break else 'no'}"
+            )
         eligible.append(package)
 
+    # assign_targets only touches packages whose target is still None, i.e. the
+    # strict non-protected-majority packages that must be balanced across the ROPs.
     assign_targets(eligible, target_rop_ids)
     return eligible, skipped
 
@@ -807,19 +850,27 @@ def run(
 
     transfer_rows = [r for r in rows if not str(r["action"]).startswith("skipped_")]
     pending_rows = [r for r in transfer_rows if r["action"] == "pending"]
-    skipped_taldyk_majority = [
-        d for d in skipped if d.skip_reason.startswith("protected_taldyk_majority:")
-    ]
     skipped_protected = [d for d in skipped if d.skip_reason.startswith("protected_lead:")]
+    protected_target_packages = [
+        p for p in eligible if p.target_owner_id in protected_taldyk_manager_ids
+    ]
+    rop_target_packages = [p for p in eligible if p.target_owner_id in set(target_rop_ids)]
 
     def count_type(kind: str, subset: list[dict[str, Any]]) -> int:
         return sum(r["entity_type"] == kind for r in subset)
 
+    protected_distribution = ", ".join(
+        f"{manager_id}: {sum(1 for p in protected_target_packages if p.target_owner_id == manager_id)} пакетов/"
+        f"{sum(len(p.lead_ids) for p in protected_target_packages if p.target_owner_id == manager_id)} остатков-лидов"
+        for manager_id in sorted(protected_taldyk_manager_ids)
+    )
+
     print(
         "[ПЛАН] "
-        f"исходных пакетов: {len(packages)}; к переносу: {len(eligible)}; "
-        f"без большинства вне 16/18/38: {len(skipped_taldyk_majority)} пакетов/"
-        f"{sum(len(d.package.lead_ids) for d in skipped_taldyk_majority)} переносимых лидов; "
+        f"исходных пакетов: {len(packages)}; "
+        f"на РОП 72/73: {len(rop_target_packages)} пакетов; "
+        f"остатки к 16/18/38: {len(protected_target_packages)} пакетов "
+        f"({protected_distribution}); "
         f"защищённые лиды: {sum(len(d.package.lead_ids) for d in skipped_protected)}; "
         f"изменений: {len(pending_rows)} "
         f"(лиды {count_type('lead', pending_rows)}, компании {count_type('company', pending_rows)}, контакты {count_type('contact', pending_rows)}).",
@@ -874,10 +925,8 @@ def run(
         "packages_total": len(packages),
         "packages_transfer": len(eligible),
         "protected_taldyk_manager_ids": sorted(protected_taldyk_manager_ids),
-        "packages_skipped_without_nonprotected_majority": len(skipped_taldyk_majority),
-        "leads_skipped_without_nonprotected_majority": sum(
-            len(d.package.lead_ids) for d in skipped_taldyk_majority
-        ),
+        "packages_to_rops": len(rop_target_packages),
+        "packages_to_protected_managers": len(protected_target_packages),
         "protected_lead_ids": sorted(protected_lead_ids),
         "rows_total_transfer": len(transfer_rows),
         "changes_planned": len(pending_rows),
@@ -894,6 +943,13 @@ def run(
     for rop in target_rop_ids:
         summary[f"rop_{rop}_packages"] = sum(p.target_owner_id == rop for p in eligible)
         summary[f"rop_{rop}_leads"] = sum(len(p.lead_ids) for p in eligible if p.target_owner_id == rop)
+    for manager_id in sorted(protected_taldyk_manager_ids):
+        summary[f"manager_{manager_id}_packages"] = sum(
+            p.target_owner_id == manager_id for p in protected_target_packages
+        )
+        summary[f"manager_{manager_id}_remaining_leads"] = sum(
+            len(p.lead_ids) for p in protected_target_packages if p.target_owner_id == manager_id
+        )
     return summary
 
 
@@ -901,8 +957,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Переносит только ответственных у пакетов лидов исключённых пользователей. "
-            "Стадии лидов не меняет. Для 16/18/38 считает все лиды, связанные "
-            "с компанией/контактом: если большинство НЕ на 16/18/38, пакет идёт РОПам."
+            "Стадии лидов не меняет. Если большинство связанных лидов НЕ на 16/18/38, "
+            "пакет идёт РОПам 72/73. Иначе остатки пакета переходят тому из 16/18/38, "
+            "у кого больше связанных лидов."
         )
     )
     parser.add_argument(
