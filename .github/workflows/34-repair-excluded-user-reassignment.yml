@@ -1,20 +1,16 @@
-name: 33 | Исключённые пользователи — переназначить все лиды
+name: 34 | Восстановить переназначение по плану 2026-09-11
 
 on:
   workflow_dispatch:
     inputs:
-      excluded_user_ids:
-        description: "ID исключённых пользователей через запятую, например: 17,42,86"
-        required: true
-        type: string
       mode:
-        description: "dry_run — отчёт; apply — распределить между РОП 72/73 и вернуть лиды в NEW"
+        description: "dry_run — проверить остаток; apply — исправить только расхождения с сохранённым планом"
         required: true
         default: dry_run
         type: choice
         options: [dry_run, apply]
       confirm:
-        description: "Для apply введите REASSIGN_EXCLUDED_USERS"
+        description: "Для apply введите REPAIR_REASSIGNMENT"
         required: false
         default: ""
         type: string
@@ -32,7 +28,7 @@ env:
   PYTHONIOENCODING: "utf-8"
 
 jobs:
-  reassign:
+  repair:
     runs-on: [self-hosted, Windows, X64]
     timeout-minutes: 120
     defaults:
@@ -54,33 +50,22 @@ jobs:
           if not "%CUSTOM_PIP_INDEX_URL%"=="" set "PIP_INDEX_URL=%CUSTOM_PIP_INDEX_URL%"
           ".venv\Scripts\python.exe" -m pip install -r requirements.txt
 
-      - name: Проверить код
-        env:
-          PYTHONPATH: ${{ github.workspace }};${{ github.workspace }}\processes\eqazyna_leads;${{ github.workspace }}\processes\excluded_user_reassignment
+      - name: Проверить подтверждение
+        if: ${{ inputs.mode == 'apply' && inputs.confirm != 'REPAIR_REASSIGNMENT' }}
         run: |
-          chcp 65001 >nul
-          ".venv\Scripts\python.exe" -m pytest -q tests
-          if errorlevel 1 exit /b 1
-          ".venv\Scripts\python.exe" reassign_excluded_users.py --help >nul
-
-      - name: Проверить подтверждение боевого запуска
-        if: ${{ inputs.mode == 'apply' && inputs.confirm != 'REASSIGN_EXCLUDED_USERS' }}
-        run: |
-          echo Для записи в коробку введите REASSIGN_EXCLUDED_USERS
+          echo Для repair apply введите REPAIR_REASSIGNMENT
           exit /b 1
 
-      - name: Рассчитать или выполнить переназначение
+      - name: Проверить или восстановить по сохранённому плану
         env:
           PYTHONPATH: ${{ github.workspace }};${{ github.workspace }}\processes\eqazyna_leads;${{ github.workspace }}\processes\excluded_user_reassignment
           TARGET_BITRIX_WEBHOOK_URL: ${{ secrets.TARGET_BITRIX_WEBHOOK_URL }}
-          REASSIGN_TARGET_ROP_IDS: "72,73"
           BITRIX_VERIFY_SSL: ${{ vars.BITRIX_VERIFY_SSL || 'true' }}
           BITRIX_CA_BUNDLE: ${{ vars.BITRIX_CA_BUNDLE }}
           BITRIX_REQUEST_TIMEOUT: ${{ vars.BITRIX_REQUEST_TIMEOUT || '45' }}
           REASSIGN_STABILIZE_SECONDS: ${{ vars.REASSIGN_STABILIZE_SECONDS || '12' }}
           REASSIGN_FINAL_WAIT_SECONDS: ${{ vars.REASSIGN_FINAL_WAIT_SECONDS || '5' }}
           REASSIGN_PROGRESS_EVERY: ${{ vars.REASSIGN_PROGRESS_EVERY || '25' }}
-          EXCLUDED_USER_IDS: ${{ inputs.excluded_user_ids }}
           RUN_MODE: ${{ inputs.mode }}
         run: |
           chcp 65001 >nul
@@ -88,21 +73,21 @@ jobs:
             echo Не задан secret TARGET_BITRIX_WEBHOOK_URL
             exit /b 1
           )
-          if exist output rmdir /s /q output
-          mkdir output
+          if exist output_repair rmdir /s /q output_repair
+          mkdir output_repair
           if "%RUN_MODE%"=="apply" (
-            ".venv\Scripts\python.exe" -u reassign_excluded_users.py --apply --output-dir output
+            ".venv\Scripts\python.exe" -u repair_from_plan.py --plan-file repair_plan_20260911.csv --apply --output-dir output_repair
           ) else (
-            ".venv\Scripts\python.exe" -u reassign_excluded_users.py --output-dir output
+            ".venv\Scripts\python.exe" -u repair_from_plan.py --plan-file repair_plan_20260911.csv --output-dir output_repair
           )
           if errorlevel 1 exit /b 1
-          type output\excluded_user_reassignment_summary.json
+          type output_repair\excluded_user_reassignment_repair_summary.json
 
-      - name: Загрузить отчёт
+      - name: Загрузить отчёт repair
         if: ${{ always() }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
-          name: 33-excluded-user-reassignment-${{ github.run_number }}
-          path: processes/excluded_user_reassignment/output/
+          name: 34-repair-excluded-user-reassignment-${{ github.run_number }}
+          path: processes/excluded_user_reassignment/output_repair/
           if-no-files-found: warn
           retention-days: 14
