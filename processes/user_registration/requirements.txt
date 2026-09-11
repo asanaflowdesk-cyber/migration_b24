@@ -1,3 +1,0 @@
-requests==2.33.0
-truststore==0.10.4
-google-auth==2.40.3

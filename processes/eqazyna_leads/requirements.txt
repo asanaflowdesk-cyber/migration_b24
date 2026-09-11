@@ -1,7 +1,0 @@
-requests==2.33.0
-beautifulsoup4==4.13.4
-lxml==6.0.1
-XlsxWriter==3.2.5
-truststore==0.10.4
-google-auth==2.40.3
-pytest==9.0.3
