@@ -1,4 +1,4 @@
-name: 33 | Исключённые пользователи — переназначение одним проходом
+name: 33 | Исключённые пользователи — перенос ответственных
 
 on:
   workflow_dispatch:
@@ -77,8 +77,7 @@ jobs:
           BITRIX_VERIFY_SSL: ${{ vars.BITRIX_VERIFY_SSL || 'true' }}
           BITRIX_CA_BUNDLE: ${{ vars.BITRIX_CA_BUNDLE }}
           BITRIX_REQUEST_TIMEOUT: ${{ vars.BITRIX_REQUEST_TIMEOUT || '45' }}
-          REASSIGN_STABILIZE_SECONDS: ${{ vars.REASSIGN_STABILIZE_SECONDS || '12' }}
-          REASSIGN_FINAL_WAIT_SECONDS: ${{ vars.REASSIGN_FINAL_WAIT_SECONDS || '5' }}
+          REASSIGN_FINAL_WAIT_SECONDS: ${{ vars.REASSIGN_FINAL_WAIT_SECONDS || '2' }}
           REASSIGN_PROGRESS_EVERY: ${{ vars.REASSIGN_PROGRESS_EVERY || '25' }}
           EXCLUDED_USER_IDS: ${{ inputs.excluded_user_ids }}
           RUN_MODE: ${{ inputs.mode }}
