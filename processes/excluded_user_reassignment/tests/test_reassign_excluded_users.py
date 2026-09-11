@@ -46,21 +46,46 @@ def test_parse_ids_accepts_commas_spaces_and_semicolons():
     assert parse_excluded_user_ids("17, 42;86") == {17, 42, 86}
 
 
-def test_all_founder_companies_and_closed_leads_get_one_owner_and_new_status():
+def test_foreign_owner_entities_in_same_founder_package_are_protected():
     companies = [company(1, 900), company(2, 77)]
     contacts = [director(11, 1, 900), director(12, 2, 77)]
     leads = [lead(101, 1, 11, 900), lead(102, 2, 12, 77, status="JUNK", semantic="F")]
     groups = build_owner_groups(companies, contacts, leads, {900})
     assert len(groups) == 1
     assert groups[0].company_ids == {1, 2}
-    assert groups[0].lead_ids == {101, 102}
+    assert groups[0].lead_ids == {101}
 
     assign_targets(groups, (72, 73))
-    rows = build_change_rows(groups, companies, contacts, leads)
+    rows = build_change_rows(
+        groups, companies, contacts, leads, excluded_user_ids={900}
+    )
     assert {row["new_owner_id"] for row in rows} == {72}
     lead_rows = [row for row in rows if row["entity_type"] == "lead"]
+    assert {row["entity_id"] for row in lead_rows} == {101}
     assert {row["new_status_id"] for row in lead_rows} == {"NEW"}
-    assert {row["old_status_id"] for row in lead_rows} == {"CONVERTED", "JUNK"}
+    assert {row["entity_id"] for row in rows if row["entity_type"] == "company"} == {1}
+    assert {row["entity_id"] for row in rows if row["entity_type"] == "contact"} == {11}
+
+
+def test_only_explicitly_excluded_owners_are_changed_in_shared_package():
+    protected_owner_ids = {13, 16, 18, 38, 40, 58}
+    companies = [company(1, 900)]
+    contacts = [director(11, 1, 900)]
+    leads = [lead(101, 1, 11, 900)] + [
+        lead(200 + owner_id, 1, 11, owner_id, status="JUNK", semantic="F")
+        for owner_id in sorted(protected_owner_ids)
+    ]
+
+    groups = build_owner_groups(companies, contacts, leads, {900})
+    assign_targets(groups, (72, 73))
+    rows = build_change_rows(
+        groups, companies, contacts, leads, excluded_user_ids={900}
+    )
+
+    lead_rows = [row for row in rows if row["entity_type"] == "lead"]
+    assert {row["entity_id"] for row in lead_rows} == {101}
+    assert all(row["old_owner_id"] == 900 for row in rows)
+    assert lead_rows[0]["new_status_id"] == "NEW"
 
 
 def test_packages_are_balanced_by_lead_count_between_rops():
@@ -144,7 +169,9 @@ def test_founders_are_merged_when_shared_company_exists_only_in_lead_links():
     assert "есенбаев" in groups[0].key
 
     assign_targets(groups, (72, 73))
-    rows = build_change_rows(groups, companies, contacts, leads)
+    rows = build_change_rows(
+        groups, companies, contacts, leads, excluded_user_ids={900}
+    )
     assert len({row["new_owner_id"] for row in rows}) == 1
     assert {row["new_owner_id"] for row in rows} <= {72, 73}
     assert {row["new_status_id"] for row in rows if row["entity_type"] == "lead"} == {"NEW"}

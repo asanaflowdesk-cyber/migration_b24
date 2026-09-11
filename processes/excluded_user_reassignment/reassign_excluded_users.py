@@ -199,11 +199,6 @@ def build_owner_groups(
     for company_id, keys in company_founders.items():
         company_groups[company_id].update(canonical_by_founder[key] for key in keys)
 
-    lead_by_id = {
-        lead_id: lead
-        for lead in leads_list
-        if (lead_id := _entity_id(lead)) is not None
-    }
     seed_leads = [
         lead
         for lead in leads_list
@@ -252,22 +247,15 @@ def build_owner_groups(
         if contact_id in contact_by_id:
             group.contact_ids.add(int(contact_id))
 
-    # Expand a founder to all same-FIO director cards, their companies and all
-    # linked leads. No status filter is used: closed leads are intentionally included.
+    # Expand only the package context (same-FIO founder cards and companies).
+    # Lead ownership is a hard boundary: a lead is eligible only when its current
+    # ASSIGNED_BY_ID was explicitly entered in excluded_user_ids. In particular,
+    # do not pull another manager's leads merely because they share a company or
+    # founder with an excluded user's lead.
     for group in groups.values():
         if group.key in group_contacts:
             group.contact_ids.update(group_contacts[group.key])
             group.company_ids.update(group_companies[group.key])
-
-        for lead_id, lead in lead_by_id.items():
-            if lead_id in skip_lead_ids:
-                continue
-            company_id = normalized_id(lead.get("COMPANY_ID"))
-            contact_id = normalized_id(lead.get("CONTACT_ID"))
-            if company_id in group.company_ids or contact_id in group.contact_ids:
-                group.lead_ids.add(lead_id)
-                if company_id is not None:
-                    group.company_ids.add(company_id)
 
         for contact_id, contact in contact_by_id.items():
             company_id = normalized_id(contact.get("COMPANY_ID"))
@@ -386,7 +374,8 @@ def build_change_rows(
 ) -> list[dict[str, Any]]:
     user_names = user_names or {}
     status_names = status_names or {}
-    excluded_ids_text = ",".join(map(str, sorted(set(excluded_user_ids))))
+    excluded_ids = set(excluded_user_ids)
+    excluded_ids_text = ",".join(map(str, sorted(excluded_ids)))
     company_by_id = {_entity_id(row): row for row in companies if _entity_id(row) is not None}
     contact_by_id = {_entity_id(row): row for row in contacts if _entity_id(row) is not None}
     lead_by_id = {_entity_id(row): row for row in leads if _entity_id(row) is not None}
@@ -428,6 +417,10 @@ def build_change_rows(
             for entity_id in sorted(ids):
                 record = source.get(entity_id, {})
                 old_owner = normalized_id(record.get("ASSIGNED_BY_ID"))
+                # Leads, companies and contacts already assigned to somebody
+                # outside the manually entered exclusion list are protected.
+                if old_owner not in excluded_ids:
+                    continue
                 old_status = str(record.get("STATUS_ID") or "") if entity_type == "lead" else ""
                 lead_company_id = (
                     normalized_id(record.get("COMPANY_ID"))
@@ -684,13 +677,10 @@ def run(
         raise ReassignmentError(
             "У указанных пользователей не найдено ни одного лида; изменения не требуются"
         )
-    all_lead_ids = {
-        int(lead_id)
-        for lead in leads
-        if (lead_id := _entity_id(lead)) is not None
-    }
+    # Validate only leads that are actually in scope. Broken links belonging to
+    # other managers must neither block this run nor appear as its manual queue.
     all_linkage_issues = collect_linkage_issues(
-        companies, contacts, leads, all_lead_ids
+        companies, contacts, leads, seed_lead_ids
     )
     issue_by_lead_id = {
         int(issue["lead_id"]): issue for issue in all_linkage_issues
@@ -708,16 +698,7 @@ def run(
         skip_lead_ids=skipped_linkage_ids,
     )
     relevant_lead_ids = set().union(*(group.lead_ids for group in groups))
-    relevant_company_ids = set().union(*(group.company_ids for group in groups))
-    relevant_contact_ids = set().union(*(group.contact_ids for group in groups))
-    related_issues = [
-        issue
-        for issue in all_linkage_issues
-        if int(issue["lead_id"]) in seed_lead_ids
-        or normalized_id(issue["company_id"]) in relevant_company_ids
-        or normalized_id(issue["contact_id"]) in relevant_contact_ids
-    ]
-    skipped_issues = list(related_issues)
+    skipped_issues = list(all_linkage_issues)
     if skipped_issues:
         write_linkage_report(
             output_dir / "excluded_user_reassignment_skipped.csv", skipped_issues
