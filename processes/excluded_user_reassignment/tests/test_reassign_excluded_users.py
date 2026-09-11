@@ -116,13 +116,13 @@ def test_no_seed_leads_is_blocking():
 
 
 def test_taldykorgan_only_package_remains_eligible():
-    companies = [company(224, 900, address="Талдыкорган")]
+    companies = [company(224, 900)]
     contacts = [director(11, 224, 900)]
     leads = [lead(101, 224, 11, 900)]
     groups = build_owner_groups(companies, contacts, leads, {900})
 
     eligible, skipped = split_reassignment_groups(
-        groups, companies, contacts, leads, {900}
+        groups, companies, contacts, leads, {900}, {900: {"УП г. Талдыкорган"}}
     )
 
     assert len(eligible) == 1
@@ -132,25 +132,53 @@ def test_taldykorgan_only_package_remains_eligible():
 
 
 def test_taldykorgan_plus_other_branch_skips_whole_package():
-    companies = [
-        company(224, 900, address="Талдыкорган"),
-        company(225, 900, address="Алматы"),
-    ]
+    companies = [company(224, 900), company(225, 901)]
     contacts = [
         director(11, 224, 900, last="Иванов"),
-        director(12, 225, 900, last="Иванов"),
+        director(12, 225, 901, last="Иванов"),
     ]
-    leads = [lead(101, 224, 11, 900), lead(102, 225, 12, 900)]
-    groups = build_owner_groups(companies, contacts, leads, {900})
+    leads = [lead(101, 224, 11, 900), lead(102, 225, 12, 901)]
+    groups = build_owner_groups(companies, contacts, leads, {900, 901})
     assert len(groups) == 1
 
     eligible, skipped = split_reassignment_groups(
-        groups, companies, contacts, leads, {900}
+        groups,
+        companies,
+        contacts,
+        leads,
+        {900, 901},
+        {900: {"УП г. Талдыкорган"}, 901: {"УП г. Алматы"}},
     )
 
     assert eligible == []
     assert {row["lead_id"] for row in skipped} == {101, 102}
     assert all("skipped_multibranch_taldykorgan" in row["action"] for row in skipped)
+    assert all("по ответственным" in row["error"] for row in skipped)
+
+
+def test_company_address_does_not_define_branch_for_taldykorgan_rule():
+    companies = [
+        company(224, 900, address="Талдыкорган"),
+        company(225, 901, address="Алматы"),
+    ]
+    contacts = [
+        director(11, 224, 900, last="Иванов"),
+        director(12, 225, 901, last="Иванов"),
+    ]
+    leads = [lead(101, 224, 11, 900), lead(102, 225, 12, 901)]
+    groups = build_owner_groups(companies, contacts, leads, {900, 901})
+
+    eligible, skipped = split_reassignment_groups(
+        groups,
+        companies,
+        contacts,
+        leads,
+        {900, 901},
+        {900: {"УП г. Алматы"}, 901: {"УП г. Алматы"}},
+    )
+
+    assert len(eligible) == 1
+    assert skipped == []
 
 
 def test_package_owned_only_by_excluded_users_can_be_redistributed():

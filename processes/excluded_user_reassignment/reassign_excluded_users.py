@@ -344,22 +344,30 @@ def collect_linkage_issues(
 
 
 
-def _company_location_text(company: dict[str, Any]) -> str:
-    return " | ".join(
-        str(company.get(field) or "").strip()
-        for field in ("ADDRESS_CITY", "ADDRESS_REGION", "ADDRESS_PROVINCE", "ADDRESS")
-        if str(company.get(field) or "").strip()
-    )
+TALDYKORGAN_TOKENS = ("талдыкорган", "талдықорған", "taldykorgan")
 
 
-def _is_taldykorgan_company(company: dict[str, Any]) -> bool:
-    text = _name_part(_company_location_text(company))
-    return any(token in text for token in ("талдыкорган", "талдықорған", "taldykorgan"))
+def _is_taldykorgan_department_name(value: Any) -> bool:
+    text = _name_part(value)
+    return any(token in text for token in TALDYKORGAN_TOKENS)
 
 
-def _has_other_known_location(company: dict[str, Any]) -> bool:
-    text = _name_part(_company_location_text(company))
-    return bool(text) and not _is_taldykorgan_company(company)
+def _owner_branch_kind(
+    owner_id: int, owner_department_names: dict[int, set[str]],
+) -> str:
+    """Return ``taldykorgan``, ``other`` or ``unknown`` for a CRM owner.
+
+    Branch means the Bitrix24 department of the responsible employee, not the
+    client's legal/postal address. If a user has several department labels and
+    at least one of them is Taldykorgan, we classify the owner as Taldykorgan
+    so a parent/root department does not create a false multi-branch match.
+    """
+    names = {str(name).strip() for name in owner_department_names.get(owner_id, set()) if str(name).strip()}
+    if any(_is_taldykorgan_department_name(name) for name in names):
+        return "taldykorgan"
+    if names:
+        return "other"
+    return "unknown"
 
 
 def split_reassignment_groups(
@@ -368,6 +376,7 @@ def split_reassignment_groups(
     contacts: Iterable[dict[str, Any]],
     leads: Iterable[dict[str, Any]],
     excluded_user_ids: set[int],
+    owner_department_names: dict[int, set[str]] | None = None,
 ) -> tuple[list[OwnerGroup], list[dict[str, Any]]]:
     """Keep only packages that are safe to redistribute.
 
@@ -381,6 +390,7 @@ def split_reassignment_groups(
     companies_list = list(companies)
     contacts_list = list(contacts)
     leads_list = list(leads)
+    owner_department_names = owner_department_names or {}
     company_by_id = {_entity_id(row): row for row in companies_list if _entity_id(row) is not None}
     contact_by_id = {_entity_id(row): row for row in contacts_list if _entity_id(row) is not None}
     lead_by_id = {_entity_id(row): row for row in leads_list if _entity_id(row) is not None}
@@ -412,14 +422,17 @@ def split_reassignment_groups(
 
         protected_owner_ids = sorted(package_owner_ids - excluded_user_ids)
 
-        package_companies = [
-            company_by_id[company_id]
-            for company_id in sorted(group.company_ids)
-            if company_id in company_by_id
-        ]
-        has_taldykorgan = any(_is_taldykorgan_company(company) for company in package_companies)
-        has_other_branch = any(_has_other_known_location(company) for company in package_companies)
-        is_multibranch_taldykorgan = has_taldykorgan and has_other_branch
+        taldyk_owner_ids = sorted(
+            owner_id
+            for owner_id in package_owner_ids
+            if _owner_branch_kind(owner_id, owner_department_names) == "taldykorgan"
+        )
+        other_branch_owner_ids = sorted(
+            owner_id
+            for owner_id in package_owner_ids
+            if _owner_branch_kind(owner_id, owner_department_names) == "other"
+        )
+        is_multibranch_taldykorgan = bool(taldyk_owner_ids and other_branch_owner_ids)
 
         reasons: list[str] = []
         actions: list[str] = []
@@ -431,16 +444,15 @@ def split_reassignment_groups(
             )
         if is_multibranch_taldykorgan:
             actions.append("skipped_multibranch_taldykorgan")
-            locations = sorted(
-                {
-                    _company_location_text(company)
-                    for company in package_companies
-                    if _company_location_text(company)
-                }
-            )
+            branch_details = []
+            for owner_id in taldyk_owner_ids + other_branch_owner_ids:
+                names = sorted(owner_department_names.get(owner_id, set()))
+                branch_details.append(
+                    f"{owner_id}:" + "/".join(names) if names else str(owner_id)
+                )
             reasons.append(
-                "мультифилиальный пакет: Талдыкорган + другой филиал/локация"
-                + (f" ({' | '.join(locations)})" if locations else "")
+                "мультифилиальный пакет по ответственным: Талдыкорган + другой филиал"
+                + (f" ({' | '.join(branch_details)})" if branch_details else "")
             )
 
         if not reasons:
@@ -748,6 +760,67 @@ def validate_users(
     return names
 
 
+def collect_group_owner_ids(
+    groups: Iterable[OwnerGroup],
+    companies: Iterable[dict[str, Any]],
+    contacts: Iterable[dict[str, Any]],
+    leads: Iterable[dict[str, Any]],
+) -> set[int]:
+    """Return owners of every entity connected to the candidate packages."""
+    groups_list = list(groups)
+    company_ids = set().union(*(group.company_ids for group in groups_list)) if groups_list else set()
+    contact_ids = set().union(*(group.contact_ids for group in groups_list)) if groups_list else set()
+    owners: set[int] = set()
+    for row in companies:
+        if _entity_id(row) in company_ids:
+            owner_id = normalized_id(row.get("ASSIGNED_BY_ID"))
+            if owner_id is not None:
+                owners.add(owner_id)
+    for row in contacts:
+        if _entity_id(row) in contact_ids:
+            owner_id = normalized_id(row.get("ASSIGNED_BY_ID"))
+            if owner_id is not None:
+                owners.add(owner_id)
+    for row in leads:
+        company_id = normalized_id(row.get("COMPANY_ID"))
+        contact_id = normalized_id(row.get("CONTACT_ID"))
+        if company_id in company_ids or contact_id in contact_ids:
+            owner_id = normalized_id(row.get("ASSIGNED_BY_ID"))
+            if owner_id is not None:
+                owners.add(owner_id)
+    return owners
+
+
+def load_user_department_names(
+    client: BitrixClient, user_ids: Iterable[int],
+) -> dict[int, set[str]]:
+    """Resolve direct Bitrix24 department names for package owners."""
+    department_cache: dict[int, str] = {}
+    result: dict[int, set[str]] = {}
+    for user_id in sorted(set(user_ids)):
+        user = client.get_user(user_id)
+        if not user:
+            result[user_id] = set()
+            continue
+        raw = user.get("UF_DEPARTMENT")
+        values = raw if isinstance(raw, list) else [raw]
+        department_ids = {
+            department_id
+            for value in values
+            if (department_id := normalized_id(value)) is not None
+        }
+        names: set[str] = set()
+        for department_id in sorted(department_ids):
+            if department_id not in department_cache:
+                department = client.get_department(department_id)
+                department_cache[department_id] = str((department or {}).get("NAME") or "").strip()
+            name = department_cache[department_id]
+            if name:
+                names.add(name)
+        result[user_id] = names
+    return result
+
+
 def load_user_names(client: BitrixClient, user_ids: Iterable[int]) -> dict[int, str]:
     names: dict[int, str] = {}
     for user_id in sorted(set(user_ids)):
@@ -827,8 +900,10 @@ def run(
         excluded_user_ids,
         skip_lead_ids=skipped_linkage_ids,
     )
+    package_owner_ids = collect_group_owner_ids(groups, companies, contacts, leads)
+    owner_department_names = load_user_department_names(client, package_owner_ids)
     groups, package_skip_issues = split_reassignment_groups(
-        groups, companies, contacts, leads, excluded_user_ids
+        groups, companies, contacts, leads, excluded_user_ids, owner_department_names
     )
     relevant_lead_ids = set().union(*(group.lead_ids for group in groups))
     skipped_issues = list(all_linkage_issues) + package_skip_issues
