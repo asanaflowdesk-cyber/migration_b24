@@ -343,6 +343,136 @@ def collect_linkage_issues(
     return issues
 
 
+
+def _company_location_text(company: dict[str, Any]) -> str:
+    return " | ".join(
+        str(company.get(field) or "").strip()
+        for field in ("ADDRESS_CITY", "ADDRESS_REGION", "ADDRESS_PROVINCE", "ADDRESS")
+        if str(company.get(field) or "").strip()
+    )
+
+
+def _is_taldykorgan_company(company: dict[str, Any]) -> bool:
+    text = _name_part(_company_location_text(company))
+    return any(token in text for token in ("талдыкорган", "талдықорған", "taldykorgan"))
+
+
+def _has_other_known_location(company: dict[str, Any]) -> bool:
+    text = _name_part(_company_location_text(company))
+    return bool(text) and not _is_taldykorgan_company(company)
+
+
+def split_reassignment_groups(
+    groups: Iterable[OwnerGroup],
+    companies: Iterable[dict[str, Any]],
+    contacts: Iterable[dict[str, Any]],
+    leads: Iterable[dict[str, Any]],
+    excluded_user_ids: set[int],
+) -> tuple[list[OwnerGroup], list[dict[str, Any]]]:
+    """Keep only packages that are safe to redistribute.
+
+    Two package-level stop rules are intentionally conservative:
+    1. If any entity in the connected package is already owned by a user who is
+       not in the explicit exclusion list, the whole package is left untouched.
+       This prevents a previously distributed package from being split again.
+    2. If the same package spans Taldykorgan and at least one other known
+       location/branch, the whole package is left for manual handling.
+    """
+    companies_list = list(companies)
+    contacts_list = list(contacts)
+    leads_list = list(leads)
+    company_by_id = {_entity_id(row): row for row in companies_list if _entity_id(row) is not None}
+    contact_by_id = {_entity_id(row): row for row in contacts_list if _entity_id(row) is not None}
+    lead_by_id = {_entity_id(row): row for row in leads_list if _entity_id(row) is not None}
+
+    eligible: list[OwnerGroup] = []
+    skipped: list[dict[str, Any]] = []
+
+    for group in groups:
+        related_leads = [
+            lead
+            for lead in leads_list
+            if normalized_id(lead.get("COMPANY_ID")) in group.company_ids
+            or normalized_id(lead.get("CONTACT_ID")) in group.contact_ids
+        ]
+
+        package_owner_ids: set[int] = set()
+        for company_id in group.company_ids:
+            owner_id = normalized_id((company_by_id.get(company_id) or {}).get("ASSIGNED_BY_ID"))
+            if owner_id is not None:
+                package_owner_ids.add(owner_id)
+        for contact_id in group.contact_ids:
+            owner_id = normalized_id((contact_by_id.get(contact_id) or {}).get("ASSIGNED_BY_ID"))
+            if owner_id is not None:
+                package_owner_ids.add(owner_id)
+        for lead in related_leads:
+            owner_id = normalized_id(lead.get("ASSIGNED_BY_ID"))
+            if owner_id is not None:
+                package_owner_ids.add(owner_id)
+
+        protected_owner_ids = sorted(package_owner_ids - excluded_user_ids)
+
+        package_companies = [
+            company_by_id[company_id]
+            for company_id in sorted(group.company_ids)
+            if company_id in company_by_id
+        ]
+        has_taldykorgan = any(_is_taldykorgan_company(company) for company in package_companies)
+        has_other_branch = any(_has_other_known_location(company) for company in package_companies)
+        is_multibranch_taldykorgan = has_taldykorgan and has_other_branch
+
+        reasons: list[str] = []
+        actions: list[str] = []
+        if protected_owner_ids:
+            actions.append("skipped_existing_owner")
+            reasons.append(
+                "пакет уже закреплён за пользователем вне списка исключённых: "
+                + ",".join(map(str, protected_owner_ids))
+            )
+        if is_multibranch_taldykorgan:
+            actions.append("skipped_multibranch_taldykorgan")
+            locations = sorted(
+                {
+                    _company_location_text(company)
+                    for company in package_companies
+                    if _company_location_text(company)
+                }
+            )
+            reasons.append(
+                "мультифилиальный пакет: Талдыкорган + другой филиал/локация"
+                + (f" ({' | '.join(locations)})" if locations else "")
+            )
+
+        if not reasons:
+            eligible.append(group)
+            continue
+
+        action = "+".join(actions)
+        error = "; ".join(reasons)
+        for lead_id in sorted(group.lead_ids):
+            lead = lead_by_id.get(lead_id, {})
+            company_id = normalized_id(lead.get("COMPANY_ID"))
+            contact_id = normalized_id(lead.get("CONTACT_ID"))
+            company = company_by_id.get(company_id, {})
+            contact = contact_by_id.get(contact_id, {})
+            skipped.append(
+                {
+                    "lead_id": lead_id,
+                    "lead_title": str(lead.get("TITLE") or ""),
+                    "old_owner_id": normalized_id(lead.get("ASSIGNED_BY_ID")) or "",
+                    "old_status_id": str(lead.get("STATUS_ID") or ""),
+                    "company_id": company_id or "",
+                    "company_title": str(company.get("TITLE") or ""),
+                    "company_bin": str(company.get("ORIGIN_ID") or ""),
+                    "contact_id": contact_id or "",
+                    "founder_name": contact_full_name(contact),
+                    "action": action,
+                    "error": error,
+                }
+            )
+
+    return sorted(eligible, key=lambda item: item.key), skipped
+
 def assign_targets(
     groups: list[OwnerGroup],
     target_rop_ids: tuple[int, int],
@@ -697,8 +827,11 @@ def run(
         excluded_user_ids,
         skip_lead_ids=skipped_linkage_ids,
     )
+    groups, package_skip_issues = split_reassignment_groups(
+        groups, companies, contacts, leads, excluded_user_ids
+    )
     relevant_lead_ids = set().union(*(group.lead_ids for group in groups))
-    skipped_issues = list(all_linkage_issues)
+    skipped_issues = list(all_linkage_issues) + package_skip_issues
     if skipped_issues:
         write_linkage_report(
             output_dir / "excluded_user_reassignment_skipped.csv", skipped_issues
@@ -763,8 +896,17 @@ def run(
         "skipped_missing_company": sum(
             issue["action"] == "skipped_missing_company" for issue in skipped_issues
         ),
-        "skipped_incomplete_total": len(skipped_issues),
-        "skipped_lead_ids": [int(issue["lead_id"]) for issue in skipped_issues],
+        "skipped_incomplete_total": len(all_linkage_issues),
+        "skipped_existing_owner": sum(
+            "skipped_existing_owner" in str(issue["action"]) for issue in package_skip_issues
+        ),
+        "skipped_multibranch_taldykorgan": sum(
+            "skipped_multibranch_taldykorgan" in str(issue["action"])
+            for issue in package_skip_issues
+        ),
+        "skipped_package_leads_total": len(package_skip_issues),
+        "skipped_total": len(skipped_issues),
+        "skipped_lead_ids": sorted({int(issue["lead_id"]) for issue in skipped_issues}),
         "founders": len(groups),
         "leads": sum(row["entity_type"] == "lead" for row in rows),
         "companies": sum(row["entity_type"] == "company" for row in rows),

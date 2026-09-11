@@ -8,6 +8,7 @@ from reassign_excluded_users import (
     build_owner_groups,
     collect_linkage_issues,
     parse_excluded_user_ids,
+    split_reassignment_groups,
     verify_changes,
 )
 
@@ -46,7 +47,7 @@ def test_parse_ids_accepts_commas_spaces_and_semicolons():
     assert parse_excluded_user_ids("17, 42;86") == {17, 42, 86}
 
 
-def test_foreign_owner_entities_in_same_founder_package_are_protected():
+def test_foreign_owner_in_same_founder_package_skips_whole_package():
     companies = [company(1, 900), company(2, 77)]
     contacts = [director(11, 1, 900), director(12, 2, 77)]
     leads = [lead(101, 1, 11, 900), lead(102, 2, 12, 77, status="JUNK", semantic="F")]
@@ -55,19 +56,18 @@ def test_foreign_owner_entities_in_same_founder_package_are_protected():
     assert groups[0].company_ids == {1, 2}
     assert groups[0].lead_ids == {101}
 
-    assign_targets(groups, (72, 73))
-    rows = build_change_rows(
-        groups, companies, contacts, leads, excluded_user_ids={900}
+    eligible, skipped = split_reassignment_groups(
+        groups, companies, contacts, leads, {900}
     )
-    assert {row["new_owner_id"] for row in rows} == {72}
-    lead_rows = [row for row in rows if row["entity_type"] == "lead"]
-    assert {row["entity_id"] for row in lead_rows} == {101}
-    assert {row["new_status_id"] for row in lead_rows} == {"NEW"}
-    assert {row["entity_id"] for row in rows if row["entity_type"] == "company"} == {1}
-    assert {row["entity_id"] for row in rows if row["entity_type"] == "contact"} == {11}
+
+    assert eligible == []
+    assert len(skipped) == 1
+    assert skipped[0]["lead_id"] == 101
+    assert "skipped_existing_owner" in skipped[0]["action"]
+    assert "77" in skipped[0]["error"]
 
 
-def test_only_explicitly_excluded_owners_are_changed_in_shared_package():
+def test_any_non_excluded_lead_owner_protects_entire_package():
     protected_owner_ids = {13, 16, 18, 38, 40, 58}
     companies = [company(1, 900)]
     contacts = [director(11, 1, 900)]
@@ -77,15 +77,16 @@ def test_only_explicitly_excluded_owners_are_changed_in_shared_package():
     ]
 
     groups = build_owner_groups(companies, contacts, leads, {900})
-    assign_targets(groups, (72, 73))
-    rows = build_change_rows(
-        groups, companies, contacts, leads, excluded_user_ids={900}
+    eligible, skipped = split_reassignment_groups(
+        groups, companies, contacts, leads, {900}
     )
 
-    lead_rows = [row for row in rows if row["entity_type"] == "lead"]
-    assert {row["entity_id"] for row in lead_rows} == {101}
-    assert all(row["old_owner_id"] == 900 for row in rows)
-    assert lead_rows[0]["new_status_id"] == "NEW"
+    assert eligible == []
+    assert len(skipped) == 1
+    assert skipped[0]["lead_id"] == 101
+    assert "skipped_existing_owner" in skipped[0]["action"]
+    for owner_id in protected_owner_ids:
+        assert str(owner_id) in skipped[0]["error"]
 
 
 def test_packages_are_balanced_by_lead_count_between_rops():
@@ -114,14 +115,60 @@ def test_no_seed_leads_is_blocking():
         build_owner_groups([], [], [], {900})
 
 
-def test_company_branch_does_not_change_fixed_rop_pool():
+def test_taldykorgan_only_package_remains_eligible():
     companies = [company(224, 900, address="Талдыкорган")]
     contacts = [director(11, 224, 900)]
     leads = [lead(101, 224, 11, 900)]
     groups = build_owner_groups(companies, contacts, leads, {900})
-    assign_targets(groups, (72, 73))
-    assert groups[0].target_owner_id in {72, 73}
-    assert groups[0].assignment_reason == "balanced_between_rops_72_73"
+
+    eligible, skipped = split_reassignment_groups(
+        groups, companies, contacts, leads, {900}
+    )
+
+    assert len(eligible) == 1
+    assert skipped == []
+    assign_targets(eligible, (72, 73))
+    assert eligible[0].target_owner_id in {72, 73}
+
+
+def test_taldykorgan_plus_other_branch_skips_whole_package():
+    companies = [
+        company(224, 900, address="Талдыкорган"),
+        company(225, 900, address="Алматы"),
+    ]
+    contacts = [
+        director(11, 224, 900, last="Иванов"),
+        director(12, 225, 900, last="Иванов"),
+    ]
+    leads = [lead(101, 224, 11, 900), lead(102, 225, 12, 900)]
+    groups = build_owner_groups(companies, contacts, leads, {900})
+    assert len(groups) == 1
+
+    eligible, skipped = split_reassignment_groups(
+        groups, companies, contacts, leads, {900}
+    )
+
+    assert eligible == []
+    assert {row["lead_id"] for row in skipped} == {101, 102}
+    assert all("skipped_multibranch_taldykorgan" in row["action"] for row in skipped)
+
+
+def test_package_owned_only_by_excluded_users_can_be_redistributed():
+    companies = [company(1, 900), company(2, 901)]
+    contacts = [
+        director(11, 1, 900, last="Иванов"),
+        director(12, 2, 901, last="Иванов"),
+    ]
+    leads = [lead(101, 1, 11, 900), lead(102, 2, 12, 901)]
+    groups = build_owner_groups(companies, contacts, leads, {900, 901})
+
+    eligible, skipped = split_reassignment_groups(
+        groups, companies, contacts, leads, {900, 901}
+    )
+
+    assert len(eligible) == 1
+    assert eligible[0].lead_ids == {101, 102}
+    assert skipped == []
 
 
 def test_verification_rejects_lead_that_did_not_move_to_new():
