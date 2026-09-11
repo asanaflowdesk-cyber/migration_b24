@@ -11,6 +11,7 @@
   30-eqazyna-leads.yml        постоянный парсер e-Qazyna → лиды коробки
   31-company-owner-sync.yml   ответственный компании по контакту руководителя
   32-restore-failed-leads.yml возврат ошибочно проваленных лидов
+  33-reassign-excluded-users.yml все лиды исключённых пользователей → новые ответственные
   40-flowdesk.yml             FlowDesk → пользователь/задача Bitrix24
   50-create-departments.yml   создание отсутствующих подразделений
 
@@ -49,6 +50,7 @@ processes/eqazyna_leads/
 
 processes/user_registration/  отдельный процесс регистрации пользователей
 processes/lead_recovery/       контролируемое восстановление проваленных лидов
+processes/excluded_user_reassignment/ переназначение пакетов учредителей
 processes/flowdesk/            идемпотентное создание задач FlowDesk
 processes/departments/         создание подразделений из JSON
 scripts/prepare-python.cmd     подготовка Python на Windows runner
