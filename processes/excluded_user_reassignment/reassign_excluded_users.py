@@ -381,9 +381,10 @@ def split_reassignment_groups(
     """Keep packages eligible for redistribution.
 
     Package rules:
-    - an already distributed package owned by somebody outside the exclusion list
-      stays untouched as one package;
-    - any package connected to Taldykorgan stays untouched as one package;
+    - the ONLY package-level stop condition is a connection to Taldykorgan;
+    - an owner outside the exclusion list does not block redistribution of the
+      excluded user's package entities (non-excluded leads themselves are never
+      pulled into group.lead_ids);
     - missing founder is NOT a skip condition: company + lead is a shortened
       package, and a lead without a company is a one-lead package.
     """
@@ -421,40 +422,27 @@ def split_reassignment_groups(
             if owner_id is not None:
                 package_owner_ids.add(owner_id)
 
-        protected_owner_ids = sorted(package_owner_ids - excluded_user_ids)
         taldyk_owner_ids = sorted(
             owner_id
             for owner_id in package_owner_ids
             if _owner_branch_kind(owner_id, owner_department_names) == "taldykorgan"
         )
 
-        reasons: list[str] = []
-        actions: list[str] = []
-        if protected_owner_ids:
-            actions.append("skipped_existing_owner")
-            reasons.append(
-                "пакет уже закреплён за пользователем вне списка исключённых: "
-                + ",".join(map(str, protected_owner_ids))
-            )
-        if taldyk_owner_ids:
-            actions.append("skipped_taldykorgan")
-            branch_details = []
-            for owner_id in taldyk_owner_ids:
-                names = sorted(owner_department_names.get(owner_id, set()))
-                branch_details.append(
-                    f"{owner_id}:" + "/".join(names) if names else str(owner_id)
-                )
-            reasons.append(
-                "пакет связан с Талдыкорганом"
-                + (f" ({' | '.join(branch_details)})" if branch_details else "")
-            )
-
-        if not reasons:
+        if not taldyk_owner_ids:
             eligible.append(group)
             continue
 
-        action = "+".join(actions)
-        error = "; ".join(reasons)
+        branch_details = []
+        for owner_id in taldyk_owner_ids:
+            names = sorted(owner_department_names.get(owner_id, set()))
+            branch_details.append(
+                f"{owner_id}:" + "/".join(names) if names else str(owner_id)
+            )
+        action = "skipped_taldykorgan"
+        error = (
+            "пакет связан с Талдыкорганом"
+            + (f" ({' | '.join(branch_details)})" if branch_details else "")
+        )
         for lead_id in sorted(group.lead_ids):
             lead = lead_by_id.get(lead_id, {})
             company_id = normalized_id(lead.get("COMPANY_ID"))
@@ -553,9 +541,12 @@ def build_change_rows(
             for entity_id in sorted(ids):
                 record = source.get(entity_id, {})
                 old_owner = normalized_id(record.get("ASSIGNED_BY_ID"))
-                # Leads, companies and contacts already assigned to somebody
-                # outside the manually entered exclusion list are protected.
-                if old_owner not in excluded_ids:
+                # A package is indivisible for its company/contact context.
+                # Therefore company/contact rows are moved with an eligible package
+                # even when their current owner is outside the exclusion list.
+                # Non-excluded LEADS remain protected because build_owner_groups()
+                # never adds them to group.lead_ids.
+                if entity_type == "lead" and old_owner not in excluded_ids:
                     continue
                 old_status = str(record.get("STATUS_ID") or "") if entity_type == "lead" else ""
                 lead_company_id = (
@@ -1136,9 +1127,6 @@ def run(
         "excluded_users": len(excluded_user_ids),
         "excluded_user_ids": sorted(excluded_user_ids),
         "short_packages": len(all_linkage_issues),
-        "skipped_existing_owner": sum(
-            "skipped_existing_owner" in str(issue["action"]) for issue in package_skip_issues
-        ),
         "skipped_taldykorgan": sum(
             "skipped_taldykorgan" in str(issue["action"]) for issue in package_skip_issues
         ),

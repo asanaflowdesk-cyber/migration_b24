@@ -105,27 +105,27 @@ def test_parse_ids_accepts_commas_spaces_and_semicolons():
     assert parse_excluded_user_ids("17, 42;86") == {17, 42, 86}
 
 
-def test_foreign_owner_in_same_founder_package_skips_whole_package():
+def test_foreign_owner_does_not_block_non_taldyk_package():
     companies = [company(1, 900), company(2, 77)]
     contacts = [director(11, 1, 900), director(12, 2, 77)]
     leads = [lead(101, 1, 11, 900), lead(102, 2, 12, 77, status="JUNK", semantic="F")]
     groups = build_owner_groups(companies, contacts, leads, {900})
     assert len(groups) == 1
     assert groups[0].company_ids == {1, 2}
+    # The other manager's lead is protected by the seed boundary and is not moved.
     assert groups[0].lead_ids == {101}
 
     eligible, skipped = split_reassignment_groups(
-        groups, companies, contacts, leads, {900}
+        groups, companies, contacts, leads, {900},
+        {900: {"УП г. Алматы"}, 77: {"УП г. Алматы"}},
     )
 
-    assert eligible == []
-    assert len(skipped) == 1
-    assert skipped[0]["lead_id"] == 101
-    assert "skipped_existing_owner" in skipped[0]["action"]
-    assert "77" in skipped[0]["error"]
+    assert len(eligible) == 1
+    assert eligible[0].lead_ids == {101}
+    assert skipped == []
 
 
-def test_any_non_excluded_lead_owner_protects_entire_package():
+def test_non_excluded_lead_owners_do_not_block_non_taldyk_package():
     protected_owner_ids = {13, 16, 18, 38, 40, 58}
     companies = [company(1, 900)]
     contacts = [director(11, 1, 900)]
@@ -135,16 +135,16 @@ def test_any_non_excluded_lead_owner_protects_entire_package():
     ]
 
     groups = build_owner_groups(companies, contacts, leads, {900})
+    assert groups[0].lead_ids == {101}
+    dept = {900: {"УП г. Алматы"}}
+    dept.update({owner_id: {"УП г. Алматы"} for owner_id in protected_owner_ids})
     eligible, skipped = split_reassignment_groups(
-        groups, companies, contacts, leads, {900}
+        groups, companies, contacts, leads, {900}, dept
     )
 
-    assert eligible == []
-    assert len(skipped) == 1
-    assert skipped[0]["lead_id"] == 101
-    assert "skipped_existing_owner" in skipped[0]["action"]
-    for owner_id in protected_owner_ids:
-        assert str(owner_id) in skipped[0]["error"]
+    assert len(eligible) == 1
+    assert eligible[0].lead_ids == {101}
+    assert skipped == []
 
 
 def test_missing_founder_becomes_short_company_lead_package():
@@ -424,3 +424,29 @@ def test_extended_report_contains_decision_fields_on_lead_row():
     assert lead_row["new_owner_name"] == "РОП 72"
     assert lead_row["old_status_name"] == "Некачественный"
     assert lead_row["new_status_name"] == "Новый лид"
+
+
+def test_build_plan_moves_package_company_and_contact_even_if_their_owner_is_not_excluded():
+    companies = [company(1, 77)]
+    contacts = [director(11, 1, 77)]
+    leads = [lead(101, 1, 11, 900)]
+    groups = build_owner_groups(companies, contacts, leads, {900})
+    eligible, skipped = split_reassignment_groups(
+        groups, companies, contacts, leads, {900},
+        {900: {"УП г. Алматы"}, 77: {"УП г. Алматы"}},
+    )
+    assert skipped == []
+    eligible[0].target_owner_id = 72
+    eligible[0].assignment_reason = "test"
+    rows = build_change_rows(
+        eligible, companies, contacts, leads,
+        excluded_user_ids={900}, user_names={72: "ROP 72", 77: "Owner 77", 900: "Excluded"},
+        status_names={"NEW": "Новый лид"},
+    )
+    by_type = {row["entity_type"]: row for row in rows}
+    assert set(by_type) == {"company", "contact", "lead"}
+    assert by_type["company"]["old_owner_id"] == 77
+    assert by_type["contact"]["old_owner_id"] == 77
+    assert by_type["company"]["new_owner_id"] == 72
+    assert by_type["contact"]["new_owner_id"] == 72
+    assert by_type["lead"]["old_owner_id"] == 900
