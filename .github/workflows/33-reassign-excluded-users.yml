@@ -1,0 +1,110 @@
+name: 33 | Исключённые пользователи — переназначить все лиды
+
+on:
+  workflow_dispatch:
+    inputs:
+      excluded_user_ids:
+        description: "ID исключённых пользователей через запятую, например: 17,42,86"
+        required: true
+        type: string
+      mode:
+        description: "dry_run — только отчёт; apply — переназначить и вернуть все лиды в NEW"
+        required: true
+        default: dry_run
+        type: choice
+        options: [dry_run, apply]
+      confirm:
+        description: "Для apply введите REASSIGN_EXCLUDED_USERS"
+        required: false
+        default: ""
+        type: string
+
+concurrency:
+  group: excluded-user-reassignment
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  NODE_USE_SYSTEM_CA: "1"
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: "utf-8"
+
+jobs:
+  reassign:
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: cmd
+        working-directory: processes/excluded_user_reassignment
+
+    steps:
+      - name: Получить код репозитория
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - name: Найти Python и создать локальное окружение
+        run: call ..\..\scripts\prepare-python.cmd
+
+      - name: Установить зависимости
+        env:
+          CUSTOM_PIP_INDEX_URL: ${{ vars.PIP_INDEX_URL }}
+        run: |
+          if not "%CUSTOM_PIP_INDEX_URL%"=="" set "PIP_INDEX_URL=%CUSTOM_PIP_INDEX_URL%"
+          ".venv\Scripts\python.exe" -m pip install -r requirements.txt
+
+      - name: Проверить код
+        env:
+          PYTHONPATH: ${{ github.workspace }};${{ github.workspace }}\processes\eqazyna_leads;${{ github.workspace }}\processes\excluded_user_reassignment
+        run: |
+          chcp 65001 >nul
+          ".venv\Scripts\python.exe" -m pytest -q tests
+          if errorlevel 1 exit /b 1
+          ".venv\Scripts\python.exe" reassign_excluded_users.py --help >nul
+
+      - name: Проверить подтверждение боевого запуска
+        if: ${{ inputs.mode == 'apply' && inputs.confirm != 'REASSIGN_EXCLUDED_USERS' }}
+        run: |
+          echo Для записи в коробку введите REASSIGN_EXCLUDED_USERS
+          exit /b 1
+
+      - name: Рассчитать или выполнить переназначение
+        env:
+          PYTHONPATH: ${{ github.workspace }};${{ github.workspace }}\processes\eqazyna_leads;${{ github.workspace }}\processes\excluded_user_reassignment
+          TARGET_BITRIX_WEBHOOK_URL: ${{ secrets.TARGET_BITRIX_WEBHOOK_URL }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          DISTRIBUTION_SHEET_ID: "1WuRHHyQm5lHxDlW81m4P0oZJ6X_SDYj1bN-NOx8aM2k"
+          DISTRIBUTION_USERS_SHEET: "user_list"
+          DISTRIBUTION_FIXES_SHEET: "Company_fix"
+          ASTANA_DEPARTMENT_ID: "46"
+          BITRIX_VERIFY_SSL: ${{ vars.BITRIX_VERIFY_SSL || 'true' }}
+          BITRIX_CA_BUNDLE: ${{ vars.BITRIX_CA_BUNDLE }}
+          BITRIX_REQUEST_TIMEOUT: ${{ vars.BITRIX_REQUEST_TIMEOUT || '45' }}
+          REASSIGN_STABILIZE_SECONDS: ${{ vars.REASSIGN_STABILIZE_SECONDS || '12' }}
+          REASSIGN_FINAL_WAIT_SECONDS: ${{ vars.REASSIGN_FINAL_WAIT_SECONDS || '5' }}
+          EXCLUDED_USER_IDS: ${{ inputs.excluded_user_ids }}
+          RUN_MODE: ${{ inputs.mode }}
+        run: |
+          chcp 65001 >nul
+          if "%TARGET_BITRIX_WEBHOOK_URL%"=="" (
+            echo Не задан secret TARGET_BITRIX_WEBHOOK_URL
+            exit /b 1
+          )
+          if not exist output mkdir output
+          if "%RUN_MODE%"=="apply" (
+            ".venv\Scripts\python.exe" -u reassign_excluded_users.py --apply --output-dir output
+          ) else (
+            ".venv\Scripts\python.exe" -u reassign_excluded_users.py --output-dir output
+          )
+          if errorlevel 1 exit /b 1
+          type output\excluded_user_reassignment_summary.json
+
+      - name: Загрузить отчёт
+        if: ${{ always() }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: 33-excluded-user-reassignment-${{ github.run_number }}
+          path: processes/excluded_user_reassignment/output/
+          if-no-files-found: warn
+          retention-days: 14
