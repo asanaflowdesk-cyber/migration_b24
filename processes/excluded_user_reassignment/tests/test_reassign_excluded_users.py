@@ -123,12 +123,16 @@ def test_verification_rejects_lead_that_did_not_move_to_new():
     assert rows[0]["action"] == "verify_error"
 
 
-def test_conflicting_founders_on_one_company_block_reassignment():
+def test_multiple_founders_of_one_company_are_merged_into_one_package():
     companies = [company(1, 900)]
     contacts = [
         director(11, 1, 900, last="Иванов"),
         director(12, 1, 900, last="Петров"),
     ]
     leads = [lead(101, 1, 11, 900), lead(102, 1, 12, 900)]
-    with pytest.raises(ReassignmentError, match="несколько руководителей|одновременно относится"):
-        build_owner_groups(companies, contacts, leads, {900})
+    groups = build_owner_groups(companies, contacts, leads, {900})
+    assert len(groups) == 1
+    assert groups[0].company_ids == {1}
+    assert groups[0].contact_ids == {11, 12}
+    assert groups[0].lead_ids == {101, 102}
+    assert groups[0].key.startswith("founders:")

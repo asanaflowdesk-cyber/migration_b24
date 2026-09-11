@@ -120,6 +120,49 @@ def build_owner_groups(
             founder_companies[key].add(company_id)
             company_founders[company_id].add(key)
 
+    # Several directors/owners may be attached to one company. They are one
+    # indivisible client package: every connected founder, company and lead
+    # must receive the same manager.
+    parent = {key: key for key in founder_contacts}
+
+    def find(key: str) -> str:
+        while parent[key] != key:
+            parent[key] = parent[parent[key]]
+            key = parent[key]
+        return key
+
+    def union(left: str, right: str) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parent[max(left_root, right_root)] = min(left_root, right_root)
+
+    for keys in company_founders.values():
+        ordered = sorted(keys)
+        for key in ordered[1:]:
+            union(ordered[0], key)
+
+    members_by_root: dict[str, set[str]] = defaultdict(set)
+    for key in parent:
+        members_by_root[find(key)].add(key)
+    canonical_by_founder: dict[str, str] = {}
+    group_contacts: dict[str, set[int]] = defaultdict(set)
+    group_companies: dict[str, set[int]] = defaultdict(set)
+    for members in members_by_root.values():
+        ordered = sorted(members)
+        canonical = (
+            ordered[0]
+            if len(ordered) == 1
+            else "founders:" + " & ".join(key.removeprefix("fio:") for key in ordered)
+        )
+        for key in ordered:
+            canonical_by_founder[key] = canonical
+            group_contacts[canonical].update(founder_contacts[key])
+            group_companies[canonical].update(founder_companies[key])
+    company_groups: dict[int, set[str]] = defaultdict(set)
+    for company_id, keys in company_founders.items():
+        company_groups[company_id].update(canonical_by_founder[key] for key in keys)
+
     lead_by_id = {
         lead_id: lead
         for lead in leads_list
@@ -143,17 +186,13 @@ def build_owner_groups(
         company_id = normalized_id(lead.get("COMPANY_ID"))
         contact_id = normalized_id(lead.get("CONTACT_ID"))
         contact = contact_by_id.get(contact_id or -1)
-        key = founder_key(contact) if contact else None
+        raw_key = founder_key(contact) if contact else None
+        key = canonical_by_founder.get(raw_key) if raw_key else None
         warning = ""
         if key is None and company_id is not None:
-            keys = company_founders.get(company_id, set())
+            keys = company_groups.get(company_id, set())
             if len(keys) == 1:
                 key = next(iter(keys))
-            elif len(keys) > 1:
-                raise ReassignmentError(
-                    f"У компании ID={company_id} найдено несколько руководителей; "
-                    "нельзя однозначно определить учредителя"
-                )
         if key is None and company_id is not None:
             key = f"company:{company_id}"
             warning = "Учредитель не определён; объединение выполнено только в пределах компании"
@@ -177,9 +216,9 @@ def build_owner_groups(
     # Expand a founder to all same-FIO director cards, their companies and all
     # linked leads. No status filter is used: closed leads are intentionally included.
     for group in groups.values():
-        if group.key.startswith("fio:"):
-            group.contact_ids.update(founder_contacts.get(group.key, set()))
-            group.company_ids.update(founder_companies.get(group.key, set()))
+        if group.key in group_contacts:
+            group.contact_ids.update(group_contacts[group.key])
+            group.company_ids.update(group_companies[group.key])
 
         for lead_id, lead in lead_by_id.items():
             company_id = normalized_id(lead.get("COMPANY_ID"))
@@ -193,7 +232,11 @@ def build_owner_groups(
             company_id = normalized_id(contact.get("COMPANY_ID"))
             if company_id not in group.company_ids:
                 continue
-            if group.key.startswith("fio:") and founder_key(contact) != group.key:
+            raw_contact_key = founder_key(contact)
+            if (
+                group.key in group_contacts
+                and canonical_by_founder.get(raw_contact_key or "") != group.key
+            ):
                 continue
             group.contact_ids.add(contact_id)
         group.company_ids.intersection_update(company_ids)
