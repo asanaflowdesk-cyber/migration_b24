@@ -15,9 +15,6 @@ from eqazyna_bitrix.bitrix_client import BitrixClient, BitrixError
 from eqazyna_bitrix.settings import Settings
 
 
-NEW_STATUS_ID = "NEW"
-DEFAULT_PROTECTED_OWNER_IDS = {13, 16, 18, 38, 40, 58}
-DEFAULT_PROTECTED_LEAD_IDS = {401}
 
 
 class ReassignmentError(RuntimeError):
@@ -38,16 +35,6 @@ def parse_excluded_user_ids(value: str) -> set[int]:
         raise ReassignmentError(
             "Некорректные ID исключённых пользователей: " + ", ".join(invalid)
         )
-    return {int(token) for token in tokens}
-
-
-def parse_optional_ids(value: str, default: set[int] | None = None) -> set[int]:
-    tokens = [token.strip() for token in re.split(r"[,;\s]+", value or "") if token.strip()]
-    if not tokens:
-        return set(default or set())
-    invalid = [token for token in tokens if not token.isdigit() or int(token) <= 0]
-    if invalid:
-        raise ReassignmentError("Некорректные ID: " + ", ".join(invalid))
     return {int(token) for token in tokens}
 
 
@@ -333,9 +320,9 @@ def collect_linkage_issues(
         if not errors:
             continue
         action = (
-            "warning_missing_company_lead_only_package"
+            "skipped_missing_company"
             if any("COMPANY_ID" in error or "компания ID=" in error for error in errors)
-            else "warning_missing_founder_short_package"
+            else "skipped_missing_founder"
         )
         issues.append(
             {
@@ -388,27 +375,26 @@ def split_reassignment_groups(
     contacts: Iterable[dict[str, Any]],
     leads: Iterable[dict[str, Any]],
     excluded_user_ids: set[int],
+    target_rop_ids: tuple[int, int],
     owner_department_names: dict[int, set[str]] | None = None,
-    target_owner_ids: set[int] | None = None,
-    *,
-    skip_any_taldykorgan: bool = True,
 ) -> tuple[list[OwnerGroup], list[dict[str, Any]]]:
-    """Keep only packages that are safe to redistribute.
+    """Keep all source packages except packages linked to Taldykorgan.
 
-    Residual runs are intentionally idempotent: entities already moved to one of
-    the target ROPs do not block the package.  Instead the unfinished package is
-    pinned to that same ROP so the package cannot be split between 72 and 73.
-
-    A package is skipped when it contains a real owner outside both the exclusion
-    list and the target ROPs, when both target ROPs are already present in the same
-    package, or (for the current one-off cleanup) when it is linked to a
-    Taldykorgan owner.
+    Important idempotency rules:
+    - 72/73 are migration targets, not evidence that a package belongs to Taldykorgan;
+      their departments are ignored for the Taldykorgan gate.
+    - if any entity of a partially migrated package is already on exactly one of 72/73,
+      the remaining source entities inherit that same target.  We never rebalance an
+      already-started package to the other ROP.
+    - a non-excluded lead is context only and is never reassigned by this flow.
+    - missing founder is not a blocker: company + source lead is a shortened package;
+      a source lead without a company is a one-lead package.
     """
     companies_list = list(companies)
     contacts_list = list(contacts)
     leads_list = list(leads)
     owner_department_names = owner_department_names or {}
-    target_owner_ids = set(target_owner_ids or set())
+    target_ids = set(target_rop_ids)
     company_by_id = {_entity_id(row): row for row in companies_list if _entity_id(row) is not None}
     contact_by_id = {_entity_id(row): row for row in contacts_list if _entity_id(row) is not None}
     lead_by_id = {_entity_id(row): row for row in leads_list if _entity_id(row) is not None}
@@ -422,8 +408,12 @@ def split_reassignment_groups(
             for lead in leads_list
             if normalized_id(lead.get("COMPANY_ID")) in group.company_ids
             or normalized_id(lead.get("CONTACT_ID")) in group.contact_ids
+            or _entity_id(lead) in group.lead_ids
         ]
 
+        # All current owners provide context.  Target ROPs are intentionally excluded
+        # from branch detection because they may be present only due to an earlier
+        # partial migration attempt.
         package_owner_ids: set[int] = set()
         for company_id in group.company_ids:
             owner_id = normalized_id((company_by_id.get(company_id) or {}).get("ASSIGNED_BY_ID"))
@@ -438,70 +428,37 @@ def split_reassignment_groups(
             if owner_id is not None:
                 package_owner_ids.add(owner_id)
 
-        existing_target_ids = sorted(package_owner_ids & target_owner_ids)
-        protected_owner_ids = sorted(
-            package_owner_ids - excluded_user_ids - target_owner_ids
-        )
+        existing_targets = sorted(package_owner_ids & target_ids)
+        if len(existing_targets) > 1:
+            raise ReassignmentError(
+                f"Пакет {group.key} уже частично распределён одновременно на "
+                f"{existing_targets}; автоматическое продолжение остановлено, чтобы не дробить пакет"
+            )
+        if existing_targets:
+            group.target_owner_id = existing_targets[0]
+            group.assignment_reason = "continue_existing_package_target"
 
+        branch_owner_ids = package_owner_ids - target_ids
         taldyk_owner_ids = sorted(
             owner_id
-            for owner_id in package_owner_ids
+            for owner_id in branch_owner_ids
             if _owner_branch_kind(owner_id, owner_department_names) == "taldykorgan"
         )
-        other_branch_owner_ids = sorted(
-            owner_id
-            for owner_id in package_owner_ids
-            if _owner_branch_kind(owner_id, owner_department_names) == "other"
-        )
-        has_taldykorgan = bool(taldyk_owner_ids)
-        is_multibranch_taldykorgan = bool(taldyk_owner_ids and other_branch_owner_ids)
 
-        reasons: list[str] = []
-        actions: list[str] = []
-        if protected_owner_ids:
-            actions.append("skipped_existing_owner")
-            reasons.append(
-                "пакет закреплён за защищённым пользователем вне исключённых и целевых РОПов: "
-                + ",".join(map(str, protected_owner_ids))
-            )
-        if len(existing_target_ids) > 1:
-            actions.append("skipped_conflicting_target_rops")
-            reasons.append(
-                "пакет уже разделён между целевыми РОПами: "
-                + ",".join(map(str, existing_target_ids))
-            )
-        if (skip_any_taldykorgan and has_taldykorgan) or (
-            not skip_any_taldykorgan and is_multibranch_taldykorgan
-        ):
-            actions.append(
-                "skipped_taldykorgan"
-                if skip_any_taldykorgan
-                else "skipped_multibranch_taldykorgan"
-            )
-            branch_details = []
-            for owner_id in sorted(set(taldyk_owner_ids + other_branch_owner_ids)):
-                names = sorted(owner_department_names.get(owner_id, set()))
-                branch_details.append(
-                    f"{owner_id}:" + "/".join(names) if names else str(owner_id)
-                )
-            reasons.append(
-                (
-                    "пакет связан с ответственным из Талдыкоргана"
-                    if skip_any_taldykorgan
-                    else "мультифилиальный пакет по ответственным: Талдыкорган + другой филиал"
-                )
-                + (f" ({' | '.join(branch_details)})" if branch_details else "")
-            )
-
-        if not reasons:
-            if len(existing_target_ids) == 1:
-                group.target_owner_id = existing_target_ids[0]
-                group.assignment_reason = "continue_existing_target_package"
+        if not taldyk_owner_ids:
             eligible.append(group)
             continue
 
-        action = "+".join(actions)
-        error = "; ".join(reasons)
+        branch_details = []
+        for owner_id in taldyk_owner_ids:
+            names = sorted(owner_department_names.get(owner_id, set()))
+            branch_details.append(
+                f"{owner_id}:" + "/".join(names) if names else str(owner_id)
+            )
+        error = (
+            "пакет связан с Талдыкорганом"
+            + (f" ({' | '.join(branch_details)})" if branch_details else "")
+        )
         for lead_id in sorted(group.lead_ids):
             lead = lead_by_id.get(lead_id, {})
             company_id = normalized_id(lead.get("COMPANY_ID"))
@@ -519,7 +476,7 @@ def split_reassignment_groups(
                     "company_bin": str(company.get("ORIGIN_ID") or ""),
                     "contact_id": contact_id or "",
                     "founder_name": contact_full_name(contact),
-                    "action": action,
+                    "action": "skipped_taldykorgan",
                     "error": error,
                 }
             )
@@ -534,25 +491,25 @@ def assign_targets(
     if len(rops) != 2 or any(user_id <= 0 for user_id in rops):
         raise ReassignmentError("Нужно указать ровно два корректных ID РОПов")
 
-    # Packages that already contain exactly one target ROP are pinned to that ROP.
-    # Only completely untouched packages participate in balancing.
+    # Preserve a target already present inside a partially migrated package.  Only
+    # completely new packages are balanced.  Existing packages count toward the
+    # balancing totals so new assignments do not undo earlier distribution.
     planned_leads = {user_id: 0 for user_id in rops}
     for group in groups:
         if group.target_owner_id is not None:
-            if group.target_owner_id not in rops:
+            if group.target_owner_id not in planned_leads:
                 raise ReassignmentError(
-                    f"Пакет {group.key} закреплён за недопустимым целевым ID={group.target_owner_id}"
+                    f"Для пакета {group.key} найден неожиданный целевой владелец "
+                    f"{group.target_owner_id}"
                 )
             planned_leads[group.target_owner_id] += len(group.lead_ids)
 
-    for group in sorted(groups, key=lambda item: (-len(item.lead_ids), item.key)):
-        if group.target_owner_id is not None:
-            continue
+    unassigned = [group for group in groups if group.target_owner_id is None]
+    for group in sorted(unassigned, key=lambda item: (-len(item.lead_ids), item.key)):
         target = min(rops, key=lambda user_id: (planned_leads[user_id], user_id))
         group.target_owner_id = target
         group.assignment_reason = "balanced_between_rops_72_73"
         planned_leads[target] += len(group.lead_ids)
-
 
 def build_change_rows(
     groups: Iterable[OwnerGroup],
@@ -609,9 +566,12 @@ def build_change_rows(
             for entity_id in sorted(ids):
                 record = source.get(entity_id, {})
                 old_owner = normalized_id(record.get("ASSIGNED_BY_ID"))
-                # Leads, companies and contacts already assigned to somebody
-                # outside the manually entered exclusion list are protected.
-                if old_owner not in excluded_ids:
+                # A package is indivisible for its company/contact context.
+                # Therefore company/contact rows are moved with an eligible package
+                # even when their current owner is outside the exclusion list.
+                # Non-excluded LEADS remain protected because build_owner_groups()
+                # never adds them to group.lead_ids.
+                if entity_type == "lead" and old_owner not in excluded_ids:
                     continue
                 old_status = str(record.get("STATUS_ID") or "") if entity_type == "lead" else ""
                 lead_company_id = (
@@ -624,9 +584,7 @@ def build_change_rows(
                 )
                 lead_company = company_by_id.get(lead_company_id, {})
                 lead_contact = contact_by_id.get(lead_contact_id, {})
-                needs_change = old_owner != group.target_owner_id or (
-                    entity_type == "lead" and old_status != NEW_STATUS_ID
-                )
+                needs_change = old_owner != group.target_owner_id
                 rows.append(
                     {
                         **package_fields,
@@ -659,11 +617,8 @@ def build_change_rows(
                             str(record.get("STATUS_SEMANTIC_ID") or "")
                             if entity_type == "lead" else ""
                         ),
-                        "new_status_id": NEW_STATUS_ID if entity_type == "lead" else "",
-                        "new_status_name": (
-                            status_names.get(NEW_STATUS_ID, "Новый лид")
-                            if entity_type == "lead" else ""
-                        ),
+                        "new_status_id": "",
+                        "new_status_name": "",
                         "assignment_reason": group.assignment_reason,
                         "warning": group.warning,
                         "action": "pending" if needs_change else "already_matches",
@@ -704,65 +659,48 @@ def _print_progress(
     print(f"[{label}] {done}/{total} ({pct:.1f}%){suffix}", flush=True)
 
 
-def prepare_lead_statuses(client: BitrixClient, rows: list[dict[str, Any]]) -> dict[str, int]:
-    """Move leads to NEW before ownership reassignment.
-
-    Stage robots may react to STATUS_ID changes and change the responsible user.  Therefore
-    the status transition is deliberately completed first; ownership is written only after
-    the robot stabilization pause.
-    """
-    lead_rows = [
-        row for row in rows
-        if row["action"] == "pending"
-        and row["entity_type"] == "lead"
-        and str(row.get("old_status_id") or "") != NEW_STATUS_ID
-    ]
-    total = len(lead_rows)
-    ok = 0
-    errors = 0
-    if total:
-        print(
-            f"Подготовка лидов: перевести в статус NEW до переназначения владельца — {total} шт.",
-            flush=True,
+def _strict_owner_update(
+    client: BitrixClient,
+    entity_type: str,
+    entity_id: int,
+    new_owner_id: int,
+) -> None:
+    method = {
+        "lead": "crm.lead.update",
+        "company": "crm.company.update",
+        "contact": "crm.contact.update",
+    }[entity_type]
+    result = client.call(
+        method,
+        {
+            "id": int(entity_id),
+            "fields": {"ASSIGNED_BY_ID": int(new_owner_id)},
+            "params": {"REGISTER_SONET_EVENT": "N"},
+        },
+    )
+    if result is not True and str(result).upper() not in {"1", "TRUE"}:
+        raise ReassignmentError(
+            f"{method} ID={entity_id}: Bitrix вернул неожиданный result={result!r}"
         )
-    for index, row in enumerate(lead_rows, start=1):
-        try:
-            client.update_lead(str(row["entity_id"]), {"STATUS_ID": NEW_STATUS_ID})
-            ok += 1
-        except Exception as exc:  # noqa: BLE001
-            row["action"] = "update_error"
-            row["error"] = f"Не удалось перевести лид в NEW: {exc}"
-            errors += 1
-        _print_progress("СТАТУС NEW", index, total, ok=ok, errors=errors)
-    return {"planned": total, "updated": ok, "errors": errors}
 
 
 def apply_owner_changes(client: BitrixClient, rows: list[dict[str, Any]]) -> dict[str, int]:
-    """Write the complete target state in one pass.
-
-    For leads the owner and NEW stage are written in the same crm.lead.update call.
-    That prevents the old two-step repair from leaving a lead with the right owner
-    but a stage already changed back by a robot between calls.
-    """
-    update_methods = {
-        "contact": client.update_contact,
-        "company": client.update_company,
-        "lead": client.update_lead,
-    }
-    eligible = [row for row in rows if row["action"] in {"pending", "verify_error"}]
+    """Change only ASSIGNED_BY_ID. Stages/statuses are never touched by this flow."""
+    eligible = [row for row in rows if row["action"] == "pending"]
     total = len(eligible)
     ok = 0
     errors = 0
     if total:
-        print(f"Перенос пакетов: всего {total} сущностей.", flush=True)
+        print(f"Переназначение владельцев: {total} сущностей.", flush=True)
     for index, row in enumerate(eligible, start=1):
-        fields: dict[str, Any] = {"ASSIGNED_BY_ID": int(row["new_owner_id"])}
-        if row["entity_type"] == "lead":
-            fields["STATUS_ID"] = NEW_STATUS_ID
         try:
-            update_methods[row["entity_type"]](str(row["entity_id"]), fields)
+            _strict_owner_update(
+                client,
+                str(row["entity_type"]),
+                int(row["entity_id"]),
+                int(row["new_owner_id"]),
+            )
             row["action"] = "updated"
-            row["error"] = ""
             ok += 1
         except Exception as exc:  # noqa: BLE001
             row["action"] = "update_error"
@@ -771,35 +709,38 @@ def apply_owner_changes(client: BitrixClient, rows: list[dict[str, Any]]) -> dic
         _print_progress("ПЕРЕНОС", index, total, ok=ok, errors=errors)
     return {"planned": total, "updated": ok, "errors": errors}
 
-
 def verify_changes(
     rows: list[dict[str, Any]],
     companies: Iterable[dict[str, Any]],
     contacts: Iterable[dict[str, Any]],
     leads: Iterable[dict[str, Any]],
-) -> None:
+) -> dict[str, int]:
+    """Verify only ASSIGNED_BY_ID; this flow intentionally does not touch lead stages."""
     sources = {
         "company": {_entity_id(row): row for row in companies if _entity_id(row) is not None},
         "contact": {_entity_id(row): row for row in contacts if _entity_id(row) is not None},
         "lead": {_entity_id(row): row for row in leads if _entity_id(row) is not None},
     }
+    owner_ok = owner_errors = 0
     for row in rows:
         if row["action"] == "update_error":
             continue
         current = sources[row["entity_type"]].get(int(row["entity_id"]))
         current_owner = normalized_id((current or {}).get("ASSIGNED_BY_ID"))
-        owner_matches = current_owner == int(row["new_owner_id"])
-        status_matches = (
-            row["entity_type"] != "lead"
-            or str((current or {}).get("STATUS_ID") or "") == NEW_STATUS_ID
-        )
-        if current is None or not owner_matches or not status_matches:
+        row["current_owner_id"] = current_owner or ""
+        if row["entity_type"] == "lead":
+            row["current_status_id"] = str((current or {}).get("STATUS_ID") or "")
+        if current is None or current_owner != int(row["new_owner_id"]):
             row["action"] = "verify_error"
             row["error"] = (
-                f"Контрольное чтение: owner={current_owner}, "
-                f"status={str((current or {}).get('STATUS_ID') or '')!r}"
+                f"Контроль владельца: owner={current_owner}, ожидается {row['new_owner_id']}"
             )
-
+            owner_errors += 1
+        else:
+            if row["action"] != "already_matches":
+                row["action"] = "updated"
+            owner_ok += 1
+    return {"owner_ok": owner_ok, "owner_errors": owner_errors}
 
 def write_report(path: Path, rows: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -810,8 +751,8 @@ def write_report(path: Path, rows: list[dict[str, Any]]) -> None:
         "company_bins", "lead_company_id", "lead_company_title", "lead_company_bin",
         "lead_contact_id", "lead_founder_name", "lead_date_create", "entity_type",
         "entity_id", "title",
-        "old_owner_id", "old_owner_name", "new_owner_id", "new_owner_name",
-        "old_status_id", "old_status_name", "old_status_semantic_id",
+        "old_owner_id", "old_owner_name", "new_owner_id", "new_owner_name", "current_owner_id",
+        "old_status_id", "old_status_name", "old_status_semantic_id", "current_status_id",
         "new_status_id", "new_status_name",
         "assignment_reason", "warning", "action", "error",
     ]
@@ -999,144 +940,41 @@ def run(
         client, target_rop_ids, label="Целевой РОП", require_active=True
     )
     companies, contacts, leads = load_crm(client)
-    protected_owner_ids = parse_optional_ids(
-        os.getenv("REASSIGN_PROTECTED_OWNER_IDS", "13,16,18,38,40,58"),
-        DEFAULT_PROTECTED_OWNER_IDS,
-    )
-    protected_lead_ids = parse_optional_ids(
-        os.getenv("REASSIGN_PROTECTED_LEAD_IDS", "401"),
-        DEFAULT_PROTECTED_LEAD_IDS,
-    )
-    protected_overlap = sorted(excluded_user_ids & protected_owner_ids)
-    if protected_overlap:
-        print(
-            "Защищённые пользователи исключены из охвата: "
-            + ", ".join(map(str, protected_overlap)),
-            flush=True,
-        )
-        excluded_user_ids = excluded_user_ids - protected_owner_ids
-    if not excluded_user_ids:
-        raise ReassignmentError("После применения защиты не осталось пользователей для переноса")
-
-    protected_seed_issues: list[dict[str, Any]] = []
-    for lead in leads:
-        lead_id = _entity_id(lead)
-        owner_id = normalized_id(lead.get("ASSIGNED_BY_ID"))
-        if lead_id not in protected_lead_ids or owner_id not in excluded_user_ids:
-            continue
-        protected_seed_issues.append({
-            "lead_id": lead_id or "",
-            "lead_title": str(lead.get("TITLE") or ""),
-            "old_owner_id": owner_id or "",
-            "old_status_id": str(lead.get("STATUS_ID") or ""),
-            "company_id": normalized_id(lead.get("COMPANY_ID")) or "",
-            "company_title": "",
-            "company_bin": "",
-            "contact_id": normalized_id(lead.get("CONTACT_ID")) or "",
-            "founder_name": "",
-            "action": "skipped_protected_lead",
-            "error": "лид явно защищён от переноса",
-        })
-
     seed_lead_ids = {
         int(lead_id)
         for lead in leads
         if normalized_id(lead.get("ASSIGNED_BY_ID")) in excluded_user_ids
         and (lead_id := _entity_id(lead)) is not None
-        and lead_id not in protected_lead_ids
     }
     if not seed_lead_ids:
-        if protected_seed_issues:
-            write_linkage_report(
-                output_dir / "excluded_user_reassignment_skipped.csv", protected_seed_issues
-            )
-        summary = {
-            "mode_apply": int(apply),
-            "excluded_users": len(excluded_user_ids),
-            "excluded_user_ids": sorted(excluded_user_ids),
-            "protected_owner_ids": sorted(protected_owner_ids),
-            "protected_lead_ids": sorted(protected_lead_ids),
-            "linkage_validation_errors": 0,
-            "linkage_warnings_total": 0,
-            "short_packages_missing_founder_or_company": 0,
-            "skipped_protected_lead": len(protected_seed_issues),
-            "skipped_existing_owner": 0,
-            "skipped_taldykorgan": 0,
-            "skipped_conflicting_target_rops": 0,
-            "skipped_package_leads_total": 0,
-            "skipped_total": len(protected_seed_issues),
-            "skipped_lead_ids": sorted({int(issue["lead_id"]) for issue in protected_seed_issues}),
-            "founders": 0,
-            "leads": 0,
-            "companies": 0,
-            "contacts": 0,
-            "planned_total": 0,
-            "lead_status_updates_planned": 0,
-            "lead_status_updates_ok": 0,
-            "lead_status_update_errors": 0,
-            "owner_updates_planned": 0,
-            "owner_updates_ok": 0,
-            "owner_update_errors": 0,
-            "repair_updates_planned": 0,
-            "repair_updates_ok": 0,
-            "repair_update_errors": 0,
-            "pending": 0,
-            "updated": 0,
-            "verified_total": 0,
-            "already_matches": 0,
-            "update_errors": 0,
-            "verify_errors": 0,
-            "rop_72_founders": 0,
-            "rop_72_leads": 0,
-            "rop_73_founders": 0,
-            "rop_73_leads": 0,
-        }
-        (output_dir / "excluded_user_reassignment_summary.json").write_text(
-            json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
+        raise ReassignmentError(
+            "У указанных пользователей не найдено ни одного лида; изменения не требуются"
         )
-        print("Остатков для автоматического переноса нет.", flush=True)
-        return summary
-
-    # Missing founder is no longer a stop condition.  The grouping code falls back
-    # to company:<ID>, so company + all selected leads remain one shortened package.
-    # If even COMPANY_ID is absent, the lead becomes a one-lead package instead of
-    # aborting the whole run.  Linkage problems are retained only as warnings.
-    linkage_warnings = collect_linkage_issues(companies, contacts, leads, seed_lead_ids)
-    if linkage_warnings:
-        write_linkage_report(
-            output_dir / "excluded_user_reassignment_warnings.csv", linkage_warnings
-        )
-
+    # Missing founder/company is not a blocker. build_owner_groups() falls back to
+    # company:<ID> (company + lead) and then lead:<ID> (single-lead package).
+    # The linkage scan is retained only for diagnostics in the main report/log.
+    all_linkage_issues = collect_linkage_issues(
+        companies, contacts, leads, seed_lead_ids
+    )
     groups = build_owner_groups(
         companies,
         contacts,
         leads,
         excluded_user_ids,
-        skip_lead_ids=protected_lead_ids,
+        skip_lead_ids=set(),
     )
     package_owner_ids = collect_group_owner_ids(groups, companies, contacts, leads)
     owner_department_names = load_user_department_names(client, package_owner_ids)
     groups, package_skip_issues = split_reassignment_groups(
-        groups,
-        companies,
-        contacts,
-        leads,
-        excluded_user_ids,
-        owner_department_names,
-        set(target_rop_ids),
-        skip_any_taldykorgan=True,
+        groups, companies, contacts, leads, excluded_user_ids, target_rop_ids, owner_department_names
     )
-    relevant_lead_ids = set().union(*(group.lead_ids for group in groups)) if groups else set()
-    skipped_issues = protected_seed_issues + package_skip_issues
-    if skipped_issues:
-        write_linkage_report(
-            output_dir / "excluded_user_reassignment_skipped.csv", skipped_issues
-        )
+    relevant_lead_ids = set().union(*(group.lead_ids for group in groups))
+    skipped_issues = list(package_skip_issues)
     assign_targets(groups, target_rop_ids)
     relevant_owner_ids = set(target_rop_ids) | set(excluded_user_ids)
     entity_ids = {
-        "company": set().union(*(group.company_ids for group in groups)) if groups else set(),
-        "contact": set().union(*(group.contact_ids for group in groups)) if groups else set(),
+        "company": set().union(*(group.company_ids for group in groups)),
+        "contact": set().union(*(group.contact_ids for group in groups)),
         "lead": relevant_lead_ids,
     }
     for entity_type, records in (
@@ -1159,119 +997,109 @@ def run(
         user_names=user_names,
         status_names=status_names,
     )
-    status_result = {"planned": 0, "updated": 0, "errors": 0}
-    owner_result = {"planned": 0, "updated": 0, "errors": 0}
-    repair_result = {"planned": 0, "updated": 0, "errors": 0}
-    if apply:
-        stabilize_seconds = float(os.getenv("REASSIGN_STABILIZE_SECONDS", "12"))
-        final_wait_seconds = float(os.getenv("REASSIGN_FINAL_WAIT_SECONDS", "5"))
+    owner_result = {
+        "planned": sum(row["action"] == "pending" for row in rows),
+        "updated": 0,
+        "errors": 0,
+    }
+    verify_result = {"owner_ok": 0, "owner_errors": 0}
 
-        # One atomic target-state write per lead: owner + NEW together.
+    print(
+        f"[ПЛАН] пакетов к переносу: {len(groups)}; "
+        f"лидов: {sum(row['entity_type'] == 'lead' for row in rows)}; "
+        f"компаний: {sum(row['entity_type'] == 'company' for row in rows)}; "
+        f"контактов: {sum(row['entity_type'] == 'contact' for row in rows)}; "
+        f"всего сущностей: {len(rows)}; "
+        f"пропущено лидов из пакетов Талдыкоргана: {len(package_skip_issues)}.",
+        flush=True,
+    )
+    if all_linkage_issues:
+        print(
+            f"[СОКРАЩЁННЫЕ ПАКЕТЫ] лидов без полного учредителя/связки: "
+            f"{len(all_linkage_issues)} — они НЕ пропущены, а идут как company+lead/lead-only.",
+            flush=True,
+        )
+
+    if apply:
+        final_wait_seconds = float(os.getenv("REASSIGN_FINAL_WAIT_SECONDS", "2"))
         owner_result = apply_owner_changes(client, rows)
-        if stabilize_seconds > 0 and owner_result["planned"]:
+        if final_wait_seconds > 0 and owner_result["planned"]:
             print(
-                f"Ожидание {stabilize_seconds:g} сек. — даём роботам Bitrix24 отработать...",
+                f"Ожидание {final_wait_seconds:g} сек. перед контрольным чтением владельцев...",
                 flush=True,
             )
-            time.sleep(stabilize_seconds)
+            time.sleep(final_wait_seconds)
 
         refreshed_companies, refreshed_contacts, refreshed_leads = load_crm(client)
-        verify_changes(rows, refreshed_companies, refreshed_contacts, refreshed_leads)
-        first_verify_errors = sum(row["action"] == "verify_error" for row in rows)
-        if first_verify_errors:
-            print(
-                f"[ПРОВЕРКА 1] роботы изменили {first_verify_errors} сущностей; "
-                "повторно фиксируем целевой owner + NEW.",
-                flush=True,
-            )
-            repair_result = apply_owner_changes(client, rows)
-            if final_wait_seconds > 0 and repair_result["planned"]:
-                print(
-                    f"Ожидание {final_wait_seconds:g} сек. после повторной фиксации...",
-                    flush=True,
-                )
-                time.sleep(final_wait_seconds)
-            refreshed_companies, refreshed_contacts, refreshed_leads = load_crm(client)
-            verify_changes(rows, refreshed_companies, refreshed_contacts, refreshed_leads)
+        verify_result = verify_changes(rows, refreshed_companies, refreshed_contacts, refreshed_leads)
 
-        verify_errors_now = sum(row["action"] == "verify_error" for row in rows)
-        verified_now = sum(row["action"] == "updated" for row in rows)
-        verify_total = verified_now + verify_errors_now
-        if verify_total:
-            print(
-                f"[ПРОВЕРКА] подтверждено {verified_now}/{verify_total}; "
-                f"расхождений после повторной фиксации: {verify_errors_now}",
-                flush=True,
-            )
+        by_type = {}
+        for entity_type in ("lead", "company", "contact"):
+            subset = [row for row in rows if row["entity_type"] == entity_type]
+            ok = sum(row["action"] in {"updated", "already_matches"} for row in subset)
+            errors = sum(row["action"] == "verify_error" for row in subset)
+            by_type[entity_type] = (ok, len(subset), errors)
+        print(
+            f"[ИТОГ] владельцы подтверждены: "
+            f"лиды {by_type['lead'][0]}/{by_type['lead'][1]}; "
+            f"компании {by_type['company'][0]}/{by_type['company'][1]}; "
+            f"контакты {by_type['contact'][0]}/{by_type['contact'][1]}; "
+            f"расхождений: {verify_result['owner_errors']}.",
+            flush=True,
+        )
 
-    write_report(output_dir / "excluded_user_reassignment.csv", rows)
+    # One artifact only: the complete plan/result CSV. Package skips are appended
+    # as compact rows so there is no second skipped/report file.
+    report_rows = list(rows)
+    for issue in package_skip_issues:
+        report_rows.append({
+            "source_excluded_user_ids": ",".join(map(str, sorted(excluded_user_ids))),
+            "founder_key": "",
+            "package_lead_count": "", "package_company_count": "", "package_contact_count": "",
+            "package_seed_old_owner_ids": "", "founder_contact_ids": "", "founder_names": issue.get("founder_name", ""),
+            "company_ids": issue.get("company_id", ""), "company_titles": issue.get("company_title", ""),
+            "company_bins": issue.get("company_bin", ""), "lead_company_id": issue.get("company_id", ""),
+            "lead_company_title": issue.get("company_title", ""), "lead_company_bin": issue.get("company_bin", ""),
+            "lead_contact_id": issue.get("contact_id", ""), "lead_founder_name": issue.get("founder_name", ""),
+            "lead_date_create": "", "entity_type": "lead", "entity_id": issue.get("lead_id", ""),
+            "title": issue.get("lead_title", ""), "old_owner_id": issue.get("old_owner_id", ""),
+            "old_owner_name": "", "new_owner_id": "", "new_owner_name": "", "current_owner_id": issue.get("old_owner_id", ""),
+            "old_status_id": issue.get("old_status_id", ""), "old_status_name": "", "old_status_semantic_id": "",
+            "current_status_id": issue.get("old_status_id", ""), "new_status_id": "", "new_status_name": "",
+            "assignment_reason": "", "warning": "", "action": issue.get("action", "skipped"), "error": issue.get("error", ""),
+        })
+    write_report(output_dir / "excluded_user_reassignment.csv", report_rows)
+
     update_errors = sum(row["action"] == "update_error" for row in rows)
-    verify_errors = sum(row["action"] == "verify_error" for row in rows)
-    verified_total = sum(row["action"] == "updated" for row in rows)
+    owner_verify_errors = sum(row["action"] == "verify_error" for row in rows)
     summary = {
         "mode_apply": int(apply),
         "excluded_users": len(excluded_user_ids),
         "excluded_user_ids": sorted(excluded_user_ids),
-        "protected_owner_ids": sorted(protected_owner_ids),
-        "protected_lead_ids": sorted(protected_lead_ids),
-        "linkage_validation_errors": 0,
-        "linkage_warnings_total": len(linkage_warnings),
-        "short_packages_missing_founder_or_company": len(linkage_warnings),
-        "skipped_protected_lead": len(protected_seed_issues),
-        "skipped_existing_owner": sum(
-            "skipped_existing_owner" in str(issue["action"]) for issue in package_skip_issues
-        ),
+        "short_packages": len(all_linkage_issues),
         "skipped_taldykorgan": sum(
-            "skipped_taldykorgan" in str(issue["action"])
-            for issue in package_skip_issues
-        ),
-        "skipped_conflicting_target_rops": sum(
-            "skipped_conflicting_target_rops" in str(issue["action"])
-            for issue in package_skip_issues
+            "skipped_taldykorgan" in str(issue["action"]) for issue in package_skip_issues
         ),
         "skipped_package_leads_total": len(package_skip_issues),
-        "skipped_total": len(skipped_issues),
-        "skipped_lead_ids": sorted({int(issue["lead_id"]) for issue in skipped_issues}),
-        "founders": len(groups),
+        "packages": len(groups),
         "leads": sum(row["entity_type"] == "lead" for row in rows),
         "companies": sum(row["entity_type"] == "company" for row in rows),
         "contacts": sum(row["entity_type"] == "contact" for row in rows),
         "planned_total": len(rows),
-        "lead_status_updates_planned": status_result["planned"],
-        "lead_status_updates_ok": status_result["updated"],
-        "lead_status_update_errors": status_result["errors"],
         "owner_updates_planned": owner_result["planned"],
         "owner_updates_ok": owner_result["updated"],
         "owner_update_errors": owner_result["errors"],
-        "repair_updates_planned": repair_result["planned"],
-        "repair_updates_ok": repair_result["updated"],
-        "repair_update_errors": repair_result["errors"],
-        "pending": sum(row["action"] == "pending" for row in rows),
-        "updated": verified_total,
-        "verified_total": verified_total,
-        "already_matches": sum(row["action"] == "already_matches" for row in rows),
-        "update_errors": update_errors,
-        "verify_errors": verify_errors,
+        "owner_verified": verify_result["owner_ok"],
+        "owner_verify_errors": owner_verify_errors,
     }
     for rop_id in target_rop_ids:
-        summary[f"rop_{rop_id}_founders"] = sum(
+        summary[f"rop_{rop_id}_packages"] = sum(
             group.target_owner_id == rop_id for group in groups
         )
         summary[f"rop_{rop_id}_leads"] = sum(
             len(group.lead_ids) for group in groups if group.target_owner_id == rop_id
         )
-    (output_dir / "excluded_user_reassignment_summary.json").write_text(
-        json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-    if apply:
-        verification_total = verified_total + verify_errors
-        print(
-            f"[ИТОГ] API принял переназначение владельца: "
-            f"{owner_result['updated']}/{owner_result['planned']}; "
-            f"контроль подтверждён: {verified_total}/{verification_total}; "
-            f"ошибок записи: {update_errors}; расхождений проверки: {verify_errors}",
-            flush=True,
-        )
+    print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
     return summary
 
 
@@ -1291,8 +1119,8 @@ def build_client() -> BitrixClient:
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Переназначить все лиды исключённых пользователей, связанные компании и "
-            "контакты руководителей; пакеты учредителей сбалансировать между РОП 72 и 73."
+            "Переназначить ответственных у лидов исключённых пользователей и связанного "
+            "пакета (компания/контакт) между РОП 72 и 73; статусы лидов не изменяются."
         )
     )
     parser.add_argument(
@@ -1314,7 +1142,7 @@ def main() -> int:
         print(f"ERROR: {exc}")
         return 1
     print(json.dumps(summary, ensure_ascii=False, indent=2))
-    return 1 if summary["update_errors"] or summary["verify_errors"] else 0
+    return 1 if summary["owner_update_errors"] or summary["owner_verify_errors"] else 0
 
 
 if __name__ == "__main__":
