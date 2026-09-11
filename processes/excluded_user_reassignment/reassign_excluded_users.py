@@ -2,26 +2,16 @@ from __future__ import annotations
 
 import argparse
 import csv
-import hashlib
 import json
 import os
 import re
 import time
-from collections import Counter, defaultdict
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
 from eqazyna_bitrix.bitrix_client import BitrixClient, BitrixError
-from eqazyna_bitrix.distribution import (
-    AssignmentUser,
-    DistributionSnapshot,
-    DistributionError,
-    GoogleSheetDistributionSource,
-    branch_key,
-    is_branch_head,
-    normalise_bin,
-)
 from eqazyna_bitrix.settings import Settings
 
 
@@ -275,172 +265,23 @@ def build_owner_groups(
     return sorted(groups.values(), key=lambda item: item.key)
 
 
-def _company_bins(
-    company: dict[str, Any], requisites_by_company: dict[int, set[str]]
-) -> set[str]:
-    company_id = _entity_id(company)
-    values = set(requisites_by_company.get(company_id or -1, set()))
-    origin_id = normalise_bin(company.get("ORIGIN_ID"))
-    if len(origin_id) == 12:
-        values.add(origin_id)
-    return values
-
-
-def _stable_tie_choice(group_key: str, candidates: list[int]) -> int:
-    ordered = sorted(candidates)
-    digest = hashlib.sha256(group_key.encode("utf-8")).digest()
-    return ordered[int.from_bytes(digest[:8], "big") % len(ordered)]
-
-
 def assign_targets(
     groups: list[OwnerGroup],
-    snapshot: DistributionSnapshot,
-    companies: Iterable[dict[str, Any]],
-    contacts: Iterable[dict[str, Any]],
-    leads: Iterable[dict[str, Any]],
-    requisites_by_company: dict[int, set[str]],
-    excluded_user_ids: set[int],
-    excluded_user_departments: dict[int, set[int]],
-    astana_department_id: int = 46,
+    target_rop_ids: tuple[int, int],
 ) -> None:
-    approved: dict[int, AssignmentUser] = {user.user_id: user for user in snapshot.users}
-    overlap = sorted(set(approved) & excluded_user_ids)
-    if overlap:
-        raise ReassignmentError(
-            "Исключённые пользователи всё ещё присутствуют в user_list: "
-            + ", ".join(map(str, overlap))
-        )
+    rops = tuple(sorted(set(target_rop_ids)))
+    if len(rops) != 2 or any(user_id <= 0 for user_id in rops):
+        raise ReassignmentError("Нужно указать ровно два корректных ID РОПов")
 
-    companies_by_id = {
-        company_id: company
-        for company in companies
-        if (company_id := _entity_id(company)) is not None
-    }
-    contacts_by_id = {
-        contact_id: contact
-        for contact in contacts
-        if (contact_id := _entity_id(contact)) is not None
-    }
-    loads = Counter()
-    for lead in leads:
-        owner_id = normalized_id(lead.get("ASSIGNED_BY_ID"))
-        semantic = str(lead.get("STATUS_SEMANTIC_ID") or "").strip().upper()
-        if owner_id in approved and semantic not in {"S", "F"}:
-            loads[owner_id] += 1
-
-    users_by_department: dict[int, list[int]] = defaultdict(list)
-    for user in snapshot.users:
-        users_by_department[user.department_id].append(user.user_id)
-    new_founders_by_manager: dict[int, set[str]] = defaultdict(set)
-
-    for group in groups:
-        fixed_targets: set[int] = set()
-        for company_id in group.company_ids:
-            for bin_number in _company_bins(
-                companies_by_id.get(company_id, {}), requisites_by_company
-            ):
-                target = snapshot.company_assignments.get(bin_number)
-                if target is not None:
-                    fixed_targets.add(target)
-        if len(fixed_targets) > 1:
-            raise ReassignmentError(
-                f"Для учредителя {group.key} Company_fix задаёт разных менеджеров: "
-                + ", ".join(map(str, sorted(fixed_targets)))
-            )
-        if fixed_targets:
-            target = next(iter(fixed_targets))
-            if target not in approved:
-                raise ReassignmentError(
-                    f"Company_fix назначает учредителя {group.key} пользователю ID={target}, "
-                    "которого нет в user_list"
-                )
-            group.target_owner_id = target
-            group.assignment_reason = "company_fix"
-            continue
-
-        active_contact_owners = {
-            owner_id
-            for contact_id in group.contact_ids
-            if (owner_id := normalized_id(
-                contacts_by_id.get(contact_id, {}).get("ASSIGNED_BY_ID")
-            )) in approved
-        }
-        if len(active_contact_owners) > 1:
-            raise ReassignmentError(
-                f"У учредителя {group.key} уже несколько действующих ответственных: "
-                + ", ".join(map(str, sorted(active_contact_owners)))
-            )
-        if active_contact_owners:
-            group.target_owner_id = next(iter(active_contact_owners))
-            group.assignment_reason = "existing_active_founder_owner"
-            continue
-
-        astana = any(
-            branch_key(
-                " ".join(
-                    str(companies_by_id.get(company_id, {}).get(field) or "")
-                    for field in (
-                        "ADDRESS", "ADDRESS_CITY", "ADDRESS_REGION", "ADDRESS_PROVINCE"
-                    )
-                )
-            ) == "astana"
-            for company_id in group.company_ids
-        )
-        old_departments = {
-            department_id
-            for old_owner_id in group.seed_old_owner_ids
-            for department_id in excluded_user_departments.get(old_owner_id, set())
-            if department_id in users_by_department
-        }
-        if astana:
-            department_id = astana_department_id
-            reason_prefix = "astana"
-        elif len(old_departments) == 1:
-            department_id = next(iter(old_departments))
-            reason_prefix = "old_owner_department"
-        elif len(old_departments) > 1:
-            raise ReassignmentError(
-                f"У учредителя {group.key} исходные ответственные относятся к разным подразделениям: "
-                + ", ".join(map(str, sorted(old_departments)))
-            )
-        else:
-            department_id = None
-            reason_prefix = "global"
-
-        scope = (
-            sorted(users_by_department.get(department_id, []))
-            if department_id else sorted(approved)
-        )
-        if not scope:
-            raise ReassignmentError(
-                f"Для учредителя {group.key} не найден пользователь в целевом подразделении"
-            )
-        if len(scope) == 1:
-            target = scope[0]
-            reason = f"{reason_prefix}_single_user"
-        else:
-            regular = [user_id for user_id in scope if not is_branch_head(approved[user_id].role)]
-            available = [user_id for user_id in regular if not new_founders_by_manager[user_id]]
-            if available:
-                minimum = min(loads[user_id] for user_id in available)
-                candidates = [user_id for user_id in available if loads[user_id] == minimum]
-                target = _stable_tie_choice(group.key, candidates)
-                new_founders_by_manager[target].add(group.key)
-                reason = f"{reason_prefix}_least_loaded"
-            else:
-                heads = [user_id for user_id in scope if is_branch_head(approved[user_id].role)]
-                if not heads:
-                    raise ReassignmentError(
-                        f"Для учредителя {group.key} исчерпан лимит менеджеров, но РОП не указан"
-                    )
-                minimum = min(loads[user_id] for user_id in heads)
-                target = _stable_tie_choice(
-                    group.key, [user_id for user_id in heads if loads[user_id] == minimum]
-                )
-                reason = f"{reason_prefix}_overflow_to_rop"
-        loads[target] += 1
+    # Largest packages go first. Each next indivisible founder package is
+    # assigned to the ROP with fewer planned leads. This balances lead counts,
+    # rather than merely alternating the number of founders.
+    planned_leads = {user_id: 0 for user_id in rops}
+    for group in sorted(groups, key=lambda item: (-len(item.lead_ids), item.key)):
+        target = min(rops, key=lambda user_id: (planned_leads[user_id], user_id))
         group.target_owner_id = target
-        group.assignment_reason = reason
+        group.assignment_reason = "balanced_between_rops_72_73"
+        planned_leads[target] += len(group.lead_ids)
 
 
 def build_change_rows(
@@ -591,39 +432,20 @@ def load_crm(
     return companies, contacts, leads
 
 
-def load_requisites(client: BitrixClient) -> dict[int, set[str]]:
-    rows = client.list_all(
-        "crm.requisite.list",
-        {
-            "order": {"ID": "ASC"}, "filter": {"ENTITY_TYPE_ID": 4},
-            "select": ["ID", "ENTITY_ID", "RQ_BIN"],
-        },
-    )
-    result: dict[int, set[str]] = defaultdict(set)
-    for row in rows:
-        company_id = normalized_id(row.get("ENTITY_ID"))
-        bin_number = normalise_bin(row.get("RQ_BIN"))
-        if company_id is not None and len(bin_number) == 12:
-            result[company_id].add(bin_number)
-    return result
-
-
-def load_user_departments(
-    client: BitrixClient, user_ids: set[int]
-) -> dict[int, set[int]]:
-    result: dict[int, set[int]] = {}
+def validate_users(
+    client: BitrixClient,
+    user_ids: Iterable[int],
+    *,
+    label: str,
+    require_active: bool = False,
+) -> None:
     for user_id in sorted(user_ids):
         user = client.get_user(user_id)
         if not user:
-            raise ReassignmentError(f"Исключённый пользователь ID={user_id} не найден в Bitrix24")
-        raw = user.get("UF_DEPARTMENT")
-        values = raw if isinstance(raw, list) else [raw]
-        result[user_id] = {
-            int(str(value))
-            for value in values
-            if str(value or "").strip().isdigit() and int(str(value)) > 0
-        }
-    return result
+            raise ReassignmentError(f"{label} ID={user_id} не найден в Bitrix24")
+        active = str(user.get("ACTIVE", "true")).strip().casefold()
+        if require_active and active in {"false", "n", "0", "нет"}:
+            raise ReassignmentError(f"{label} ID={user_id} неактивен в Bitrix24")
 
 
 def run(
@@ -632,23 +454,22 @@ def run(
     output_dir: Path,
     apply: bool,
 ) -> dict[str, int]:
-    snapshot = GoogleSheetDistributionSource(
-        spreadsheet_id=os.getenv(
-            "DISTRIBUTION_SHEET_ID",
-            "1WuRHHyQm5lHxDlW81m4P0oZJ6X_SDYj1bN-NOx8aM2k",
-        ),
-        users_sheet=os.getenv("DISTRIBUTION_USERS_SHEET", "user_list"),
-        assignments_sheet=os.getenv("DISTRIBUTION_FIXES_SHEET", "Company_fix"),
-    ).load()
-    companies, contacts, leads = load_crm(client)
-    requisites = load_requisites(client)
-    excluded_departments = load_user_departments(client, excluded_user_ids)
-    groups = build_owner_groups(companies, contacts, leads, excluded_user_ids)
-    assign_targets(
-        groups, snapshot, companies, contacts, leads, requisites,
-        excluded_user_ids, excluded_departments,
-        astana_department_id=int(os.getenv("ASTANA_DEPARTMENT_ID", "46")),
+    target_rop_ids = tuple(
+        sorted(parse_excluded_user_ids(os.getenv("REASSIGN_TARGET_ROP_IDS", "72,73")))
     )
+    if len(target_rop_ids) != 2:
+        raise ReassignmentError("REASSIGN_TARGET_ROP_IDS должен содержать ровно два ID")
+    overlap = sorted(excluded_user_ids & set(target_rop_ids))
+    if overlap:
+        raise ReassignmentError(
+            "ID одновременно указан как исключённый пользователь и целевой РОП: "
+            + ", ".join(map(str, overlap))
+        )
+    validate_users(client, excluded_user_ids, label="Исключённый пользователь")
+    validate_users(client, target_rop_ids, label="Целевой РОП", require_active=True)
+    companies, contacts, leads = load_crm(client)
+    groups = build_owner_groups(companies, contacts, leads, excluded_user_ids)
+    assign_targets(groups, target_rop_ids)
     rows = build_change_rows(groups, companies, contacts, leads)
     if apply:
         apply_changes(client, rows)
@@ -685,6 +506,13 @@ def run(
         "update_errors": update_errors,
         "verify_errors": verify_errors,
     }
+    for rop_id in target_rop_ids:
+        summary[f"rop_{rop_id}_founders"] = sum(
+            group.target_owner_id == rop_id for group in groups
+        )
+        summary[f"rop_{rop_id}_leads"] = sum(
+            len(group.lead_ids) for group in groups if group.target_owner_id == rop_id
+        )
     (output_dir / "excluded_user_reassignment_summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
     )
@@ -708,7 +536,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Переназначить все лиды исключённых пользователей, связанные компании и "
-            "контакты руководителей; все карточки одного учредителя получает один менеджер."
+            "контакты руководителей; пакеты учредителей сбалансировать между РОП 72 и 73."
         )
     )
     parser.add_argument(
@@ -726,7 +554,7 @@ def main() -> int:
             build_client(), parse_excluded_user_ids(args.excluded_user_ids),
             output_dir, apply=args.apply,
         )
-    except (ReassignmentError, DistributionError, BitrixError, ValueError) as exc:
+    except (ReassignmentError, BitrixError, ValueError) as exc:
         print(f"ERROR: {exc}")
         return 1
     print(json.dumps(summary, ensure_ascii=False, indent=2))
