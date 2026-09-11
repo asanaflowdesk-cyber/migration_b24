@@ -1,1 +1,0 @@
--r ../eqazyna_leads/requirements.txt
