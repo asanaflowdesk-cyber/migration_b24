@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       mode:
-        description: "dry_run — только отчёт; apply — переназначить и вернуть все лиды в NEW"
+        description: "dry_run — отчёт; apply — распределить между РОП 72/73 и вернуть лиды в NEW"
         required: true
         default: dry_run
         type: choice
@@ -73,11 +73,7 @@ jobs:
         env:
           PYTHONPATH: ${{ github.workspace }};${{ github.workspace }}\processes\eqazyna_leads;${{ github.workspace }}\processes\excluded_user_reassignment
           TARGET_BITRIX_WEBHOOK_URL: ${{ secrets.TARGET_BITRIX_WEBHOOK_URL }}
-          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          DISTRIBUTION_SHEET_ID: "1WuRHHyQm5lHxDlW81m4P0oZJ6X_SDYj1bN-NOx8aM2k"
-          DISTRIBUTION_USERS_SHEET: "user_list"
-          DISTRIBUTION_FIXES_SHEET: "Company_fix"
-          ASTANA_DEPARTMENT_ID: "46"
+          REASSIGN_TARGET_ROP_IDS: "72,73"
           BITRIX_VERIFY_SSL: ${{ vars.BITRIX_VERIFY_SSL || 'true' }}
           BITRIX_CA_BUNDLE: ${{ vars.BITRIX_CA_BUNDLE }}
           BITRIX_REQUEST_TIMEOUT: ${{ vars.BITRIX_REQUEST_TIMEOUT || '45' }}
