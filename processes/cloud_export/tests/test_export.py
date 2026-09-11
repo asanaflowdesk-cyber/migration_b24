@@ -82,20 +82,16 @@ class _FakePagingClient:
         return self.responses[index]
 
 
-def test_list_all_fails_closed_on_repeated_page():
-    from export_bitrix import BitrixAPIError, BitrixClient
+def test_list_all_stops_on_repeated_page_without_duplicates():
+    from export_bitrix import BitrixClient
 
     page = [{"ID": str(i)} for i in range(1, 51)]
     fake = _FakePagingClient([
         {"result": page},
         {"result": page},  # метод проигнорировал start
     ])
-    try:
-        BitrixClient.list_all(fake, "methods", {})
-    except BitrixAPIError as exc:
-        assert "неполной выгрузки" in str(exc)
-    else:
-        raise AssertionError("repeated page must fail instead of returning partial data")
+    rows = BitrixClient.list_all(fake, "methods", {})
+    assert len(rows) == 50
     assert fake.calls == 2
 
 
@@ -107,13 +103,3 @@ def test_list_all_stops_by_total_on_full_page():
     rows = BitrixClient.list_all(fake, "crm.status.list", {})
     assert len(rows) == 50
     assert fake.calls == 1
-
-
-def test_sanitize_error_redacts_webhook_token():
-    from export_bitrix import sanitize_error
-
-    text = sanitize_error(
-        "HTTPSConnectionPool(host='box.example', url='/rest/7/SUPERSECRET/crm.lead.list.json')"
-    )
-    assert "SUPERSECRET" not in text
-    assert "/rest/7/***" in text

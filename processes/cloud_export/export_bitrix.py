@@ -36,14 +36,6 @@ DEFAULT_MAX_PAGES = 20_000
 DEFAULT_PROGRESS_EVERY_PAGES = 10
 
 
-_WEBHOOK_PATH_RE = re.compile(r"(?i)(/rest(?:/api)?/\d+/)[^/\s?'\"<>]+")
-
-
-def sanitize_error(value: Any) -> str:
-    """Remove Bitrix webhook secrets from request/HTTP exception text."""
-    return _WEBHOOK_PATH_RE.sub(r"\1***", str(value or ""))
-
-
 def env_bool(name: str, default: bool) -> bool:
     value = os.getenv(name)
     if value is None:
@@ -364,13 +356,13 @@ class BitrixClient:
                     time.sleep(self.delay)
                 return data
             except (requests.RequestException, ValueError) as exc:
-                last_error = sanitize_error(exc)
+                last_error = str(exc)
                 if attempt >= self.max_retries:
                     break
                 wait = min(2**attempt, 30)
                 logging.warning(
                     "%s: ошибка запроса, попытка %s/%s, пауза %s сек.: %s",
-                    method, attempt, self.max_retries, wait, sanitize_error(exc),
+                    method, attempt, self.max_retries, wait, exc,
                 )
                 time.sleep(wait)
         raise BitrixAPIError(f"{method}: {last_error}")
@@ -412,10 +404,11 @@ class BitrixClient:
                 json.dumps(page, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":")).encode("utf-8")
             ).hexdigest()
             if page and page_signature in seen_pages:
-                raise BitrixAPIError(
-                    f"{method}: сервер повторил ту же страницу при start={start}; "
-                    "отказ от неполной выгрузки"
+                logging.warning(
+                    "%s: сервер повторил ту же страницу при start=%s; пагинация остановлена без дублей",
+                    dataset_label, start,
                 )
+                break
             seen_pages.add(page_signature)
             all_rows.extend(page)
 
@@ -447,10 +440,11 @@ class BitrixClient:
                 except (TypeError, ValueError):
                     next_start = start + page_size
                 if next_start in seen_starts or next_start <= start:
-                    raise BitrixAPIError(
-                        f"{method}: некорректный next={next_value} при start={start}; "
-                        "отказ от неполной выгрузки"
+                    logging.warning(
+                        "%s: некорректный next=%s при start=%s; пагинация остановлена",
+                        dataset_label, next_value, start,
                     )
+                    break
                 seen_starts.add(start)
                 start = next_start
                 continue
@@ -745,7 +739,7 @@ SHEET_DESCRIPTIONS = {
 class ExcelWriter:
     def __init__(self, path: Path) -> None:
         self.path = path
-        self.workbook = xlsxwriter.Workbook(path, {"strings_to_formulas": False, "strings_to_urls": False})
+        self.workbook = xlsxwriter.Workbook(path)
         self.workbook.set_properties(
             {
                 "title": "Bitrix24 full export",
@@ -933,7 +927,7 @@ def safe_fetch_list(
         return rows
     except Exception as exc:  # noqa: BLE001 — ошибки должны попасть в Excel, а не оборвать экспорт
         logging.exception("Не удалось выгрузить %s", dataset)
-        log.add(dataset, method, "ERROR", 0, sanitize_error(exc))
+        log.add(dataset, method, "ERROR", 0, str(exc))
         return []
 
 
@@ -961,7 +955,7 @@ def safe_fetch_single(
         return rows
     except Exception as exc:  # noqa: BLE001
         logging.exception("Не удалось выгрузить %s", dataset)
-        log.add(dataset, method, "ERROR", 0, sanitize_error(exc))
+        log.add(dataset, method, "ERROR", 0, str(exc))
         return []
 
 
@@ -982,7 +976,7 @@ def safe_fetch_fields(
         return rows, payload
     except Exception as exc:  # noqa: BLE001
         logging.exception("Не удалось выгрузить %s", dataset)
-        log.add(dataset, method, "ERROR", 0, sanitize_error(exc))
+        log.add(dataset, method, "ERROR", 0, str(exc))
         return [], {}
 
 
@@ -1003,7 +997,7 @@ def safe_fetch_crm_entity(
         log.add(dataset, method, "OK", len(rows))
         return rows
     except Exception as exc:  # noqa: BLE001
-        logging.warning("Полный select для %s не сработал: %s. Пробую резервный.", dataset, sanitize_error(exc))
+        logging.warning("Полный select для %s не сработал: %s. Пробую резервный.", dataset, exc)
         try:
             rows = client.list_all(
                 method,
@@ -1293,8 +1287,8 @@ def export_all(client: BitrixClient, config: Mapping[str, Any]) -> tuple[Ordered
                     {"entityTypeId": int(entity_type_id)}, result_path=("categories",),
                 )
             except Exception as exc:  # noqa: BLE001
-                errors.append({"DATASET": prefix, "METHOD": "crm.item.*", "ERROR": sanitize_error(exc)})
-                log.add(prefix, "crm.item.*", "ERROR", 0, sanitize_error(exc))
+                errors.append({"DATASET": prefix, "METHOD": "crm.item.*", "ERROR": str(exc)})
+                log.add(prefix, "crm.item.*", "ERROR", 0, str(exc))
 
     # Задачи. Выбираем поля из tasks.task.getFields; при несовместимости — надежный базовый набор.
     field_codes: list[str] = []
@@ -1403,7 +1397,7 @@ def export_all(client: BitrixClient, config: Mapping[str, Any]) -> tuple[Ordered
                 for alias, error in stage_errors.items():
                     errors.append({"DATASET": "Task_Stages", "METHOD": "task.stages.get", "ITEM_ID": alias, "ERROR": scalar(error)})
             except Exception as exc:  # noqa: BLE001
-                errors.append({"DATASET": "Task_Stages", "METHOD": "task.stages.get", "ERROR": sanitize_error(exc)})
+                errors.append({"DATASET": "Task_Stages", "METHOD": "task.stages.get", "ERROR": str(exc)})
         log.add("Task_Stages", "task.stages.get", "OK", len(task_stages))
     datasets["Task_Stages"] = task_stages
 
@@ -1433,8 +1427,8 @@ def export_all(client: BitrixClient, config: Mapping[str, Any]) -> tuple[Ordered
                 log.add(name, method, "OK" if not relation_errors else "PARTIAL", len(rows), f"Ошибок: {len(relation_errors)}" if relation_errors else "")
             except Exception as exc:  # noqa: BLE001
                 datasets[name] = []
-                errors.append({"DATASET": name, "METHOD": method, "ERROR": sanitize_error(exc)})
-                log.add(name, method, "ERROR", 0, sanitize_error(exc))
+                errors.append({"DATASET": name, "METHOD": method, "ERROR": str(exc)})
+                log.add(name, method, "ERROR", 0, str(exc))
     else:
         for name in ("Deal_Contacts", "Lead_Contacts", "Contact_Companies"):
             datasets[name] = []
@@ -1452,8 +1446,8 @@ def export_all(client: BitrixClient, config: Mapping[str, Any]) -> tuple[Ordered
                 log.add(name, method, "OK" if not relation_errors else "PARTIAL", len(rows), f"Ошибок: {len(relation_errors)}" if relation_errors else "")
             except Exception as exc:  # noqa: BLE001
                 datasets[name] = []
-                errors.append({"DATASET": name, "METHOD": method, "ERROR": sanitize_error(exc)})
-                log.add(name, method, "ERROR", 0, sanitize_error(exc))
+                errors.append({"DATASET": name, "METHOD": method, "ERROR": str(exc)})
+                log.add(name, method, "ERROR", 0, str(exc))
     else:
         datasets["Deal_Products"] = []
         datasets["Lead_Products"] = []
@@ -1483,7 +1477,7 @@ def export_all(client: BitrixClient, config: Mapping[str, Any]) -> tuple[Ordered
                     for alias, error in timeline_errors.items():
                         errors.append({"DATASET": "Timeline_Comments", "METHOD": "crm.timeline.comment.list", "ITEM_ID": alias, "ERROR": scalar(error)})
                 except Exception as exc:  # noqa: BLE001
-                    errors.append({"DATASET": "Timeline_Comments", "METHOD": "crm.timeline.comment.list", "ERROR": sanitize_error(exc)})
+                    errors.append({"DATASET": "Timeline_Comments", "METHOD": "crm.timeline.comment.list", "ERROR": str(exc)})
         datasets["Timeline_Comments"] = timeline_rows
         log.add("Timeline_Comments", "crm.timeline.comment.list", "OK", len(timeline_rows))
     else:

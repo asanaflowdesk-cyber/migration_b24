@@ -55,6 +55,17 @@ class FakeClient:
         pass
 
 
+class FakeDistributionSource:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def load(self):
+        return SimpleNamespace(
+            users=(SimpleNamespace(user_id=11, full_name="Test Manager"),),
+            company_assignments={},
+        )
+
+
 class FakeLeadPipeline:
     instances = []
 
@@ -79,6 +90,7 @@ def test_main_processes_each_application_once(monkeypatch, tmp_path):
     monkeypatch.setattr(main_module, "EqazynaScraper", FakeScraper)
     monkeypatch.setattr(main_module, "EgovClient", FakeEgov)
     monkeypatch.setattr(main_module, "BitrixClient", FakeClient)
+    monkeypatch.setattr(main_module, "GoogleSheetDistributionSource", FakeDistributionSource)
     monkeypatch.setattr(main_module, "LeadPipeline", FakeLeadPipeline)
     monkeypatch.setattr(main_module, "write_xlsx", lambda results, path: path)
     monkeypatch.setattr(
@@ -109,6 +121,11 @@ def test_main_processes_each_application_once(monkeypatch, tmp_path):
             skip_field_validation=False,
             strict_page_errors=False,
             max_consecutive_page_errors=5,
+            distribution_sheet_id="sheet-id",
+            distribution_users_sheet="user_list",
+            distribution_fixes_sheet="Company_fix",
+            distribution_timeout=30,
+            astana_department_id=46,
         ),
     )
 

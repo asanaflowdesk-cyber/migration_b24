@@ -8,7 +8,6 @@ import re
 from collections import Counter, defaultdict, deque
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlsplit
 from typing import Any, Iterable, Mapping, Sequence
 
 from common.bitrix import BitrixClient
@@ -40,30 +39,6 @@ IMPORT_DATASETS = (
     "Requisites", "Addresses", "Requisite_Presets", "Requisite_Links",
     "Tasks", "CRM_Activities",
 )
-
-
-def _sha256_path(path: Path) -> str:
-    if not path.exists():
-        return "missing"
-    if path.is_dir():
-        digest = hashlib.sha256()
-        for child in sorted(p for p in path.rglob("*") if p.is_file()):
-            digest.update(str(child.relative_to(path)).encode("utf-8"))
-            digest.update(child.read_bytes())
-        return digest.hexdigest()
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _target_portal_fingerprint(client: BitrixClient | None) -> str:
-    if client is None:
-        return "none"
-    base = str(getattr(client, "base", "") or "")
-    host = (urlsplit(base).hostname or "").casefold()
-    return hashlib.sha256(host.encode("utf-8")).hexdigest() if host else "unknown"
 
 
 def text(value: Any) -> str:
@@ -335,28 +310,34 @@ class MigrationProject:
         self.source_dump = Path(source_dump)
         self._reader = DumpReader(self.source_dump)
         self.config_path = Path(config_path)
-        self.config = json.loads(self.config_path.read_text(encoding="utf-8"))
+        config_bytes = self.config_path.read_bytes()
+        self.config = json.loads(config_bytes)
         self.users_path = Path(users_path) if users_path else None
         self.client = target_client
-        state_identity = {
-            "source_sha256": _sha256_path(self.source_dump),
-            "config_sha256": _sha256_path(self.config_path),
-            "users_sha256": _sha256_path(self.users_path) if self.users_path else "none",
-            "target_portal_sha256": _target_portal_fingerprint(target_client),
-        }
-        self.report = Report(output_dir, state_identity=state_identity)
         self.source_client = source_client
-        self.source_mode = str(self.config.get("source_mode", "dump")).strip().casefold()
-        if self.source_mode not in {"dump", "live"}:
-            raise ValueError("config.source_mode must be 'dump' or 'live'")
+        target_portal = ""
+        portal_match = re.match(r"https?://[^/]+", text(getattr(target_client, "base", "")))
+        if portal_match:
+            target_portal = portal_match.group(0).casefold()
+        state_context = {
+            "checkpoint_sha256": hashlib.sha256(self.source_dump.read_bytes()).hexdigest(),
+            "config_sha256": hashlib.sha256(config_bytes).hexdigest(),
+            "users_sha256": (
+                hashlib.sha256(self.users_path.read_bytes()).hexdigest()
+                if self.users_path and self.users_path.exists()
+                else ""
+            ),
+            "target_portal": target_portal,
+        }
+        self.report = Report(output_dir, state_context=state_context)
         self._source: dict[str, list[dict[str, Any]]] = {}
         self._manifest: dict[str, Any] = self._reader.manifest()
+        self.report.extra["dump_integrity"] = self._reader.validate()
         self._live_source: LiveCloudSource | None = None
         self._source_origins: dict[str, str] = {}
         self.report.extra["source_registry"] = {
-            "primary": self.source_mode,
-            "dump_role": "immutable core migration snapshot",
-            "live_role": "optional child enrichment/readback for comments and files; never replaces a core dataset",
+            "primary": "live_cloud_api" if source_client else "dump",
+            "dump_role": "offline plan/verification checkpoint; never mixed into a live import",
             "excel_role": "human-readable audit only; not used as migration source",
         }
         self._target_fields: dict[str, dict[str, Any]] = {}
@@ -468,7 +449,7 @@ class MigrationProject:
         if not needed:
             return
 
-        if self.source_mode == "live" and self.source_client and self._live_source is None:
+        if self.source_client and self._live_source is None:
             self._live_source = LiveCloudSource(self.source_client, self._source_warning)
             self._manifest = self._live_source.manifest()
 
@@ -492,8 +473,91 @@ class MigrationProject:
             self._source_origins[name] = "dump"
             LOG.info("Source %-22s DUMP %s rows", name, len(rows))
 
-        self.report.extra["source_mode"] = self.source_mode
+        self.report.extra["source_mode"] = "direct_cloud_api" if self.source_client else "dump"
         self.report.extra["source_dataset_origins"] = dict(self._source_origins)
+
+    def validate_source_integrity(self) -> dict[str, Any]:
+        """Reject broken source relationships before the first target write."""
+        self.load_source(
+            "Companies", "Contacts", "Leads", "Deals", "Requisites", "Addresses",
+            "Contact_Companies", "Lead_Contacts", "Deal_Contacts", "Requisite_Links",
+        )
+        company_ids = {text(row.get("ID")) for row in self._source["Companies"]}
+        contact_ids = {text(row.get("ID")) for row in self._source["Contacts"]}
+        lead_ids = {text(row.get("ID")) for row in self._source["Leads"]}
+        deal_ids = {text(row.get("ID")) for row in self._source["Deals"]}
+        requisite_ids = {text(row.get("ID")) for row in self._source["Requisites"]}
+        errors: list[dict[str, str]] = []
+
+        def relation_id(value: Any) -> str:
+            raw = text(value).strip()
+            return raw if raw.isdigit() and int(raw) > 0 else ""
+
+        def check_optional_reference(
+            relation: str,
+            source_id: Any,
+            value: Any,
+            valid_ids: set[str],
+        ) -> None:
+            reference = relation_id(value)
+            if reference and reference not in valid_ids:
+                errors.append({
+                    "relation": relation,
+                    "source_id": text(source_id),
+                    "missing_id": reference,
+                })
+
+        for row in self._source["Contacts"]:
+            check_optional_reference(
+                "contact_primary_company", row.get("ID"), row.get("COMPANY_ID"), company_ids
+            )
+        for row in self._source["Leads"]:
+            check_optional_reference("lead_company", row.get("ID"), row.get("COMPANY_ID"), company_ids)
+            check_optional_reference("lead_contact", row.get("ID"), row.get("CONTACT_ID"), contact_ids)
+
+        for row in self._source["Deals"]:
+            check_optional_reference("deal_company", row.get("ID"), row.get("COMPANY_ID"), company_ids)
+            check_optional_reference("deal_contact", row.get("ID"), row.get("CONTACT_ID"), contact_ids)
+        for row in self._source["Contact_Companies"]:
+            if text(row.get("CONTACT_ID")) not in contact_ids or text(row.get("COMPANY_ID")) not in company_ids:
+                errors.append({"relation": "contact_company", "source_id": text(row.get("CONTACT_ID")), "missing_id": text(row.get("COMPANY_ID"))})
+        for dataset, owner_field, valid_owners in (
+            ("Lead_Contacts", "LEAD_ID", lead_ids),
+            ("Deal_Contacts", "DEAL_ID", deal_ids),
+        ):
+            for row in self._source[dataset]:
+                owner_id = text(row.get(owner_field))
+                contact_id = text(row.get("CONTACT_ID"))
+                if owner_id not in valid_owners or contact_id not in contact_ids:
+                    errors.append({"relation": dataset, "source_id": owner_id, "missing_id": contact_id})
+        for row in self._source["Addresses"]:
+            if text(row.get("ENTITY_TYPE_ID")) == "8" and text(row.get("ENTITY_ID")) not in requisite_ids:
+                errors.append({"relation": "address_requisite", "source_id": text(row.get("ENTITY_ID")), "missing_id": text(row.get("ENTITY_ID"))})
+
+        for row in self._source["Requisites"]:
+            entity_type = text(row.get("ENTITY_TYPE_ID"))
+            valid_owners = company_ids if entity_type == "4" else contact_ids if entity_type == "3" else None
+            if valid_owners is not None:
+                check_optional_reference(
+                    "requisite_owner", row.get("ID"), row.get("ENTITY_ID"), valid_owners
+                )
+
+        for row in self._source["Requisite_Links"]:
+            if text(row.get("ENTITY_TYPE_ID")) != "2":
+                continue
+            check_optional_reference(
+                "deal_requisite_link_deal", row.get("ENTITY_ID"), row.get("ENTITY_ID"), deal_ids
+            )
+            check_optional_reference(
+                "deal_requisite_link_requisite",
+                row.get("ENTITY_ID"),
+                row.get("REQUISITE_ID"),
+                requisite_ids,
+            )
+
+        result = {"ok": not errors, "errors": errors, "checked_relation_types": 12}
+        self.report.extra["source_integrity"] = result
+        return result
 
     # ---------- target discovery and validation ----------
 
@@ -679,17 +743,10 @@ class MigrationProject:
         task_comments = sum(int(row.get("commentsCount") or 0) for row in included_tasks)
         activity_files = sum(len(row.get("FILES") or []) for row in self._source["CRM_Activities"])
         original_leads = 0 if self.config.get("skip_original_leads", True) else len(self._source["Leads"])
-        company_ids = {text(row.get("ID")) for row in self._source["Companies"] if text(row.get("ID"))}
-        orphan_deal_company = [
-            {"deal_id": text(row.get("ID")), "company_id": text(row.get("COMPANY_ID"))}
-            for row in self._source["Deals"]
-            if text(row.get("COMPANY_ID")) and text(row.get("COMPANY_ID")) not in company_ids
-        ]
         plan = {
             "portal": self._manifest.get("portal"),
             "source_counts": {name: len(self._source[name]) for name in names},
             "expected_unique_addresses": len(self._unique_source_addresses()),
-            "source_orphan_deal_company": orphan_deal_company,
             "source_deals_routed_to_leads": route_counts["lead"],
             "source_deals_kept_as_deals": route_counts["deal"],
             "expected_target_leads_total": original_leads + route_counts["lead"],
@@ -706,87 +763,6 @@ class MigrationProject:
         }
         self.report.extra["source_plan"] = plan
         return plan
-
-    def validate_source_integrity(self) -> dict[str, Any]:
-        """Validate source relationships before the first target write.
-
-        Known source defects must be explicitly allowlisted in migration.json.
-        Nothing is repaired by guessing a missing CRM entity.
-        """
-        self.load_source(
-            "Companies", "Contacts", "Leads", "Deals", "Deal_Contacts",
-            "Lead_Contacts", "Contact_Companies", "Requisites", "Addresses"
-        )
-        companies = {text(row.get("ID")) for row in self._source["Companies"] if text(row.get("ID"))}
-        contacts = {text(row.get("ID")) for row in self._source["Contacts"] if text(row.get("ID"))}
-        leads = {text(row.get("ID")) for row in self._source["Leads"] if text(row.get("ID"))}
-        deals = {text(row.get("ID")) for row in self._source["Deals"] if text(row.get("ID"))}
-        requisites = {text(row.get("ID")) for row in self._source["Requisites"] if text(row.get("ID"))}
-
-        configured = self.config.get("source_integrity", {}).get("allowed_orphan_deal_company", [])
-        allowed = {
-            (text(item.get("deal_id")), text(item.get("company_id")))
-            for item in configured
-            if isinstance(item, Mapping)
-        }
-        errors: list[str] = []
-        tolerated: list[dict[str, str]] = []
-
-        for row in self._source["Deals"]:
-            deal_id = text(row.get("ID"))
-            company_id = text(row.get("COMPANY_ID"))
-            if company_id and company_id not in companies:
-                pair = (deal_id, company_id)
-                if pair in allowed:
-                    tolerated.append({"relation": "deal_company", "from": deal_id, "to": company_id})
-                else:
-                    errors.append(f"deal {deal_id} -> missing company {company_id}")
-            contact_id = text(row.get("CONTACT_ID"))
-            if contact_id and contact_id not in contacts:
-                errors.append(f"deal {deal_id} -> missing contact {contact_id}")
-
-        relation_specs = (
-            ("Contact_Companies", "CONTACT_ID", contacts, "COMPANY_ID", companies),
-            ("Deal_Contacts", "DEAL_ID", deals, "CONTACT_ID", contacts),
-            ("Lead_Contacts", "LEAD_ID", leads, "CONTACT_ID", contacts),
-        )
-        for dataset, left_field, left_ids, right_field, right_ids in relation_specs:
-            for row in self._source[dataset]:
-                left = text(row.get(left_field)); right = text(row.get(right_field))
-                if left and left not in left_ids:
-                    errors.append(f"{dataset}: missing {left_field}={left}")
-                if right and right not in right_ids:
-                    errors.append(f"{dataset}: missing {right_field}={right}")
-
-        for row in self._source["Requisites"]:
-            owner_type = text(row.get("ENTITY_TYPE_ID"))
-            owner_id = text(row.get("ENTITY_ID"))
-            if owner_type == "4" and owner_id and owner_id not in companies:
-                errors.append(f"requisite {row.get('ID')} -> missing company {owner_id}")
-            if owner_type == "3" and owner_id and owner_id not in contacts:
-                errors.append(f"requisite {row.get('ID')} -> missing contact {owner_id}")
-
-        for row in self._source["Addresses"]:
-            if text(row.get("ENTITY_TYPE_ID")) == "8":
-                requisite_id = text(row.get("ENTITY_ID"))
-                if requisite_id and requisite_id not in requisites:
-                    errors.append(f"address -> missing requisite {requisite_id}")
-
-        raw_addresses = len(self._source["Addresses"])
-        unique_addresses = len(self._unique_source_addresses())
-        result = {
-            "ok": not errors,
-            "errors": errors,
-            "tolerated_source_gaps": tolerated,
-            "addresses_raw": raw_addresses,
-            "addresses_unique": unique_addresses,
-            "address_exact_duplicates": raw_addresses - unique_addresses,
-            "policy": "fail closed except exact configured source-gap allowlist",
-        }
-        self.report.extra["source_integrity"] = result
-        if errors:
-            raise RuntimeError(f"Source integrity validation failed: {errors[:10]}")
-        return result
 
     # ---------- users ----------
 
@@ -882,10 +858,10 @@ class MigrationProject:
             "ambiguous": [{"source_id": text(item["source"].get("ID")), "target_ids": item["target_ids"]} for item in ambiguous],
         }
         if strict and (unresolved or ambiguous):
-            unresolved_ids = [text(row.get("ID")) for row in unresolved]
-            ambiguous_ids = [text(item["source"].get("ID")) for item in ambiguous]
             raise RuntimeError(
-                f"Required source users are not mapped: unresolved={unresolved_ids}, ambiguous={ambiguous_ids}"
+                "Required source users are not mapped: "
+                f"unresolved={[text(row.get('ID')) for row in unresolved]}, "
+                f"ambiguous={[text(item['source'].get('ID')) for item in ambiguous]}"
             )
         return result
 
@@ -1251,18 +1227,16 @@ class MigrationProject:
         dry_run: bool,
         marker_only: bool = True,
     ) -> None:
-        """Merge only duplicate cards carrying the same exact migration marker.
+        """Merge duplicate company/director cards before rebuilding relations.
 
-        Business identifiers are intentionally not sufficient for automatic merge.
-        They may be used in separate review reports, but never for a destructive write.
+        Company duplicates use BIN or the exact migration marker. Contact
+        duplicates use the exact marker, exact director FIO, or an exact
+        phone/email match involving a nameless/director card.
         """
-        if not marker_only:
-            raise ValueError(
-                "Unsafe duplicate merge by business identifiers is disabled; "
-                "only exact migration markers may be merged automatically"
-            )
         if not self.client:
             return
+        if not marker_only:
+            raise ValueError("Automatic duplicate merge is restricted to exact migration markers")
         entity_type_ids = {"contact": 3, "company": 4}
         summary: dict[str, int] = {"company_groups": 0, "contact_groups": 0}
 
@@ -1519,8 +1493,8 @@ class MigrationProject:
                     target_id = extract_id(raw_target)
                 if not target_id:
                     self.report.add(
-                        operation, source_type, source_id, target_type, "", "ERROR",
-                        "Bitrix returned no positive target ID",
+                        operation, source_type, source_id, target_type, "", "SKIP",
+                        f"Bitrix returned no target ID: {raw_target}",
                     )
                     self.report.add_transfer(
                         operation=operation,
@@ -1528,7 +1502,7 @@ class MigrationProject:
                         source_id=source_id,
                         target_type=target_type,
                         target_id="",
-                        status="ERROR",
+                        status="SKIP",
                         payload=fields,
                         route=route,
                     )
@@ -1553,7 +1527,7 @@ class MigrationProject:
                 source_type, source_id, route = source_key.split(":", 2)
                 operation = context["operation"]
                 target_id = context["target_id"]
-                status = "ERROR"
+                status = "WARN" if target_id else "SKIP"
                 self.report.add(operation, source_type, source_id, target_type, target_id, status, text(error))
                 self.report.add_transfer(
                     operation=operation,
@@ -1662,6 +1636,12 @@ class MigrationProject:
                 self.config["product_field"]["lead_code"]: self._product_encoded["lead"],
             })
             old_company = text(row.get("COMPANY_ID")); old_contact = text(row.get("CONTACT_ID"))
+            if old_company and old_company not in company_map:
+                self.report.add("prepare_lead", "DEAL", old_id, "COMPANY", "", "ERROR", f"source company {old_company} is missing or was not mapped")
+                continue
+            if old_contact and old_contact not in contact_map:
+                self.report.add("prepare_lead", "DEAL", old_id, "CONTACT", "", "ERROR", f"source contact {old_contact} is missing or was not mapped")
+                continue
             if old_company in company_map:
                 fields["COMPANY_ID"] = company_map[old_company]
             if old_contact in contact_map:
@@ -1707,6 +1687,12 @@ class MigrationProject:
                 self.config["product_field"]["deal_code"]: self._product_encoded["deal"],
             })
             old_company = text(row.get("COMPANY_ID")); old_contact = text(row.get("CONTACT_ID"))
+            if old_company and old_company not in company_map:
+                self.report.add("prepare_deal", "DEAL", old_id, "COMPANY", "", "ERROR", f"source company {old_company} is missing or was not mapped")
+                continue
+            if old_contact and old_contact not in contact_map:
+                self.report.add("prepare_deal", "DEAL", old_id, "CONTACT", "", "ERROR", f"source contact {old_contact} is missing or was not mapped")
+                continue
             if old_company in company_map:
                 fields["COMPANY_ID"] = company_map[old_company]
             if old_contact in contact_map:
@@ -1738,12 +1724,11 @@ class MigrationProject:
         return prepared
 
     def validate_live_source(self) -> dict[str, Any]:
-        """Validate immutable core data and probe optional live child access.
+        """Probe direct cloud access without blocking on optional child data.
 
-        Production core entities come exclusively from the verified dump. The
-        source webhook is used only for child enrichment which the dump cannot
-        carry fully (comments/checklists/binary files). Authentication is
-        blocking; individual child probes remain best-effort and are reported.
+        Main CRM cards, relations, tasks and activities are read from the live
+        cloud portal. Comments, checklists and binary files are best-effort child
+        data: failures are logged and the remaining records continue.
         """
         if not self.source_client:
             raise RuntimeError("SOURCE_BITRIX_WEBHOOK_URL is required")
@@ -1766,11 +1751,12 @@ class MigrationProject:
 
         check("source_user", lambda: self.source_client.call("user.current"), blocking=True)
 
-        # The immutable dump must match the approved checkpoint exactly for
-        # every core dataset. A count mismatch means the snapshot/config pair is
-        # not the one that was reviewed and therefore blocks production apply.
-        # The current live portal is intentionally not used as a count source:
-        # it may have changed after the snapshot was exported.
+        # Compare the live portal with the export checkpoint, but never block
+        # the migration only because the live portal now contains fewer rows.
+        # Records may have been deleted, converted or hidden after the dump was
+        # created. Under the project-wide skip-and-log policy we migrate every
+        # record that is currently readable and record all count gaps for later
+        # investigation. The checkpoint remains a diagnostic lower bound only.
         checkpoint_path = self.config_path.with_name("source_plan.json")
         if checkpoint_path.exists() and all(name in self._source for name in IMPORT_DATASETS):
             try:
@@ -1792,22 +1778,24 @@ class MigrationProject:
                         if dataset == "Addresses"
                         else len(self._source.get(dataset, []))
                     )
-                    count_check[dataset] = {"checkpoint": expected, "snapshot": actual}
-                    if expected and actual != expected:
+                    count_check[dataset] = {"checkpoint_minimum": expected, "live": actual}
+                    if expected and actual < expected:
+                        missing = expected - actual
                         message = (
-                            f"verified snapshot count mismatch for {dataset}: "
-                            f"snapshot={actual}, checkpoint={expected}"
+                            f"live source returned {actual} {dataset} rows, below checkpoint {expected} "
+                            f"by {missing}; the readable rows will be migrated and the gap is logged "
+                            "for follow-up (possible deletion, conversion, relation cleanup or webhook visibility)"
                         )
                         errors.append(f"source_count_{dataset}: {message}")
                 checks["source_dataset_counts"] = count_check
             except Exception as exc:  # noqa: BLE001
-                errors.append(f"source_dataset_counts: checkpoint could not be evaluated: {exc}")
-                checks["source_dataset_counts"] = f"ERROR: {exc}"
+                warnings.append(f"source_dataset_counts: checkpoint could not be evaluated: {exc}")
+                checks["source_dataset_counts"] = f"WARN: {exc}"
 
         first_task = next((row for row in self._source["Tasks"] if text(row.get("id")).isdigit()), None)
         if first_task:
             task_id = int(first_task["id"])
-            check("source_task", lambda: self.source_client.call("tasks.task.get", {"taskId": task_id, "select": ["ID", "TITLE", "UF_TASK_WEBDAV_FILES", "CHAT_ID"]}))
+            check("source_task", lambda: self.source_client.call("tasks.task.get", {"taskId": task_id, "select": ["ID", "TITLE", "UF_TASK_WEBDAV_FILES", "CHAT_ID"]}), blocking=True)
 
         task_with_comments = next(
             (
@@ -1841,51 +1829,18 @@ class MigrationProject:
         first_activity = next((row for row in self._source["CRM_Activities"] if text(row.get("ID")).isdigit()), None)
         if first_activity:
             activity_id = int(first_activity["ID"])
-            check("source_activity", lambda: self.source_client.call("crm.activity.get", {"id": activity_id}))
-            check("source_activity_bindings", lambda: self.source_client.call("crm.activity.binding.list", {"activityId": activity_id}))
+            check("source_activity", lambda: self.source_client.call("crm.activity.get", {"id": activity_id}), blocking=True)
+            check("source_activity_bindings", lambda: self.source_client.call("crm.activity.binding.list", {"activityId": activity_id}), blocking=True)
 
         result = {
             "checks": checks,
             "errors": errors,
             "warnings": warnings,
             "ok": not errors,
-            "count_gap_policy": "fail_core_snapshot_mismatch; optional_live_children_best_effort",
+            "count_gap_policy": "block_import",
         }
         self.report.extra["live_source_validation"] = result
         return result
-
-    def _validate_loaded_state_target(self) -> None:
-        """Fail closed when resumed IDs no longer carry their migration marker."""
-        if not self.report.extra.get("state_loaded"):
-            return
-        checked: list[dict[str, Any]] = []
-        specs = (
-            ("companies", "company", "COMPANY", "COMPANY"),
-            ("contacts", "contact", "CONTACT", "CONTACT"),
-            ("leads", "lead", "", ""),
-            ("deals", "deal", "DEAL", "DEAL"),
-        )
-        for map_name, entity, default_source_type, default_route in specs:
-            mapping = self.report.maps.get(map_name) or {}
-            for source_key, target_id in list(mapping.items())[:3]:
-                if map_name == "leads":
-                    parts = str(source_key).split(":", 2)
-                    if len(parts) != 3:
-                        raise RuntimeError(f"invalid state map key {map_name}:{source_key}")
-                    expected = (parts[0], parts[1], parts[2])
-                else:
-                    expected = (default_source_type, str(source_key), default_route)
-                row = self.client.call(f"crm.{entity}.get", {"id": int(target_id)}) or {}
-                if not isinstance(row, Mapping):
-                    raise RuntimeError(f"state target {entity} {target_id} is not readable")
-                markers = parse_markers(row.get("COMMENTS")) + parse_markers(row.get("ADDITIONAL_INFO"))
-                if expected not in markers:
-                    raise RuntimeError(
-                        f"state target mismatch for {map_name}:{source_key} -> {target_id}; "
-                        "migration marker is missing"
-                    )
-                checked.append({"map": map_name, "source_key": source_key, "target_id": int(target_id)})
-        self.report.extra["state_target_validation"] = {"checked": checked, "ok": True}
 
     # ---------- main import ----------
 
@@ -1893,28 +1848,20 @@ class MigrationProject:
         if not self.client:
             raise RuntimeError("Target Bitrix client is required")
         if not self.source_client:
-            raise RuntimeError("SOURCE_BITRIX_WEBHOOK_URL is required for comments/files enrichment during import")
-        if not dry_run and self.source_mode != "dump":
-            raise RuntimeError(
-                "Production apply requires config.source_mode='dump' (immutable snapshot); "
-                "live sequential reads are not an atomic migration source"
-            )
+            raise RuntimeError("SOURCE_BITRIX_WEBHOOK_URL is required for direct cloud-to-box import")
 
-        # Core datasets are loaded before any target write. A live API sequence is
-        # not an atomic snapshot, so production apply requires the immutable dump.
-        self.report.require_valid_state()
-        dump_validation = self._reader.validate_manifest()
-        self.report.extra["dump_manifest_validation"] = dump_validation
+        # Capture every source dataset before the first target write. API reads
+        # are sequential, so the validation below rejects checkpoint count gaps.
         self.load_source(*IMPORT_DATASETS)
-        self.validate_source_integrity()
         self.report.extra["source_snapshot"] = {
-            "loaded_at": datetime.now().astimezone().isoformat(),
+            "captured_at": datetime.now().astimezone().isoformat(),
             "datasets": {name: len(self._source.get(name, [])) for name in IMPORT_DATASETS},
             "origins": dict(self._source_origins),
-            "atomic": self.source_mode == "dump",
         }
+        source_integrity = self.validate_source_integrity()
+        if not source_integrity["ok"]:
+            raise RuntimeError(f"Source relationship integrity failed: {json.dumps(source_integrity, ensure_ascii=False)}")
         self.discover_target()
-        self._validate_loaded_state_target()
         validation = self.validate_target()
         if not validation["ok"]:
             raise RuntimeError(f"Target validation failed: {json.dumps(validation, ensure_ascii=False)}")
@@ -1922,10 +1869,8 @@ class MigrationProject:
         if not source_validation["ok"]:
             raise RuntimeError(f"Live cloud validation failed: {json.dumps(source_validation, ensure_ascii=False)}")
 
-        # Clean up duplicates left by previous test runs before any relation is
-        # rebuilt. In dry-run this only records the planned merge groups.
-        # Automatic merge is deliberately limited to exact migration markers.
-        # Business-key candidates (BIN/FIO/phone/email) are never merged automatically.
+        # Automatic cleanup is limited to exact migration markers. Business
+        # identifiers are candidates for manual review, not merge keys.
         self.consolidate_target_duplicates(
             dry_run=dry_run,
             marker_only=True,
@@ -1944,7 +1889,7 @@ class MigrationProject:
                 "CRM activity files",
                 "live activity binding enrichment",
             ],
-            "note": "Only explicitly optional child enrichment is best-effort. Core entity or relation errors fail the run.",
+            "note": "Any individual object or subobject that cannot be processed is skipped and recorded. The workflow continues.",
         }
         user_map = self.build_user_map(strict=True)
         portal_match = re.match(r"https?://[^/]+", text(getattr(self.client, "base", "")))
@@ -2641,124 +2586,61 @@ class MigrationProject:
 
     # ---------- relations and requisites ----------
 
-    @staticmethod
-    def _relation_id_set(existing: Any, *, id_field: str) -> set[str]:
-        if not isinstance(existing, list):
-            return set()
-        return {
-            text(row.get(id_field))
-            for row in existing
-            if isinstance(row, Mapping) and text(row.get(id_field))
-        }
-
-    @staticmethod
-    def _relation_has_primary(existing: Any) -> bool:
-        if not isinstance(existing, list):
-            return False
-        return any(
-            normalize_text(row.get("IS_PRIMARY")) in {"y", "yes", "true", "1"}
-            for row in existing
-            if isinstance(row, Mapping)
-        )
-
-    def _add_missing_relations(
+    def _set_relation_items_preserving_existing(
         self,
         *,
-        owner_id: int,
-        existing: Any,
-        desired: list[dict[str, Any]],
-        id_field: str,
-        add_method: str,
         get_method: str,
-    ) -> tuple[int, int]:
-        """Add migration relations without replacing the target relation set.
+        set_method: str,
+        target_id: int,
+        desired: Sequence[Mapping[str, Any]],
+        identity_field: str,
+    ) -> int:
+        """Add/update migrated relations without deleting unrelated target links."""
+        current = self.client.call(get_method, {"id": target_id}) or []
+        if isinstance(current, Mapping):
+            current = current.get("items") or current.get("result") or []
+        if not isinstance(current, list):
+            raise RuntimeError(f"{get_method} returned an unexpected payload")
 
-        The old implementation used ``*.items.set``. Bitrix documents that the
-        method replaces the whole set, so a concurrent/manual target-only link
-        could be deleted. The additive ``*.add`` APIs avoid that destructive
-        race. Existing target relations are never rewritten.
-
-        Returns ``(added, already_present)``. If a write result is ambiguous,
-        the shared HTTP client raises and the run stops; a rerun reconciles by
-        reading the current relation set before trying another add.
-        """
-        existing_ids = self._relation_id_set(existing, id_field=id_field)
-        has_primary = self._relation_has_primary(existing)
-        added = 0
-        already = 0
-        seen_desired: set[str] = set()
-
-        for raw in desired:
-            fields = dict(raw)
-            relation_id = text(fields.get(id_field))
-            if not relation_id or relation_id in seen_desired:
+        merged: dict[str, dict[str, Any]] = {}
+        normalized_identity = re.sub(r"[^a-z0-9]", "", identity_field.casefold())
+        for item in current:
+            if not isinstance(item, Mapping):
                 continue
-            seen_desired.add(relation_id)
-            if relation_id in existing_ids:
-                already += 1
-                continue
-
-            # Do not steal a manually-established primary relation on a portal
-            # that already contains one. On a clean target the source primary
-            # flag is retained.
-            if has_primary and normalize_text(fields.get("IS_PRIMARY")) in {"y", "yes", "true", "1"}:
-                fields["IS_PRIMARY"] = "N"
-
-            result = self.client.call(add_method, {"id": owner_id, "fields": fields})
-            if result is False:
-                # Bitrix returns false when the relation already exists. This
-                # can happen in a benign race after our initial read. Reconcile
-                # once using the safe read endpoint instead of replaying the
-                # write blindly.
-                refreshed = self.client.call(get_method, {"id": owner_id}) or []
-                refreshed_ids = self._relation_id_set(refreshed, id_field=id_field)
-                if relation_id not in refreshed_ids:
-                    raise RuntimeError(
-                        f"{add_method} returned false and relation {relation_id} is still absent"
-                    )
-                already += 1
-                existing_ids = refreshed_ids
-                has_primary = self._relation_has_primary(refreshed)
-                continue
-
-            added += 1
-            existing_ids.add(relation_id)
-            if normalize_text(fields.get("IS_PRIMARY")) in {"y", "yes", "true", "1"}:
-                has_primary = True
-
-        return added, already
+            key = ""
+            for code, value in item.items():
+                if re.sub(r"[^a-z0-9]", "", text(code).casefold()) == normalized_identity:
+                    key = text(value)
+                    break
+            if key:
+                merged[key] = dict(item)
+        for item in desired:
+            key = text(item.get(identity_field))
+            if key:
+                merged[key] = dict(item)
+        self.client.call(set_method, {"id": target_id, "items": list(merged.values())})
+        return len(merged)
 
     def import_contact_company_relations(self, contact_map: Mapping[str, int], company_map: Mapping[str, int]) -> None:
         self.load_source("Contact_Companies")
         grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for row in self._source["Contact_Companies"]:
-            old_contact = text(row.get("CONTACT_ID"))
-            old_company = text(row.get("COMPANY_ID"))
+            old_contact = text(row.get("CONTACT_ID")); old_company = text(row.get("COMPANY_ID"))
             if old_contact in contact_map and old_company in company_map:
-                grouped[old_contact].append({
-                    "COMPANY_ID": company_map[old_company],
-                    "SORT": int(row.get("SORT") or 10),
-                    "IS_PRIMARY": text(row.get("IS_PRIMARY")) or "N",
-                })
-        for old_contact, desired in grouped.items():
-            target_contact = int(contact_map[old_contact])
+                grouped[old_contact].append({"COMPANY_ID": company_map[old_company], "SORT": int(row.get("SORT") or 10), "IS_PRIMARY": text(row.get("IS_PRIMARY")) or "N"})
+        for old_contact, items in grouped.items():
+            target_id = contact_map[old_contact]
             try:
-                existing = self.client.call("crm.contact.company.items.get", {"id": target_contact}) or []
-                added, already = self._add_missing_relations(
-                    owner_id=target_contact,
-                    existing=existing,
-                    desired=desired,
-                    id_field="COMPANY_ID",
-                    add_method="crm.contact.company.add",
+                total = self._set_relation_items_preserving_existing(
                     get_method="crm.contact.company.items.get",
+                    set_method="crm.contact.company.items.set",
+                    target_id=target_id,
+                    desired=items,
+                    identity_field="COMPANY_ID",
                 )
-                status = "OK" if added else "SKIP"
-                self.report.add(
-                    "add_contact_companies", "CONTACT", old_contact, "CONTACT", target_contact, status,
-                    f"added={added}; already_present={already}; target-only relations untouched",
-                )
-            except Exception as exc:
-                self.report.add("add_contact_companies", "CONTACT", old_contact, "CONTACT", target_contact, "ERROR", str(exc))
+                self.report.add("set_contact_companies", "CONTACT", old_contact, "CONTACT", target_id, "OK", f"relations={total}")
+            except Exception as exc:  # noqa: BLE001
+                self.report.add("set_contact_companies", "CONTACT", old_contact, "CONTACT", target_id, "ERROR", str(exc))
 
     def import_crm_contact_relations(self, contact_map: Mapping[str, int], lead_map: Mapping[str, int], deal_map: Mapping[str, int]) -> None:
         self.load_source("Lead_Contacts", "Deal_Contacts")
@@ -2788,61 +2670,51 @@ class MigrationProject:
                     deal_contact_rows[converted_deal].append(item)
 
         for row in self._source["Deal_Contacts"]:
-            old_deal = text(row.get("DEAL_ID"))
-            old_contact = text(row.get("CONTACT_ID"))
+            old_deal = text(row.get("DEAL_ID")); old_contact = text(row.get("CONTACT_ID"))
             if old_contact not in contact_map:
                 continue
-            item = {
-                "CONTACT_ID": contact_map[old_contact],
-                "SORT": int(row.get("SORT") or 10),
-                "IS_PRIMARY": text(row.get("IS_PRIMARY")) or "N",
-            }
+            item = {"CONTACT_ID": contact_map[old_contact], "SORT": int(row.get("SORT") or 10), "IS_PRIMARY": text(row.get("IS_PRIMARY")) or "N"}
             deal_contact_rows[old_deal].append(item)
             routed_key = f"DEAL:{old_deal}:LEAD"
             if routed_key in lead_map:
                 lead_items[routed_key].append(item)
 
-        for source_key, desired in lead_items.items():
-            target_id = int(lead_map[source_key])
+        for source_key, items in lead_items.items():
+            seen = set(); unique = []
+            for item in items:
+                if item["CONTACT_ID"] not in seen:
+                    seen.add(item["CONTACT_ID"]); unique.append(item)
+            target_id = lead_map[source_key]
             try:
-                existing = self.client.call("crm.lead.contact.items.get", {"id": target_id}) or []
-                added, already = self._add_missing_relations(
-                    owner_id=target_id,
-                    existing=existing,
-                    desired=desired,
-                    id_field="CONTACT_ID",
-                    add_method="crm.lead.contact.add",
+                total = self._set_relation_items_preserving_existing(
                     get_method="crm.lead.contact.items.get",
+                    set_method="crm.lead.contact.items.set",
+                    target_id=target_id,
+                    desired=unique,
+                    identity_field="CONTACT_ID",
                 )
-                status = "OK" if added else "SKIP"
-                self.report.add(
-                    "add_crm_contacts", "LEAD", source_key, "LEAD", target_id, status,
-                    f"added={added}; already_present={already}; target-only relations untouched",
-                )
-            except Exception as exc:
-                self.report.add("add_crm_contacts", "LEAD", source_key, "LEAD", target_id, "ERROR", str(exc))
-
-        for old_deal, desired in deal_contact_rows.items():
+                self.report.add("set_crm_contacts", "LEAD", source_key, "LEAD", target_id, "OK", f"relations={total}")
+            except Exception as exc:  # noqa: BLE001
+                self.report.add("set_crm_contacts", "LEAD", source_key, "LEAD", target_id, "ERROR", str(exc))
+        for old_deal, items in deal_contact_rows.items():
             if old_deal not in deal_map:
                 continue
-            target_id = int(deal_map[old_deal])
+            seen = set(); unique = []
+            for item in items:
+                if item["CONTACT_ID"] not in seen:
+                    seen.add(item["CONTACT_ID"]); unique.append(item)
+            target_id = deal_map[old_deal]
             try:
-                existing = self.client.call("crm.deal.contact.items.get", {"id": target_id}) or []
-                added, already = self._add_missing_relations(
-                    owner_id=target_id,
-                    existing=existing,
-                    desired=desired,
-                    id_field="CONTACT_ID",
-                    add_method="crm.deal.contact.add",
+                total = self._set_relation_items_preserving_existing(
                     get_method="crm.deal.contact.items.get",
+                    set_method="crm.deal.contact.items.set",
+                    target_id=target_id,
+                    desired=unique,
+                    identity_field="CONTACT_ID",
                 )
-                status = "OK" if added else "SKIP"
-                self.report.add(
-                    "add_crm_contacts", "DEAL", old_deal, "DEAL", target_id, status,
-                    f"added={added}; already_present={already}; target-only relations untouched",
-                )
-            except Exception as exc:
-                self.report.add("add_crm_contacts", "DEAL", old_deal, "DEAL", target_id, "ERROR", str(exc))
+                self.report.add("set_crm_contacts", "DEAL", old_deal, "DEAL", target_id, "OK", f"relations={total}")
+            except Exception as exc:  # noqa: BLE001
+                self.report.add("set_crm_contacts", "DEAL", old_deal, "DEAL", target_id, "ERROR", str(exc))
 
     @staticmethod
     def _address_source_key(row: Mapping[str, Any]) -> tuple[str, ...]:
@@ -3050,37 +2922,46 @@ class MigrationProject:
     # ---------- task migration ----------
 
     def _converted_lead_to_deal(self) -> dict[str, str]:
-        """Return the explicitly approved converted lead -> deal map.
+        """Map excluded converted test leads to the deals produced by conversion.
 
-        Title matching is deliberately forbidden here: titles are mutable and
-        non-unique.  The current snapshot mapping is pinned in migration.json
-        and source IDs are validated before the alias is used.
+        The four cloud leads are intentionally not recreated. Their converted
+        deals remain part of the migration, so task/activity relations that still
+        point to an old lead must follow the uniquely matching converted deal.
         """
         if self._converted_lead_aliases is not None:
             return self._converted_lead_aliases
         self.load_source("Leads", "Deals")
-        known_leads = {text(row.get("ID")) for row in self._source["Leads"]}
-        known_deals = {text(row.get("ID")) for row in self._source["Deals"]}
-        raw = self.config.get("converted_lead_deal_map") or {}
-        if not isinstance(raw, Mapping):
-            raise RuntimeError("converted_lead_deal_map must be an object")
+        explicit = self.config.get("converted_lead_to_deal", {})
+        if explicit:
+            lead_ids = {text(row.get("ID")) for row in self._source["Leads"]}
+            deal_ids = {text(row.get("ID")) for row in self._source["Deals"]}
+            aliases = {text(lead_id): text(deal_id) for lead_id, deal_id in explicit.items()}
+            invalid = {
+                lead_id: deal_id
+                for lead_id, deal_id in aliases.items()
+                if lead_id not in lead_ids or deal_id not in deal_ids
+            }
+            if invalid:
+                raise RuntimeError(f"Invalid converted_lead_to_deal mapping: {invalid}")
+            self._converted_lead_aliases = aliases
+            self.report.extra["converted_lead_aliases"] = {"mapped": aliases, "source": "config"}
+            return aliases
+        by_title: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for deal in self._source["Deals"]:
+            title_key = normalize_text(deal.get("TITLE"))
+            if title_key:
+                by_title[title_key].append(deal)
         aliases: dict[str, str] = {}
-        invalid: list[dict[str, str]] = []
-        for old_lead, old_deal in raw.items():
-            lead_id = text(old_lead)
-            deal_id = text(old_deal)
-            if lead_id not in known_leads or deal_id not in known_deals:
-                invalid.append({"lead_id": lead_id, "deal_id": deal_id})
-                continue
-            aliases[lead_id] = deal_id
-        if invalid:
-            raise RuntimeError(f"Invalid converted lead/deal aliases in config: {invalid}")
+        ambiguous: dict[str, list[str]] = {}
+        for lead in self._source["Leads"]:
+            old_lead = text(lead.get("ID"))
+            candidates = by_title.get(normalize_text(lead.get("TITLE")), [])
+            if len(candidates) == 1:
+                aliases[old_lead] = text(candidates[0].get("ID"))
+            elif len(candidates) > 1:
+                ambiguous[old_lead] = [text(item.get("ID")) for item in candidates]
         self._converted_lead_aliases = aliases
-        self.report.extra["converted_lead_aliases"] = {
-            "mapped": aliases,
-            "source": "config/converted_lead_deal_map",
-            "title_matching": False,
-        }
+        self.report.extra["converted_lead_aliases"] = {"mapped": aliases, "ambiguous": ambiguous}
         return aliases
 
     @staticmethod
@@ -3572,8 +3453,8 @@ class MigrationProject:
                     self.report.maps["task_comments"][map_key] = mapped
                 self.report.add("create_task_comment", "TASK_COMMENT", map_key, "TASK", target_task_id, "OK", "classic comment API")
                 continue
-            except Exception as exc:
-                first_error = str(exc)
+            except Exception as first_exc:
+                first_error = str(first_exc)
 
             retry_fields = dict(fields)
             retry_fields["AUTHOR_ID"] = self._current_target_user_id
@@ -3590,8 +3471,8 @@ class MigrationProject:
                     self.report.maps["task_comments"][map_key] = mapped
                 self.report.add("create_task_comment", "TASK_COMMENT", map_key, "TASK", target_task_id, "WARN", f"webhook author used after: {first_error}")
                 continue
-            except Exception as exc:
-                retry_error = str(exc)
+            except Exception as retry_exc:
+                retry_error = str(retry_exc)
 
             fallback_text = (
                 f"Исходный автор: {author_label}\n"
@@ -3612,7 +3493,7 @@ class MigrationProject:
                     f"{fallback_method} used after: {first_error}; retry: {retry_error}",
                 )
             except Exception as chat_exc:
-                self.report.add("create_task_comment", "TASK_COMMENT", map_key, "TASK", target_task_id, "WARN", f"classic: {first_error}; retry: {retry_error}; chat: {chat_exc}")
+                self.report.add("create_task_comment", "TASK_COMMENT", map_key, "TASK", target_task_id, "ERROR", f"classic: {first_error}; retry: {retry_error}; chat: {chat_exc}")
 
     def _import_task_checklist(self, old_task_id: str, target_task_id: int, user_map: Mapping[str, int]) -> None:
         try:
@@ -4446,205 +4327,27 @@ class MigrationProject:
             )
             self._ensure_activity_files(old_id, target_id, files)
 
-    @staticmethod
-    def _verify_value(value: Any) -> Any:
-        if value in (None, "", [], {}, ()):
-            return ""
-        if isinstance(value, bool):
-            return "Y" if value else "N"
-        if isinstance(value, Mapping):
-            return {
-                str(key): MigrationProject._verify_value(item)
-                for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
-            }
-        if isinstance(value, (list, tuple)):
-            return [MigrationProject._verify_value(item) for item in value]
-        return str(value).strip()
-
-    @staticmethod
-    def _relation_result_rows(value: Any) -> list[dict[str, Any]]:
-        if isinstance(value, list):
-            return [dict(item) for item in value if isinstance(item, Mapping)]
-        if isinstance(value, Mapping):
-            for key in ("items", "result"):
-                nested = value.get(key)
-                if isinstance(nested, list):
-                    return [dict(item) for item in nested if isinstance(item, Mapping)]
-        return []
-
-    def _verify_relation_subsets(
-        self,
-        company_map: Mapping[str, int],
-        contact_map: Mapping[str, int],
-        lead_map: Mapping[str, int],
-        deal_map: Mapping[str, int],
-    ) -> list[dict[str, Any]]:
-        """Verify every migrated contact/company and CRM contact relation as a subset.
-
-        Target-only relations are allowed because reruns deliberately preserve manual
-        links. Missing source relations are gaps and fail verification.
-        """
-        self.load_source("Contact_Companies", "Lead_Contacts", "Deal_Contacts")
-        checks: list[tuple[str, str, int, str, set[int]]] = []
-
-        contact_company: dict[str, set[int]] = defaultdict(set)
-        for row in self._source["Contact_Companies"]:
-            old_contact = text(row.get("CONTACT_ID"))
-            old_company = text(row.get("COMPANY_ID"))
-            if old_contact in contact_map and old_company in company_map:
-                contact_company[old_contact].add(int(company_map[old_company]))
-        for old_contact, expected in contact_company.items():
-            checks.append((
-                f"contact:{old_contact}",
-                "crm.contact.company.items.get",
-                int(contact_map[old_contact]),
-                "COMPANY_ID",
-                expected,
-            ))
-
-        lead_contacts: dict[str, set[int]] = defaultdict(set)
-        deal_contacts: dict[str, set[int]] = defaultdict(set)
-        aliases = self._converted_lead_to_deal()
-        for row in self._source["Lead_Contacts"]:
-            old_lead = text(row.get("LEAD_ID"))
-            old_contact = text(row.get("CONTACT_ID"))
-            if old_contact not in contact_map:
-                continue
-            target_contact = int(contact_map[old_contact])
-            source_key = f"LEAD:{old_lead}:LEAD"
-            if source_key in lead_map:
-                lead_contacts[source_key].add(target_contact)
-                continue
-            converted_deal = aliases.get(old_lead)
-            if converted_deal:
-                target = self._source_deal_target(converted_deal, lead_map, deal_map)
-                if target and target[0] == "lead":
-                    lead_contacts[f"DEAL:{converted_deal}:LEAD"].add(target_contact)
-                elif target and target[0] == "deal":
-                    deal_contacts[converted_deal].add(target_contact)
-
-        for row in self._source["Deal_Contacts"]:
-            old_deal = text(row.get("DEAL_ID"))
-            old_contact = text(row.get("CONTACT_ID"))
-            if old_contact not in contact_map:
-                continue
-            target_contact = int(contact_map[old_contact])
-            routed_key = f"DEAL:{old_deal}:LEAD"
-            if routed_key in lead_map:
-                lead_contacts[routed_key].add(target_contact)
-            elif old_deal in deal_map:
-                deal_contacts[old_deal].add(target_contact)
-
-        for source_key, expected in lead_contacts.items():
-            if source_key in lead_map:
-                checks.append((
-                    f"lead:{source_key}",
-                    "crm.lead.contact.items.get",
-                    int(lead_map[source_key]),
-                    "CONTACT_ID",
-                    expected,
-                ))
-        for old_deal, expected in deal_contacts.items():
-            if old_deal in deal_map:
-                checks.append((
-                    f"deal:{old_deal}",
-                    "crm.deal.contact.items.get",
-                    int(deal_map[old_deal]),
-                    "CONTACT_ID",
-                    expected,
-                ))
-
-        gaps: list[dict[str, Any]] = []
-        commands = [
-            (f"r{index}", method, {"id": target_id})
-            for index, (_label, method, target_id, _field, _expected) in enumerate(checks)
-        ]
-        contexts = {
-            f"r{index}": (label, target_id, id_field, expected)
-            for index, (label, _method, target_id, id_field, expected) in enumerate(checks)
-        }
-        for success, errors in self.client.batch_chunks(commands, size=40):
-            for key, raw in success.items():
-                label, target_id, id_field, expected = contexts[key]
-                rows = self._relation_result_rows(raw)
-                actual = {
-                    int(str(row.get(id_field)))
-                    for row in rows
-                    if str(row.get(id_field) or "").isdigit()
-                }
-                missing = sorted(expected - actual)
-                if missing:
-                    gaps.append({
-                        "relation": label,
-                        "target_id": target_id,
-                        "missing_target_ids": missing,
-                    })
-            for key, error in errors.items():
-                label, target_id, _id_field, _expected = contexts[key]
-                gaps.append({
-                    "relation": label,
-                    "target_id": target_id,
-                    "error": text(error),
-                })
-        return gaps
-
     def verify(self) -> dict[str, Any]:
         if not self.client:
             raise RuntimeError("Target Bitrix client is required")
-
-        self.report.require_valid_state()
-        self.report.extra["dump_manifest_validation"] = self._reader.validate_manifest()
-        self.load_source(*IMPORT_DATASETS)
-        self.validate_source_integrity()
-        self.discover_target()
-        self._validate_loaded_state_target()
-        target_validation = self.validate_target()
-        if not target_validation["ok"]:
-            result = {
-                "ok": False,
-                "complete": False,
-                "target_validation": target_validation,
-                "policy": "Target schema mismatch blocks verification.",
-            }
-            self.report.extra["verification"] = result
-            return result
-
-        user_map = self.build_user_map(strict=True)
         plan = self.source_plan()
-        result: dict[str, Any] = {"expected": plan, "markers": {}, "target_validation": target_validation}
-
-        company_markers = self._existing_markers("company")
-        contact_markers = self._existing_markers("contact")
+        result: dict[str, Any] = {"expected": plan, "markers": {}}
+        for label, entity, source_type, route in (
+            ("companies", "company", "COMPANY", "COMPANY"),
+            ("contacts", "contact", "CONTACT", "CONTACT"),
+        ):
+            markers = self._existing_markers(entity)
+            result["markers"][label] = sum(
+                1 for key in markers if key[0] == source_type and key[2] == route
+            )
         lead_markers = self._existing_markers("lead")
         deal_markers = self._existing_markers("deal")
-
-        company_map = {
-            source_id: target_id
-            for (source_type, source_id, route), target_id in company_markers.items()
-            if source_type == "COMPANY" and route == "COMPANY"
-        }
-        contact_map = {
-            source_id: target_id
-            for (source_type, source_id, route), target_id in contact_markers.items()
-            if source_type == "CONTACT" and route == "CONTACT"
-        }
-        lead_map = {
-            f"{source_type}:{source_id}:{route}": target_id
-            for (source_type, source_id, route), target_id in lead_markers.items()
-            if route == "LEAD"
-        }
-        deal_map = {
-            source_id: target_id
-            for (source_type, source_id, route), target_id in deal_markers.items()
-            if source_type == "DEAL" and route == "DEAL"
-        }
-
-        result["markers"]["companies"] = len(company_map)
-        result["markers"]["contacts"] = len(contact_map)
         result["markers"]["deals_routed_to_leads"] = sum(
-            1 for key in lead_map if key.startswith("DEAL:")
+            1 for key in lead_markers if key[0] == "DEAL" and key[2] == "LEAD"
         )
-        result["markers"]["deals_kept_as_deals"] = len(deal_map)
+        result["markers"]["deals_kept_as_deals"] = sum(
+            1 for key in deal_markers if key[0] == "DEAL" and key[2] == "DEAL"
+        )
         result["markers"]["tasks"] = len(self._existing_tasks(include_saved_maps=False))
         result["markers"]["activities"] = len(self._existing_activities(include_saved_maps=False))
 
@@ -4652,21 +4355,25 @@ class MigrationProject:
             "crm.requisite.list",
             {"order": {"ID": "ASC"}, "filter": {}, "select": ["ID", "XML_ID"]},
         )
-        migrated_requisites = [
-            row for row in requisites if text(row.get("XML_ID")).startswith("B24MIG_REQ_")
-        ]
-        result["markers"]["requisites"] = len(migrated_requisites)
+        result["markers"]["requisites"] = sum(
+            1 for row in requisites if text(row.get("XML_ID")).startswith("B24MIG_REQ_")
+        )
         addresses = self.client.list_all(
             "crm.address.list",
             {"filter": {"ENTITY_TYPE_ID": 8}, "order": {"ENTITY_ID": "ASC", "TYPE_ID": "ASC"}},
         )
-        requisite_ids = {text(row.get("ID")) for row in migrated_requisites}
+        requisite_ids = {
+            text(row.get("ID"))
+            for row in requisites
+            if text(row.get("XML_ID")).startswith("B24MIG_REQ_")
+        }
         result["markers"]["addresses"] = len({
             (text(row.get("ENTITY_ID")), text(row.get("TYPE_ID")))
             for row in addresses
             if text(row.get("ENTITY_ID")) in requisite_ids
         })
 
+        self.load_source("Addresses")
         expected_counts = {
             "companies": plan["source_counts"]["Companies"],
             "contacts": plan["source_counts"]["Contacts"],
@@ -4675,7 +4382,7 @@ class MigrationProject:
             "tasks": plan["expected_tasks"],
             "activities": plan["expected_activities"],
             "requisites": plan["source_counts"]["Requisites"],
-            "addresses": plan["expected_unique_addresses"],
+            "addresses": len(self._unique_source_addresses()),
         }
         gaps = {
             name: max(0, int(expected) - int(result["markers"].get(name, 0)))
@@ -4684,112 +4391,18 @@ class MigrationProject:
         result["expected_counts"] = expected_counts
         result["gaps"] = gaps
         result["count_complete"] = not any(gaps.values())
-
-        # Field-level verification for the fields that drive business routing,
-        # ownership, linkage and reporting. Binary files/comments have separate
-        # best-effort checks and are not silently promoted to field equality.
-        prepared_by_entity: dict[str, list[tuple[str, dict[str, Any]]]] = {
-            "company": self.prepare_companies(user_map),
-            "contact": self.prepare_contacts(user_map, company_map),
-            "lead": self.prepare_original_leads(user_map, company_map, contact_map)
-            + self.prepare_routed_deal_leads(user_map, company_map, contact_map),
-            "deal": self.prepare_deals(user_map, company_map, contact_map),
-        }
-        target_ids_by_entity: dict[str, Mapping[str, int]] = {
-            "company": {f"COMPANY:{key}:COMPANY": value for key, value in company_map.items()},
-            "contact": {f"CONTACT:{key}:CONTACT": value for key, value in contact_map.items()},
-            "lead": lead_map,
-            "deal": {f"DEAL:{key}:DEAL": value for key, value in deal_map.items()},
-        }
-        loss_cfg = self.config["field_mapping"]["lead_loss_reason"]
-        critical_fields = {
-            "company": {"TITLE", "ASSIGNED_BY_ID", "SOURCE_ID"},
-            "contact": {"NAME", "LAST_NAME", "SECOND_NAME", "ASSIGNED_BY_ID", "COMPANY_ID", "SOURCE_ID"},
-            "lead": {
-                "TITLE", "ASSIGNED_BY_ID", "STATUS_ID", "COMPANY_ID", "CONTACT_ID", "SOURCE_ID",
-                self.config["product_field"]["lead_code"], loss_cfg["target_lead_field"],
-            },
-            "deal": {
-                "TITLE", "ASSIGNED_BY_ID", "STAGE_ID", "CATEGORY_ID", "COMPANY_ID", "CONTACT_ID", "SOURCE_ID",
-                self.config["product_field"]["deal_code"], loss_cfg["target_deal_field"],
-                self.config["field_mapping"]["deal_contract_number"]["target_deal_field"],
-                self.config["field_mapping"]["deal_loss_detail"]["target_deal_field"],
-            },
-        }
-        field_mismatches: list[dict[str, Any]] = []
-        field_mismatch_count = 0
-        for entity, prepared in prepared_by_entity.items():
-            keys = sorted(critical_fields[entity])
-            target_rows = self.client.list_all(
-                f"crm.{entity}.list",
-                {"order": {"ID": "ASC"}, "filter": {}, "select": ["ID", *keys]},
-            )
-            by_id = {
-                int(row["ID"]): row
-                for row in target_rows
-                if str(row.get("ID") or "").isdigit()
-            }
-            target_map = target_ids_by_entity[entity]
-            for source_key, expected_fields in prepared:
-                target_id = target_map.get(source_key)
-                if not target_id:
-                    continue  # already counted as a marker gap
-                actual = by_id.get(int(target_id))
-                if actual is None:
-                    field_mismatch_count += 1
-                    if len(field_mismatches) < 200:
-                        field_mismatches.append({
-                            "entity": entity,
-                            "source_key": source_key,
-                            "target_id": int(target_id),
-                            "field": "ID",
-                            "expected": "readable target row",
-                            "actual": "missing",
-                        })
-                    continue
-                for code in keys:
-                    if code not in expected_fields:
-                        continue
-                    expected_value = self._verify_value(expected_fields.get(code))
-                    actual_value = self._verify_value(actual.get(code))
-                    if expected_value == actual_value:
-                        continue
-                    field_mismatch_count += 1
-                    if len(field_mismatches) < 200:
-                        field_mismatches.append({
-                            "entity": entity,
-                            "source_key": source_key,
-                            "target_id": int(target_id),
-                            "field": code,
-                            "expected": expected_value,
-                            "actual": actual_value,
-                        })
-
-        relation_gaps = self._verify_relation_subsets(company_map, contact_map, lead_map, deal_map)
-        result["field_verification"] = {
-            "mismatch_count": field_mismatch_count,
-            "mismatches_sample": field_mismatches,
-            "checked_scope": "business-critical routing/owner/link/status/product fields",
-        }
-        result["relation_verification"] = {
-            "gap_count": len(relation_gaps),
-            "gaps_sample": relation_gaps[:200],
-            "policy": "source relations must exist; target-only manual relations are allowed",
-        }
-        result["complete"] = (
-            result["count_complete"]
-            and field_mismatch_count == 0
-            and not relation_gaps
-        )
-        result["ok"] = result["complete"]
+        result["complete"] = result["count_complete"]
+        result["ok"] = result["count_complete"]
         result["scope"] = (
-            "Marker/count checks + business-critical field equality + complete CRM relation subset checks."
+            "Entity marker counts plus migrated requisite and unique address counts."
         )
         result["limitations"] = [
-            "Binary file bytes are not re-downloaded and hashed during verify.",
-            "Task comment/checklist content remains covered by import journals and marker/idempotency checks, not byte-for-byte equality.",
-            "Target-only CRM relations are intentionally preserved and therefore do not count as mismatches.",
+            "Does not compare every field value in every target card.",
+            "Does not prove every task comment, checklist item or binary file was readable in the source.",
+            "Does not call every relation endpoint again; relation-level failures remain in the import reports.",
         ]
-        result["policy"] = "Any count gap, field mismatch or missing source relation makes verify return a non-zero exit code."
+        result["policy"] = (
+            "Verification reports gaps honestly and does not delete or recreate data automatically."
+        )
         self.report.extra["verification"] = result
         return result

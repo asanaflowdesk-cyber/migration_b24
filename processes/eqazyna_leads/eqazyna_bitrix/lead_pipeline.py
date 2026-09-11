@@ -9,6 +9,14 @@ from typing import Any
 from common.naming import short_organization_name
 
 from .bitrix_client import BitrixClient, BitrixError
+from .distribution import (
+    AssignmentUser,
+    DistributionError,
+    DistributionSnapshot,
+    branch_key,
+    is_branch_head,
+    normalise_bin,
+)
 from .formatter import (
     build_company_summary,
     build_lead_comment,
@@ -27,7 +35,7 @@ DEFAULT_FAILURE_REASON_FIELD = "UF_CRM_1785508658316"
 DEFAULT_EXISTING_CLIENT_FAILURE_REASON = "Уже работает с Евразией"
 DEFAULT_NEW_LEAD_STATUS_ID = "NEW"
 DEFAULT_EXISTING_CLIENT_FAILURE_STATUS_ID = "JUNK"
-DEFAULT_MANAGER_IDS = (22, 23, 16, 17, 18, 38, 44, 39, 19, 15)
+DEFAULT_MANAGER_IDS: tuple[int, ...] = ()
 
 
 @dataclass(slots=True)
@@ -37,9 +45,10 @@ class LeadPipelineConfig:
     One e-Qazyna application number is represented by one lead. One BIN is
     represented by one company, one company requisite and, when a valid
     director name is available, one linked director contact. The responsible
-    manager is inherited only from the director contact card. If that contact
-    has no approved responsible manager, a manager is selected randomly among
-    the least-loaded approved managers. Every genuinely new application starts
+    assignment is taken from the live Google Sheets rules: an explicit BIN
+    binding wins, an active director owner is retained within the proper
+    branch, each regular manager receives at most one new founder per run, and
+    overflow goes to the branch head. Every genuinely new application starts
     in NEW. The only exception is a latest related failed lead with the reason
     «Уже работает с Евразией»: the new lead is created in JUNK with that reason.
     No other historical stage or failure reason is inherited.
@@ -63,6 +72,8 @@ class LeadPipelineConfig:
     failure_reason_field: str = DEFAULT_FAILURE_REASON_FIELD
     existing_client_failure_reason: str = DEFAULT_EXISTING_CLIENT_FAILURE_REASON
     random_seed: int | None = None
+    distribution: DistributionSnapshot | None = None
+    astana_department_id: int = 46
 
 
 @dataclass(slots=True)
@@ -101,6 +112,17 @@ class LeadPipeline:
             )
         )
         self._manager_loads: dict[int, int] = {}
+        self._distribution = config.distribution
+        self._assignment_users: dict[int, AssignmentUser] = {
+            user.user_id: user for user in (config.distribution.users if config.distribution else ())
+        }
+        self._users_by_department: dict[int, list[int]] = {}
+        for user in self._assignment_users.values():
+            self._users_by_department.setdefault(user.department_id, []).append(user.user_id)
+        self._department_heads: dict[int, int] = {}
+        self._user_cache: dict[int, dict[str, Any] | None] = {}
+        self._founder_assignments: dict[str, int] = {}
+        self._new_founders_by_manager: dict[int, set[str]] = {}
         # Entities created earlier in the same run must be reused even in dry_run.
         # This keeps the preview identical to apply and prevents one director
         # from receiving different managers across several applications.
@@ -184,7 +206,90 @@ class LeadPipeline:
             )
 
         self._load_lead_status_catalog()
-        self._load_manager_workloads()
+        if self._distribution is not None:
+            self._validate_distribution()
+        else:
+            self._load_manager_workloads()
+
+    def _validate_distribution(self) -> None:
+        if not self._assignment_users:
+            raise DistributionError("Список участников распределения пуст")
+        for user in self._assignment_users.values():
+            record = self._get_active_user(user.user_id)
+            raw_departments = record.get("UF_DEPARTMENT")
+            if raw_departments not in (None, "", []):
+                values = raw_departments if isinstance(raw_departments, list) else [raw_departments]
+                actual = {
+                    int(str(value))
+                    for value in values
+                    if str(value).strip().isdigit()
+                }
+                if actual and user.department_id not in actual:
+                    raise DistributionError(
+                        f"Пользователь {user.user_id} указан в DepartmentID={user.department_id}, "
+                        f"но в Bitrix24 состоит в {sorted(actual)}"
+                    )
+
+        fixed_ids = set(self._distribution.company_assignments.values())
+        for manager_id in sorted(fixed_ids):
+            self._get_active_user(manager_id)
+
+        for department_id in sorted(self._users_by_department):
+            members = [
+                user.user_id
+                for user in self._assignment_users.values()
+                if user.department_id == department_id
+            ]
+            heads = [
+                user.user_id
+                for user in self._assignment_users.values()
+                if user.department_id == department_id and is_branch_head(user.role)
+            ]
+            if len(heads) == 1:
+                self._department_heads[department_id] = heads[0]
+            elif len(heads) > 1:
+                raise DistributionError(
+                    f"Для DepartmentID={department_id} в user_list указано несколько РОПов: "
+                    + ", ".join(map(str, sorted(heads)))
+                )
+            elif len(members) == 1:
+                # Explicit business exception: when the table contains one
+                # person for the department, that person receives the flow.
+                self._department_heads[department_id] = members[0]
+            else:
+                raise DistributionError(
+                    f"Для DepartmentID={department_id} в user_list не указан РОП, "
+                    f"а в user_list указано {len(members)} сотрудников"
+                )
+
+        manager_ids = sorted(self._assignment_users)
+        try:
+            self._manager_loads = {
+                manager_id: self.client.count_open_leads_for_manager(
+                    manager_id,
+                    self._terminal_status_ids,
+                )
+                for manager_id in manager_ids
+            }
+        except Exception as exc:  # noqa: BLE001 - safe deterministic fallback
+            self._manager_loads = {manager_id: 0 for manager_id in manager_ids}
+            self.validation_warnings.append(
+                "Не удалось прочитать текущую нагрузку из Bitrix24; "
+                f"будет использована только нагрузка текущего запуска: {exc}"
+            )
+
+    def _get_active_user(self, user_id: int) -> dict[str, Any]:
+        record = self._get_user_record(user_id)
+        if not record:
+            raise DistributionError(f"Пользователь Bitrix24 ID={user_id} не найден")
+        if str(record.get("ACTIVE") or "Y").strip().upper() == "N":
+            raise DistributionError(f"Пользователь Bitrix24 ID={user_id} неактивен")
+        return record
+
+    def _get_user_record(self, user_id: int) -> dict[str, Any] | None:
+        if user_id not in self._user_cache:
+            self._user_cache[user_id] = self.client.get_user(user_id)
+        return self._user_cache[user_id]
 
     def _load_lead_status_catalog(self) -> None:
         try:
@@ -452,6 +557,8 @@ class LeadPipeline:
             )
             inherited_assigned_by_id, assignment_reason = self._resolve_assignment(
                 assignment_contact,
+                app,
+                enrichment,
             )
             reserved_manager_id = inherited_assigned_by_id
 
@@ -461,7 +568,10 @@ class LeadPipeline:
                     company_reference_lead,
                 )
             )
-            force_entity_assignment = assignment_reason == "least_loaded_random"
+            force_entity_assignment = assignment_reason not in {
+                "director_contact_owner",
+                "active_director_owner",
+            }
 
             try:
                 company = self._ensure_company(
@@ -633,6 +743,19 @@ class LeadPipeline:
         The global card is not re-linked or edited; it is only an assignment
         reference for the new company/contact/lead bundle.
         """
+        if self._distribution is not None:
+            # In sheet-driven mode an owner absent from user_list is meaningful:
+            # it triggers routing to that branch's ROP, so it must not be erased
+            # by the old hard-coded approved-manager filter.
+            if self._record_assigned_by_id(existing_contact or {}) is not None:
+                return existing_contact
+            person = self._split_director_name(enrichment.director)
+            finder = getattr(self.client, "find_director_contact_global", None)
+            if person is not None and callable(finder):
+                global_contact = finder(*person)
+                if self._record_assigned_by_id(global_contact or {}) is not None:
+                    return global_contact
+            return existing_contact
         if self._approved_record_assigned_by_id(existing_contact or {}) is not None:
             return existing_contact
         person = self._split_director_name(enrichment.director)
@@ -689,6 +812,8 @@ class LeadPipeline:
     def _resolve_assignment(
         self,
         contact: dict[str, Any] | None,
+        app: Application | None = None,
+        enrichment: CompanyEnrichment | None = None,
     ) -> tuple[int | None, str | None]:
         """Resolve the lead owner from one unambiguous source.
 
@@ -699,6 +824,11 @@ class LeadPipeline:
         bundle is distributed randomly among the least-loaded approved
         managers.
         """
+        if self._distribution is not None:
+            if app is None or enrichment is None:
+                raise DistributionError("Для нового распределения не переданы данные заявки")
+            return self._resolve_sheet_assignment(contact, app, enrichment)
+
         manager_id = self._approved_record_assigned_by_id(contact or {})
         if manager_id is not None:
             self._reserve_manager_load(manager_id)
@@ -711,6 +841,154 @@ class LeadPipeline:
         if configured:
             return configured, "configured_default_no_manager_pool"
         return None, None
+
+    def _resolve_sheet_assignment(
+        self,
+        contact: dict[str, Any] | None,
+        app: Application,
+        enrichment: CompanyEnrichment,
+    ) -> tuple[int, str]:
+        fixed = self._distribution.company_assignments.get(normalise_bin(app.bin))
+        if fixed is not None:
+            # Company_fix is an explicit manual decision. It overrides branch,
+            # historical ownership and the one-new-founder capacity.
+            self._founder_assignments.setdefault(self._founder_key(app, enrichment), fixed)
+            return fixed, "company_fix"
+
+        owner_id = self._record_assigned_by_id(contact or {})
+        founder_key = self._founder_key(app, enrichment)
+
+        # A director/contact owner is the founder binding and therefore wins
+        # even when the company's address contains Astana.
+        if owner_id is not None:
+            if owner_id in self._assignment_users:
+                self._founder_assignments[founder_key] = owner_id
+                return owner_id, "active_director_owner"
+            owner_departments = self._owner_department_ids(owner_id)
+            for department_id in owner_departments:
+                if department_id in self._users_by_department:
+                    selected = self._department_fallback(department_id)
+                    self._founder_assignments[founder_key] = selected
+                    return selected, "missing_owner_to_department_head"
+            raise DistributionError(
+                f"Ответственного учредителя ID={owner_id} нет в user_list, "
+                "а его подразделение нельзя сопоставить с актуальным РОПом"
+            )
+
+        if founder_key in self._founder_assignments:
+            return self._founder_assignments[founder_key], "same_founder_in_run"
+
+        address = " ".join(
+            value
+            for value in (
+                enrichment.legal_address,
+                enrichment.region,
+                enrichment.city,
+            )
+            if value
+        )
+        is_astana = branch_key(address) == "astana"
+        if is_astana:
+            scope_users = sorted(
+                set(self._users_by_department.get(self.config.astana_department_id, []))
+            )
+            scope_label = f"DepartmentID={self.config.astana_department_id}"
+        else:
+            # Outside Astana the existing behaviour remains global: choose
+            # between all current managers from user_list by current load.
+            scope_users = sorted(self._assignment_users)
+            scope_label = "весь user_list"
+
+        if not scope_users:
+            raise DistributionError(
+                f"В user_list нет участников для {scope_label} (БИН {app.bin})"
+            )
+
+        if len(scope_users) == 1:
+            selected = scope_users[0]
+            self._founder_assignments[founder_key] = selected
+            self._manager_loads[selected] = self._manager_loads.get(selected, 0) + 1
+            return selected, "single_scope_user_no_limit"
+
+        regular_users = [
+            user_id
+            for user_id in scope_users
+            if not is_branch_head(self._assignment_users[user_id].role)
+        ]
+        available = [
+            user_id
+            for user_id in regular_users
+            if not self._new_founders_by_manager.get(user_id)
+        ]
+        if available:
+            selected = self._select_sheet_least_loaded(available)
+            self._founder_assignments[founder_key] = selected
+            self._new_founders_by_manager.setdefault(selected, set()).add(founder_key)
+            return selected, (
+                "astana_new_founder_least_loaded"
+                if is_astana
+                else "new_founder_least_loaded"
+            )
+
+        heads = [
+            user_id
+            for user_id in scope_users
+            if is_branch_head(self._assignment_users[user_id].role)
+        ]
+        if not heads:
+            raise DistributionError(
+                f"Для {scope_label} исчерпан лимит менеджеров, но в user_list не указан РОП"
+            )
+        selected = self._select_sheet_least_loaded(heads)
+        self._founder_assignments[founder_key] = selected
+        return selected, (
+            "astana_overflow_to_rop" if is_astana else "overflow_to_rop"
+        )
+
+    def _owner_department_ids(self, owner_id: int) -> list[int]:
+        record = self._get_user_record(owner_id)
+        if not record:
+            return []
+        raw = record.get("UF_DEPARTMENT")
+        department_ids = raw if isinstance(raw, list) else [raw]
+        return [
+            int(str(value))
+            for value in department_ids
+            if str(value or "").strip().isdigit() and int(str(value)) > 0
+        ]
+
+    def _department_fallback(self, department_id: int) -> int:
+        members = sorted(set(self._users_by_department.get(department_id, [])))
+        if len(members) == 1:
+            selected = members[0]
+        else:
+            head = self._department_heads.get(department_id)
+            if head is None:
+                raise DistributionError(
+                    f"Для DepartmentID={department_id} не указан РОП в user_list"
+                )
+            selected = head
+        self._manager_loads[selected] = self._manager_loads.get(selected, 0) + 1
+        return selected
+
+    def _select_sheet_least_loaded(self, user_ids: list[int]) -> int:
+        minimum = min(self._manager_loads.get(user_id, 0) for user_id in user_ids)
+        candidates = sorted(
+            user_id
+            for user_id in user_ids
+            if self._manager_loads.get(user_id, 0) == minimum
+        )
+        selected = int(self._random.choice(candidates))
+        self._manager_loads[selected] = self._manager_loads.get(selected, 0) + 1
+        return selected
+
+    def _founder_key(self, app: Application, enrichment: CompanyEnrichment) -> str:
+        person = self._split_director_name(enrichment.director)
+        if person:
+            return "fio:" + "|".join(self._normalise_label(value) for value in person)
+        # Without a reliable FIO, do not merge unrelated companies into one
+        # founder merely because the source has an empty director field.
+        return "bin:" + normalise_bin(app.bin)
 
     def _resolve_status(
         self,

@@ -188,8 +188,6 @@ def main() -> int:
                 },
             )
             created_id = extract_created_id(result)
-            if created_id is None or created_id <= 0:
-                raise RuntimeError(f"department.add не вернул положительный ID: {result!r}")
             print(f"[{index:02d}/{len(config)}] CREATED ID={created_id}: {row['name']}")
 
             created_row = {

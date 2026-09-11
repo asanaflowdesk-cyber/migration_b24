@@ -181,61 +181,6 @@ def find_user_by_email(client: BitrixClient, email: str) -> dict[str, Any] | Non
     return None
 
 
-def event_marker(data: dict[str, str], external_event_id: str = "") -> str:
-    stable = clean_text(external_event_id)
-    if not stable:
-        stable = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    digest = hashlib.sha256(stable.encode("utf-8")).hexdigest()[:32]
-    return f"[FLOWDESK_EVENT:{digest}]"
-
-
-def validate_responsible(client: BitrixClient, responsible_id: int) -> None:
-    rows = client.list_all(
-        "user.get",
-        {"FILTER": {"ID": responsible_id}, "select": ["ID", "ACTIVE"]},
-    )
-    user = next(
-        (row for row in rows if clean_text(row.get("ID")) == str(responsible_id)),
-        None,
-    )
-    if user is None:
-        raise ValueError(f"Ответственный Bitrix24 ID={responsible_id} не найден")
-    if clean_text(user.get("ACTIVE")).upper() == "N":
-        raise ValueError(f"Ответственный Bitrix24 ID={responsible_id} неактивен")
-
-
-def validate_project(client: BitrixClient, project_id: int) -> None:
-    rows = client.call(
-        "sonet_group.get",
-        {"FILTER": {"ID": project_id}, "ORDER": {"ID": "ASC"}},
-    ) or []
-    if not isinstance(rows, list) or not any(
-        clean_text(row.get("ID")) == str(project_id)
-        for row in rows
-        if isinstance(row, dict)
-    ):
-        raise ValueError(
-            f"Проект/рабочая группа Bitrix24 ID={project_id} не найден или недоступен webhook-пользователю"
-        )
-
-
-def find_task_by_marker(client: BitrixClient, project_id: int, marker: str) -> str | None:
-    rows = client.list_all(
-        "tasks.task.list",
-        {
-            "filter": {"GROUP_ID": project_id},
-            "select": ["ID", "GROUP_ID", "DESCRIPTION"],
-        },
-    )
-    for row in rows:
-        description = clean_text(row.get("DESCRIPTION") or row.get("description"))
-        if marker in description:
-            task_id = clean_text(row.get("ID") or row.get("id"))
-            if task_id:
-                return task_id
-    return None
-
-
 def resolve_creator(client: BitrixClient, email_raw: str, invite_department_id: int) -> int:
     email = normalize_email(email_raw)
     if not valid_email(email):
@@ -276,6 +221,31 @@ def resolve_responsible_id(value: str) -> int:
     return responsible_id
 
 
+def validate_responsible(client: BitrixClient, responsible_id: int) -> None:
+    rows = client.list_all("user.get", {"FILTER": {"ID": responsible_id}})
+    user = next((row for row in rows if clean_text(row.get("ID")) == str(responsible_id)), None)
+    if user is None:
+        raise ValueError(f"Ответственный Bitrix24 ID={responsible_id} не найден")
+    if clean_text(user.get("ACTIVE")).upper() == "N":
+        raise ValueError(f"Ответственный Bitrix24 ID={responsible_id} неактивен")
+
+
+def flowdesk_event_key(data: dict[str, str]) -> str:
+    canonical = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return "FLOWDESK_" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
+
+
+def find_task_by_event_key(client: BitrixClient, event_key: str) -> str:
+    rows = client.list_all(
+        "tasks.task.list",
+        {"filter": {"=XML_ID": event_key}, "select": ["ID", "XML_ID"]},
+    )
+    for row in rows:
+        if clean_text(row.get("xmlId") or row.get("XML_ID")) == event_key:
+            return clean_text(row.get("id") or row.get("ID"))
+    return ""
+
+
 def create_task(
     client: BitrixClient,
     *,
@@ -285,6 +255,7 @@ def create_task(
     responsible_id: int,
     project_id: int,
     deadline: str,
+    event_key: str,
 ) -> str:
     result = client.call(
         "tasks.task.add",
@@ -296,6 +267,7 @@ def create_task(
                 "RESPONSIBLE_ID": responsible_id,
                 "GROUP_ID": project_id,
                 "DEADLINE": deadline,
+                "XML_ID": event_key,
             }
         },
     )
@@ -321,35 +293,30 @@ def main() -> int:
         invite_department_id = int(os.environ.get("FLOWDESK_INVITE_DEPARTMENT_ID", "1"))
         utc_offset_hours = int(os.environ.get("FLOWDESK_UTC_OFFSET_HOURS", "5"))
 
-        if project_id <= 0 or invite_department_id <= 0:
-            raise ValueError("FLOWDESK_PROJECT_ID and FLOWDESK_INVITE_DEPARTMENT_ID must be positive integers")
-
         data = parse_payload(raw_payload)
         title = build_title(data)
         description = build_description(data)
         responsible_id = resolve_responsible_id(data["resp_id"])
         deadline = build_deadline(data["Datetime"], utc_offset_hours)
-        marker = event_marker(data, os.environ.get("FLOWDESK_EVENT_ID", ""))
 
         client = BitrixClient.from_env()
-        # Full read-only preflight happens before user.add or tasks.task.add.
         validate_responsible(client, responsible_id)
-        validate_project(client, project_id)
-        existing_task_id = find_task_by_marker(client, project_id, marker)
+        event_key = flowdesk_event_key(data)
+        existing_task_id = find_task_by_event_key(client, event_key)
         if existing_task_id:
-            print(f"OK: FlowDesk event already processed: task ID={existing_task_id}")
+            print(f"SKIP: FlowDesk event already created task ID={existing_task_id}")
             return 0
-
         creator_id = resolve_creator(client, data["flowdesk_email"], invite_department_id)
-        task_description = f"{description.rstrip()}\n\n{marker}"
+
         task_id = create_task(
             client,
             title=title,
-            description=task_description,
+            description=description,
             creator_id=creator_id,
             responsible_id=responsible_id,
             project_id=project_id,
             deadline=deadline,
+            event_key=event_key,
         )
 
         print(f"OK: FlowDesk task created: ID={task_id}")

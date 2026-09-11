@@ -7,7 +7,7 @@ import os
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from common.bitrix import BitrixClient
 
@@ -33,23 +33,19 @@ def _utc_cutoff(days: int, now: datetime | None = None) -> str:
     return cutoff.isoformat(timespec="seconds")
 
 
-def resolve_moved_by_id(
-    explicit_user_id: str | None,
-    configured_user_id: str | None = None,
-) -> int:
+def resolve_moved_by_id(explicit_user_id: str | None, configured_user_id: str | None = None) -> int:
     """Resolve the user whose failed-stage moves must be reverted.
 
-    Resolution order is intentionally explicit: workflow/CLI input first, then
-    repository variable. We do not infer the mover from the webhook owner: the
-    webhook identity and the user who changed the lead are different concepts.
+    Deliberately does NOT call user.current: an incoming webhook may have CRM scope only.
+    Resolution order: workflow/CLI input -> repository variable LEAD_RECOVERY_MOVED_BY_ID.
     """
     raw = (explicit_user_id or "").strip() or (configured_user_id or "").strip()
     value = _as_int(raw)
-    if value and value > 0:
-        return value
-    raise ValueError(
-        "Bitrix user ID is required. Pass --moved-by-id or set LEAD_RECOVERY_MOVED_BY_ID."
-    )
+    if not value or value <= 0:
+        raise ValueError(
+            "Bitrix user ID is required. Pass --moved-by-id or set LEAD_RECOVERY_MOVED_BY_ID repository variable."
+        )
+    return value
 
 
 def find_failed_leads(
@@ -292,7 +288,7 @@ def main() -> int:
     parser.add_argument(
         "--moved-by-id",
         default="",
-        help="Bitrix user ID who moved leads to failure. Empty = LEAD_RECOVERY_MOVED_BY_ID.",
+        help="Bitrix user ID who moved leads to failure. If empty, LEAD_RECOVERY_MOVED_BY_ID must be set.",
     )
     parser.add_argument(
         "--failure-reason-field",
@@ -310,11 +306,8 @@ def main() -> int:
     if args.stabilize_seconds < 0 or args.repair_wait_seconds < 0:
         parser.error("wait values must be >= 0")
 
+    mover = resolve_moved_by_id(args.moved_by_id, os.getenv("LEAD_RECOVERY_MOVED_BY_ID"))
     client = BitrixClient.from_env("TARGET_BITRIX_WEBHOOK_URL")
-    mover = resolve_moved_by_id(
-        args.moved_by_id,
-        os.getenv("LEAD_RECOVERY_MOVED_BY_ID"),
-    )
     cutoff = _utc_cutoff(args.days)
     leads = find_failed_leads(
         client,

@@ -1,46 +1,81 @@
-from pathlib import Path
-import sys
+from __future__ import annotations
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
-PROCESS_ROOT = Path(__file__).resolve().parents[1]
-for path in (PROJECT_ROOT, PROCESS_ROOT):
-    if str(path) not in sys.path:
-        sys.path.insert(0, str(path))
+import json
 
-from run_from_event import event_marker, find_task_by_marker, validate_project, validate_responsible
+import run_from_event as flowdesk
 
 
-class FakeClient:
-    def __init__(self):
-        self.calls = []
-
-    def list_all(self, method, params=None):
-        self.calls.append((method, params))
-        if method == "user.get":
-            return [{"ID": "9", "ACTIVE": "Y"}]
-        if method == "tasks.task.list":
-            return [{"id": "77", "description": "body\n\n[FLOWDESK_EVENT:abc]"}]
-        raise AssertionError(method)
-
-    def call(self, method, params=None):
-        self.calls.append((method, params))
-        if method == "sonet_group.get":
-            return [{"ID": "2", "NAME": "Project"}]
-        raise AssertionError(method)
+def payload() -> dict[str, str]:
+    return {
+        "flowdesk_request_1": "Обращение",
+        "flowdesk_request": "Клиент",
+        "flowdesk_department": "Поддержка",
+        "flowdesk_attachment": "",
+        "resp_id": "17",
+        "flowdesk_email": "user@example.kz",
+        "flowdesk_complaint_subproduct": "",
+        "flowdesk_complaint_description": "Описание",
+        "flowdesk_complaint_type": "Жалоба",
+        "flowdesk_complaint_product": "Продукт",
+        "Datetime": "2026-09-10 10:00:00",
+    }
 
 
-def test_event_marker_is_stable_for_same_payload():
-    payload = {"a": "1", "b": "2"}
-    assert event_marker(payload) == event_marker(dict(reversed(list(payload.items()))))
+def test_event_key_is_stable_and_content_dependent() -> None:
+    first = payload()
+    reordered = dict(reversed(list(first.items())))
+    assert flowdesk.flowdesk_event_key(first) == flowdesk.flowdesk_event_key(reordered)
+
+    reordered["flowdesk_request"] = "Другой клиент"
+    assert flowdesk.flowdesk_event_key(first) != flowdesk.flowdesk_event_key(reordered)
 
 
-def test_read_only_preflight_validates_user_and_project():
+def test_existing_task_stops_before_user_invitation(monkeypatch, capsys) -> None:
+    class FakeClient:
+        @classmethod
+        def from_env(cls):
+            return cls()
+
+    monkeypatch.setenv("FLOWDESK_PAYLOAD", json.dumps(payload(), ensure_ascii=False))
+    monkeypatch.setattr(flowdesk, "BitrixClient", FakeClient)
+    monkeypatch.setattr(flowdesk, "validate_responsible", lambda *_: None)
+    monkeypatch.setattr(flowdesk, "find_task_by_event_key", lambda *_: "555")
+
+    invited = False
+
+    def unexpected_invite(*_):
+        nonlocal invited
+        invited = True
+        raise AssertionError("resolve_creator must not run for a duplicate event")
+
+    monkeypatch.setattr(flowdesk, "resolve_creator", unexpected_invite)
+
+    assert flowdesk.main() == 0
+    assert invited is False
+    assert "ID=555" in capsys.readouterr().out
+
+
+def test_task_creation_writes_idempotency_key() -> None:
+    class FakeClient:
+        def __init__(self):
+            self.params = None
+
+        def call(self, method, params):
+            assert method == "tasks.task.add"
+            self.params = params
+            return {"task": {"id": "91"}}
+
     client = FakeClient()
-    validate_responsible(client, 9)
-    validate_project(client, 2)
-    assert [method for method, _ in client.calls] == ["user.get", "sonet_group.get"]
+    task_id = flowdesk.create_task(
+        client,
+        title="Задача",
+        description="Описание",
+        creator_id=10,
+        responsible_id=17,
+        project_id=2,
+        deadline="2026-09-13T10:00:00+05:00",
+        event_key="FLOWDESK_key",
+    )
 
-
-def test_existing_marker_is_reused():
-    client = FakeClient()
-    assert find_task_by_marker(client, 2, "[FLOWDESK_EVENT:abc]") == "77"
+    assert task_id == "91"
+    assert client.params["fields"]["XML_ID"] == "FLOWDESK_key"

@@ -1,18 +1,14 @@
-## 2026-09-10 — v10: проверяются только активные заявки e-Qazyna
+## 2026-09-11 — Распределение ГПО из Google Sheets
 
-- `33-eqazyna-status-sync` теперь до обращения к порталу пропускает лиды, где `UF_CRM_1785508658316` уже равен `66`, `67`, `68` или `69`.
-- Дополнительно исключаются закрытые лиды Bitrix24 с `STATUS_SEMANTIC_ID=S/F`; на e-Qazyna уходят только активные карточки.
-- `max_items` применяется после этого фильтра и ограничивает число активных лидов для сверки.
-- `502`/timeout e-Qazyna после retry стали предупреждением и больше не делают весь workflow красным; ошибки записи в Bitrix24 остаются фатальными.
-
-## 2026-09-10 — v7: возврат к рабочей модели Python на self-hosted Windows
-
-- За эталон взят архив, в котором Windows self-hosted runner уже работал с локально установленным Python 3.12.
-- `scripts/prepare-python.cmd` восстановлен на прямой путь `C:\\Users\\Alyona.Sachyova\\AppData\\Local\\Programs\\Python\\Python312\\python.exe` и только создаёт локальную `.venv`.
-- Из всех Windows self-hosted workflow удалён `actions/setup-python`; из потока 30 удалён PowerShell bootstrap.
-- `scripts/bootstrap-python.ps1` удалён: workflow больше не скачивает и не устанавливает Python на runner.
-- Добавлена регрессионная проверка: Windows self-hosted workflow не может снова получить `setup-python`, PowerShell bootstrap или другой путь Python.
-- GitHub-hosted Linux workflow `00-ci.yml` и `01-cloud-export.yml` не относятся к Windows runner и сохраняют собственный `actions/setup-python`.
+- Workflow `30` перед каждым запуском читает книгу `ГПО Недра`, листы `user_list` и `Company_fix`.
+- Удалён боевой зашитый список менеджеров; пустой или недоступный список теперь блокирует запуск.
+- Закрепление `ORIGIN_ID (БИН) → responsible_id` имеет абсолютный приоритет и не участвует в лимитах.
+- Закрепление учредителя по контакту имеет приоритет над адресом; все новые лиды учредителя сохраняют одного ответственного.
+- Астана определяется по адресу и при отсутствии закрепления направляется строго в `DepartmentID = 46`.
+- Прежний ответственный, отсутствующий в `user_list`, заменяется РОПом своего подразделения; РОП определяется по столбцу `role`.
+- Новый учредитель назначается менеджеру с минимальной текущей нагрузкой, случайно при равенстве; один менеджер получает не более одного нового учредителя за запуск.
+- Поток регистрации переведён с Excel на `new_users_add`; после создания ID записывается обратно и синхронизируется в `user_list`.
+- Добавлены проверки активных пользователей, ролей, подразделений, конфликтующих БИН и 12-значного формата БИН.
 
 ## 2026-09-08 — Поток 32 защищён от роботов стадии NEW
 
@@ -100,50 +96,3 @@
 - Убран `working-directory: processes/lead_recovery` из job defaults: self-hosted Windows runner больше не пытается стартовать `cmd.exe` в несуществующем каталоге до выполнения шага.
 - Workflow 32 запускается из корня репозитория и использует явные пути `processes\lead_recovery\...`.
 - Добавлена ранняя проверка наличия `recover_failed_leads.py` после checkout с диагностикой содержимого репозитория.
-
-## 2026-09-10 — self-hosted Windows Python bootstrap fix
-
-- All Windows self-hosted workflows now run pinned `actions/setup-python` with Python 3.12 x64 before creating `.venv`.
-- `scripts/prepare-python.cmd` now uses the interpreter placed on `PATH` by `setup-python` instead of assuming Python is preinstalled for the runner service account.
-- Manual execution remains supported through `PYTHON_EXE`.
-- Persistent `.venv` directories are removed before creating a job-local environment.
-
-## 2026-09-10 — GPO runner Python bootstrap v4
-- Workflow `30 | e-Qazyna — ГПО в лиды` no longer depends on a preinstalled Python or on `actions/setup-python` PATH propagation.
-- Added `scripts/bootstrap-python.ps1`: on Windows self-hosted runner it reuses Python 3.11+ when present, otherwise downloads the signed official CPython 3.12.10 installer and installs it job-locally into `RUNNER_TEMP` without administrator rights.
-- `prepare-python.cmd` has the same bootstrap as a fallback, so even an older workflow step that only calls this script can recover automatically.
-
-## 2026-09-10 — GPO runner Python bootstrap v5
-- Исправлена PowerShell parser error в `scripts/bootstrap-python.ps1`: строка ошибки больше не использует неоднозначную конструкцию `$RequiredMinor:` и формируется через оператор `-f`.
-- Добавлена статическая проверка PowerShell-интерполяции в `scripts/run_quality_checks.py`, чтобы этот класс ошибки ловился до упаковки релиза.
-- Workflow `30 | e-Qazyna — ГПО в лиды` и fallback `prepare-python.cmd` продолжают использовать один и тот же job-local bootstrap Python 3.12.10.
-
-### 2026-09-10 — v6: PowerShell `$HOME` bootstrap fix
-
-- Исправлен `scripts/bootstrap-python.ps1`: локальная переменная `$Home` переименована в `$PythonHome`. PowerShell нечувствителен к регистру, поэтому `$Home` конфликтовал со встроенной read-only переменной `$HOME` и падал уже после успешной установки Python.
-- Добавлена регрессионная проверка, запрещающая повторное присваивание `$HOME` в PowerShell-скриптах.
-
-## 2026-09-10 — e-Qazyna application status sync
-
-- Добавлен отдельный workflow `33 | e-Qazyna — синхронизация статусов заявок`.
-- Поток не создаёт лиды: он берёт существующие e-Qazyna лиды и ищет заявку в публичном реестре по точному `flDocNum`.
-- `Отклонено`, `Отозвано`, `Аннулировано` переводят лид в стадию `Провал`.
-- `Выдана лицензия` переводит лид в стадию `Потенциальные сделки`; поддержан существующий вариант названия `Потенциальная сделка`.
-- Остальные внешние статусы не изменяют стадию лида.
-- ID стадий не захардкожены: перед работой они разрешаются через `crm.status.list`; отсутствие нужной стадии блокирует запись.
-- Старые e-Qazyna карточки поддерживаются через составной `ORIGIN_ID`, заголовок и комментарий. Карточки с несколькими номерами заявок не изменяются автоматически.
-- Добавлены `dry_run`, подтверждение для `apply`, JSON/CSV/текстовый журнал, повторные попытки чтения e-Qazyna и fail-closed завершение при ошибках записи/чтения.
-- Windows self-hosted workflow продолжает использовать только локальный Python через `scripts/prepare-python.cmd`; `setup-python`/PowerShell bootstrap не добавлялись.
-
-## 2026-09-10 — исправление логики e-Qazyna status sync (v9)
-
-- Исправлено ключевое правило: **1 лид = 1 заявка**.
-- Номер заявки теперь берётся только из `TITLE`: всё после `№ ` считается номером заявки. `ORIGIN_ID` и `COMMENTS` больше не участвуют в определении номера.
-- Добавлена подстраховка поиска e-Qazyna карточек по названию, чтобы синхронизация не зависела только от `ORIGINATOR_ID` после миграции/ручных изменений.
-- При статусах e-Qazyna синхронизируется не только стадия лида, но и поле `UF_CRM_1785508658316`:
-  - `Аннулировано` → `Провал` + enum `66` (`Заявка аннулирована на сайте`);
-  - `Отозвано` → `Провал` + enum `67` (`Заявка отменена на сайте`);
-  - `Отклонено` → `Провал` + enum `68` (`Заявка отклонена на сайте`);
-  - `Выдана лицензия` → `Потенциальные сделки` + enum `69` (`По заявке уже выдана лицензия`).
-- Если стадия уже правильная, но причина отсутствует или неверная, поле причины исправляется. Запись пропускается только когда совпадают и стадия, и причина.
-- Тесты потока переписаны под фактическую структуру CRM и отдельно проверяют все четыре статуса и все четыре enum-ID.

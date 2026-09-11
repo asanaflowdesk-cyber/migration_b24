@@ -36,23 +36,23 @@ def lead(lead_id, title, company_id, contact_id, owner, date="2026-01-01"):
     }
 
 
-def test_same_fio_in_two_companies_is_not_a_global_identity():
+def test_same_name_across_two_companies_does_not_join_ownership_trees():
     companies = [company(10, "Компания 1", 17), company(20, "Компания 2", 18)]
     contacts = [
         director(100, "Иванов Иван Иванович", 10, 17),
-        director(200, "Иванов Иван Иванович", 20, 18),
+        director(200, "Иванов Иван Иванович", 20, 17),
     ]
     leads = [
-        lead(1, "Лид 1", 10, 100, 99),
-        lead(2, "Лид 2", 20, 200, 88),
+        lead(1, "Лид 1", 10, 100, 17),
+        lead(2, "Лид 2", 20, 200, 18),
     ]
 
     tree = build_desync_tree(companies, leads, contacts)
 
-    assert len(tree) == 2
-    assert {group["director_owner_id"] for group in tree} == {17, 18}
-    assert {group["companies"][0]["company_title"] for group in tree} == {"Компания 1", "Компания 2"}
-    assert all(group["identity_scope"] == "company" for group in tree)
+    assert len(tree) == 1
+    assert tree[0]["director_name"] == "Иванов Иван Иванович"
+    assert tree[0]["director_owner_id"] == 17
+    assert {node["company_title"] for node in tree[0]["companies"]} == {"Компания 2"}
 
 
 def test_fully_synchronized_director_tree_is_not_reported():
@@ -63,7 +63,7 @@ def test_fully_synchronized_director_tree_is_not_reported():
     assert build_desync_tree(companies, leads, contacts) == []
 
 
-def test_one_bad_lead_includes_whole_company_context():
+def test_one_bad_lead_includes_only_its_company_for_context():
     companies = [company(10, "Компания 1", 17), company(20, "Компания 2", 17)]
     contacts = [
         director(100, "Иванов Иван Иванович", 10, 17),
@@ -78,10 +78,10 @@ def test_one_bad_lead_includes_whole_company_context():
     tree = build_desync_tree(companies, leads, contacts)
 
     assert len(tree) == 1
-    node = tree[0]["companies"][0]
-    assert node["company_id"] == 20
-    assert [item["lead_title"] for item in node["leads"]] == ["Лид 2", "Лид 3"]
-    assert [item["lead_mismatch"] for item in node["leads"]] == [True, False]
+    assert len(tree[0]["companies"]) == 1
+    second = tree[0]["companies"][0]
+    assert [item["lead_title"] for item in second["leads"]] == ["Лид 2", "Лид 3"]
+    assert [item["lead_mismatch"] for item in second["leads"]] == [True, False]
 
 
 def test_company_owner_is_compared_to_director_owner_not_first_lead():
@@ -98,20 +98,17 @@ def test_company_owner_is_compared_to_director_owner_not_first_lead():
     assert node["leads"][0]["lead_mismatch"] is True
 
 
-def test_oldest_director_contact_is_canonical_only_within_same_company():
-    companies = [company(10, "Компания 1", 99)]
+def test_each_company_uses_its_own_same_named_director_owner():
+    companies = [company(10, "Компания 1", 17), company(20, "Компания 2", 18)]
     contacts = [
         director(100, "Иванов Иван Иванович", 10, 17),
-        director(200, "Иванов Иван Иванович", 10, 18),
+        director(200, "Иванов Иван Иванович", 20, 18),
     ]
     leads = []
 
     tree = build_desync_tree(companies, leads, contacts)
 
-    assert len(tree) == 1
-    assert tree[0]["director_contact_id"] == 100
-    assert tree[0]["director_owner_id"] == 17
-    assert tree[0]["director_contact_owner_count"] == 1
+    assert tree == []
 
 
 class FakeClient:

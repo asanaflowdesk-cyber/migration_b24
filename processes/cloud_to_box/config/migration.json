@@ -2,6 +2,12 @@
   "target_deal_category_id": 0,
   "target_source_id": "UC_5XK8LY",
   "skip_original_leads": true,
+  "converted_lead_to_deal": {
+    "92": "2386",
+    "94": "2808",
+    "96": "2910",
+    "98": "2812"
+  },
   "product_field": {
     "lead_code": "UF_CRM_1785917145255",
     "deal_code": "UF_CRM_6A73073A5405E",
@@ -106,27 +112,5 @@
       "10",
       "28"
     ]
-  },
-  "source_mode": "dump",
-  "source_integrity": {
-    "allowed_orphan_deal_company": [
-      {
-        "deal_id": "668",
-        "company_id": "382",
-        "policy": "preserve deal without company link; source company is absent"
-      },
-      {
-        "deal_id": "1344",
-        "company_id": "730",
-        "policy": "preserve deal without company link; source company is absent"
-      }
-    ],
-    "address_policy": "deduplicate_exact_payloads"
-  },
-  "converted_lead_deal_map": {
-    "92": "2386",
-    "94": "2808",
-    "96": "2910",
-    "98": "2812"
   }
 }

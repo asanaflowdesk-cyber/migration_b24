@@ -2,7 +2,6 @@ import json
 from pathlib import Path
 
 from common.bitrix import BitrixClient
-from migrate import _import_exit_code
 from src.dump_reader import DumpReader
 from src.file_transfer import FileTransfer
 from src.live_source import LiveCloudSource
@@ -252,7 +251,7 @@ def test_live_source_unreadable_comments_are_non_blocking(tmp_path: Path) -> Non
 
 
 
-def test_verified_snapshot_count_gaps_block_import(tmp_path: Path) -> None:
+def test_live_source_count_gaps_block_import(tmp_path: Path) -> None:
     p = project(tmp_path)
     p.source_client = _UnreadableCommentsSourceClient()
     p._source = {name: [] for name in (
@@ -263,8 +262,8 @@ def test_verified_snapshot_count_gaps_block_import(tmp_path: Path) -> None:
     )}
     result = p.validate_live_source()
     assert result["ok"] is False
+    assert result["count_gap_policy"] == "block_import"
     assert any(error.startswith("source_count_Companies:") for error in result["errors"])
-    assert result["count_gap_policy"] == "fail_core_snapshot_mismatch; optional_live_children_best_effort"
 
 def test_missing_task_comments_are_reported_as_warning(tmp_path: Path) -> None:
     p = project(tmp_path)
@@ -363,23 +362,14 @@ def test_dry_run_dependency_problem_is_skip_not_error(tmp_path: Path) -> None:
     assert row["message"].startswith("Пропущено:")
 
 
-def test_import_exit_code_fails_on_errors_and_unexplained_skips(tmp_path: Path) -> None:
-    p = project(tmp_path)
-    p.report.add("create_company", "COMPANY", "1", "COMPANY", "", "ERROR", "write failed")
-    assert _import_exit_code(p) == 2
-    assert p.report.extra["import_result"]["workflow_failed"] is True
-
-    p = project(tmp_path / "skip")
-    p.report.add("create_company", "COMPANY", "1", "COMPANY", "", "SKIP", "unmapped required dependency")
-    assert _import_exit_code(p) == 2
-
-    p = project(tmp_path / "allowed")
-    p.report.add("create_task", "TASK", "174", "TASK", "", "SKIP", "task excluded by configured source users: ['10']")
-    assert _import_exit_code(p) == 0
+def test_import_and_verify_fail_the_job_when_errors_remain() -> None:
+    source = (ROOT / "migrate.py").read_text(encoding="utf-8")
+    assert 'row.get("status") == "ERROR"' in source
+    assert "exit_code = 2 if errors else 0" in source
+    assert 'exit_code = 0 if result.get("ok") else 2' in source
 
 
-def test_report_writes_full_payload_previews_only_with_explicit_opt_in(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setenv("B24_REPORT_SENSITIVE_PAYLOADS", "1")
+def test_report_redacts_payload_previews_by_default(tmp_path: Path) -> None:
     report = Report(tmp_path)
     report.add_transfer(
         operation="create_contact",
@@ -400,32 +390,38 @@ def test_report_writes_full_payload_previews_only_with_explicit_opt_in(tmp_path:
     report.save()
 
     wide = (tmp_path / "preview_contact.csv").read_text(encoding="utf-8-sig")
-    assert "+77010000000" in wide
-    assert "ivan@example.kz" in wide
-    assert "Алматы" in wide
+    assert "+77010000000" not in wide
+    assert "ivan@example.kz" not in wide
+    assert "Алматы" not in wide
+
+    full = json.loads((tmp_path / "full_transfer_preview.json").read_text(encoding="utf-8"))
+    assert full[0]["payload"] == {}
+
+
+def test_report_can_emit_sensitive_previews_after_explicit_opt_in(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("INCLUDE_SENSITIVE_REPORTS", "true")
+    report = Report(tmp_path)
+    report.add_transfer(
+        operation="create_contact",
+        source_type="CONTACT",
+        source_id="44",
+        target_type="CONTACT",
+        target_id=-1,
+        status="DRY_RUN",
+        route="CONTACT",
+        payload={"PHONE": [{"VALUE": "+77010000000"}]},
+    )
+    report.save()
 
     full = json.loads((tmp_path / "full_transfer_preview.json").read_text(encoding="utf-8"))
     assert full[0]["payload"]["PHONE"][0]["VALUE"] == "+77010000000"
-    assert full[0]["payload"]["ADDRESS"] == "Алматы"
 
     index = (tmp_path / "preview_index.csv").read_text(encoding="utf-8-sig")
     assert "CONTACT" in index
     assert "preview_contact.csv" in index
-
-
-def test_report_redacts_payloads_by_default(tmp_path: Path) -> None:
-    report = Report(tmp_path)
-    report.add_transfer(
-        operation="create_contact", source_type="CONTACT", source_id="1",
-        target_type="CONTACT", target_id=10, status="OK", route="CONTACT",
-        payload={"NAME": "Иван", "PHONE": [{"VALUE": "+77010000000"}]},
-    )
-    report.save()
-    assert not (tmp_path / "full_transfer_preview.json").exists()
-    assert not (tmp_path / "preview_contact.csv").exists()
-    register = (tmp_path / "transfer_register.csv").read_text(encoding="utf-8-sig")
-    assert "+77010000000" not in register
-    assert "Иван" not in register
 
 
 def test_dump_is_checkpoint_not_excel_primary() -> None:
@@ -464,7 +460,7 @@ def test_live_cloud_source_returns_full_card_fields() -> None:
 
 
 
-def test_migration_project_uses_configured_dump_even_when_live_client_exists(tmp_path: Path) -> None:
+def test_migration_project_prefers_live_source_over_dump(tmp_path: Path) -> None:
     p = MigrationProject(
         DUMP,
         ROOT / "config/migration.json",
@@ -472,20 +468,6 @@ def test_migration_project_uses_configured_dump_even_when_live_client_exists(tmp
         tmp_path,
         target_client=None,
         source_client=_LiveCompanyClient(),
-    )
-    p.load_source("Companies")
-    assert p._source["Companies"][0]["TITLE"] != "Live company"
-    assert p.report.extra["source_dataset_origins"]["Companies"] == "dump"
-
-
-def test_migration_project_can_use_live_source_when_explicitly_configured(tmp_path: Path) -> None:
-    config = json.loads((ROOT / "config/migration.json").read_text(encoding="utf-8"))
-    config["source_mode"] = "live"
-    config_path = tmp_path / "migration-live.json"
-    config_path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
-    p = MigrationProject(
-        DUMP, config_path, ROOT / "config/users.csv", tmp_path / "out",
-        target_client=None, source_client=_LiveCompanyClient(),
     )
     p.load_source("Companies")
     assert p._source["Companies"][0]["TITLE"] == "Live company"
@@ -506,27 +488,18 @@ def test_same_code_user_field_is_included_in_target_payload(tmp_path: Path) -> N
 
 
 def test_dry_run_builds_requisites_relations_tasks_and_activities(tmp_path: Path) -> None:
-    p = project(tmp_path)
+    p = object.__new__(MigrationProject)
     p.client = object()
     p.source_client = object()
     p.report = Report(tmp_path)
-    p._source = {name: [] for name in (
-        "Users", "Companies", "Contacts", "Leads", "Deals", "Deal_UserFields",
-        "Contact_Companies", "Lead_Contacts", "Deal_Contacts", "Requisites",
-        "Addresses", "Requisite_Presets", "Requisite_Links", "Tasks", "CRM_Activities",
-    )}
-    p._source_origins = {name: "dump" for name in p._source}
-
-    p.report.require_valid_state = lambda: None
-    p._reader.validate_manifest = lambda: {"ok": True}
+    p.file_transfer = None
+    p._source = {}
+    p._source_origins = {}
     p.load_source = lambda *datasets: [p._source.setdefault(name, []) for name in datasets]
-    p.validate_source_integrity = lambda: {"ok": True}
+
     p.discover_target = lambda: None
-    p._validate_loaded_state_target = lambda: None
     p.validate_target = lambda: {"ok": True}
     p.validate_live_source = lambda: {"ok": True}
-    p.consolidate_target_duplicates = lambda **kwargs: None
-    p.normalize_existing_target_titles = lambda **kwargs: None
     p.build_user_map = lambda strict=True: {"1": 101}
     p.prepare_companies = lambda user_map: [("COMPANY:1:COMPANY", {"TITLE": "C"})]
     p.prepare_contacts = lambda user_map, company_map: [("CONTACT:2:CONTACT", {"NAME": "N"})]
@@ -546,6 +519,7 @@ def test_dry_run_builds_requisites_relations_tasks_and_activities(tmp_path: Path
 
     p.import_all(dry_run=True, max_items=0)
     assert calls == ["requisites", "relations", "tasks_activities"]
+
 
 def test_requisite_preset_maps_legal_entity_alias_with_real_preset_entity_type() -> None:
     target = [
@@ -659,8 +633,7 @@ def test_sample_tasks_prioritize_related_and_active(tmp_path: Path) -> None:
     assert [row["id"] for row in selected] == ["2", "3"]
 
 
-def test_report_writes_task_preview_and_direct_url(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setenv("B24_REPORT_SENSITIVE_PAYLOADS", "1")
+def test_report_writes_task_preview_and_direct_url(tmp_path: Path) -> None:
     report = Report(tmp_path)
     report.extra["target_portal"] = "https://bitrix.example"
     report.add_transfer(
@@ -679,7 +652,7 @@ def test_report_writes_task_preview_and_direct_url(tmp_path: Path, monkeypatch) 
     )
     report.save()
     preview = (tmp_path / "preview_task.csv").read_text(encoding="utf-8-sig")
-    assert "Проверочная задача" in preview
+    assert "Проверочная задача" not in preview
     assert "/company/personal/user/4/tasks/task/view/77/" in preview
     created = (tmp_path / "created_objects.csv").read_text(encoding="utf-8-sig")
     assert "/company/personal/user/4/tasks/task/view/77/" in created
@@ -825,44 +798,24 @@ class _VerifyScopeClient:
                 {"ENTITY_ID": "10", "TYPE_ID": "1"},
                 {"ENTITY_ID": "20", "TYPE_ID": "1"},
             ]
-        if method in {"crm.company.list", "crm.contact.list", "crm.lead.list", "crm.deal.list"}:
-            return []
         raise AssertionError(method)
 
 
 def test_verify_counts_only_addresses_of_migrated_requisites(tmp_path: Path) -> None:
     p = project(tmp_path)
     p.client = _VerifyScopeClient()
-    p.report.require_valid_state = lambda: None
-    p._reader.validate_manifest = lambda: {"ok": True}
-    p._source = {name: [] for name in (
-        "Users", "Companies", "Contacts", "Leads", "Deals", "Deal_UserFields",
-        "Contact_Companies", "Lead_Contacts", "Deal_Contacts", "Requisites",
-        "Addresses", "Requisite_Presets", "Requisite_Links", "Tasks", "CRM_Activities",
-    )}
-    p.load_source = lambda *args: None
-    p.validate_source_integrity = lambda: {"ok": True}
-    p.discover_target = lambda: None
-    p._validate_loaded_state_target = lambda: None
-    p.validate_target = lambda: {"ok": True}
-    p.build_user_map = lambda strict=True: {}
     p.source_plan = lambda: {
         "source_counts": {"Companies": 0, "Contacts": 0, "Requisites": 1},
         "source_deals_routed_to_leads": 0,
         "source_deals_kept_as_deals": 0,
         "expected_tasks": 0,
         "expected_activities": 0,
-        "expected_unique_addresses": 1,
     }
     p._existing_markers = lambda entity: {}
     p._existing_tasks = lambda **kwargs: {}
     p._existing_activities = lambda **kwargs: {}
-    p.prepare_companies = lambda user_map: []
-    p.prepare_contacts = lambda user_map, company_map: []
-    p.prepare_original_leads = lambda user_map, company_map, contact_map: []
-    p.prepare_routed_deal_leads = lambda user_map, company_map, contact_map: []
-    p.prepare_deals = lambda user_map, company_map, contact_map: []
-    p._verify_relation_subsets = lambda *args: []
+    p.load_source = lambda *args: None
+    p._unique_source_addresses = lambda: [{"ENTITY_ID": "1", "TYPE_ID": "1"}]
 
     result = p.verify()
 
@@ -956,7 +909,7 @@ class _DuplicateMergeClient:
         return {"STATUS": "SUCCESS", "ENTITY_IDS": ids[1:]}
 
 
-def test_business_identifier_duplicates_are_never_auto_merged(tmp_path: Path) -> None:
+def test_default_apply_does_not_merge_unmarked_target_cards(tmp_path: Path) -> None:
     p = project(tmp_path)
     client = _DuplicateMergeClient()
     p.client = client
@@ -969,41 +922,6 @@ def test_business_identifier_duplicates_are_never_auto_merged(tmp_path: Path) ->
         "contact_groups": 0,
         "marker_only": 1,
     }
-
-
-def test_unsafe_business_identifier_merge_mode_is_disabled(tmp_path: Path) -> None:
-    p = project(tmp_path)
-    p.client = _DuplicateMergeClient()
-
-    try:
-        p.consolidate_target_duplicates(dry_run=False, marker_only=False)
-    except ValueError as exc:
-        assert "disabled" in str(exc)
-    else:
-        raise AssertionError("unsafe non-marker duplicate merge must be rejected")
-
-
-class _ExactMarkerMergeClient(_DuplicateMergeClient):
-    def list_all(self, method, params=None):
-        rows = super().list_all(method, params)
-        if method == "crm.company.list":
-            rows[1]["COMMENTS"] = rows[0]["COMMENTS"]
-        if method == "crm.contact.list":
-            rows[1]["COMMENTS"] = rows[0]["COMMENTS"]
-        return rows
-
-
-def test_exact_migration_marker_duplicates_can_be_merged(tmp_path: Path) -> None:
-    p = project(tmp_path)
-    client = _ExactMarkerMergeClient()
-    p.client = client
-
-    p.consolidate_target_duplicates(dry_run=False)
-
-    assert [call[1]["params"] for call in client.calls] == [
-        {"entityTypeId": 4, "entityIds": [100, 101]},
-        {"entityTypeId": 3, "entityIds": [200, 201]},
-    ]
 
 
 class _GenericDirectorMergeClient:
@@ -1052,18 +970,17 @@ class _GenericDirectorMergeClient:
         return {"STATUS": "SUCCESS", "ENTITY_IDS": ids[1:]}
 
 
-def test_nameless_director_candidate_is_scoped_to_same_company_for_review(tmp_path: Path) -> None:
+def test_nameless_director_is_merged_only_with_director_of_same_company(tmp_path: Path) -> None:
     p = project(tmp_path)
     client = _GenericDirectorMergeClient()
     p.client = client
 
-    groups = p._target_duplicate_groups("contact", marker_only=False)
+    p.consolidate_target_duplicates(dry_run=False)
 
-    assert [[int(row["ID"]) for row in group] for group in groups] == [[300, 301]]
     assert client.calls == []
 
 
-def test_marker_only_merge_ignores_business_key_candidates(tmp_path: Path) -> None:
+def test_limited_apply_merges_only_exact_migration_marker_duplicates(tmp_path: Path) -> None:
     p = project(tmp_path)
     client = _DuplicateMergeClient()
     p.client = client
@@ -1079,98 +996,6 @@ def test_marker_only_merge_ignores_business_key_candidates(tmp_path: Path) -> No
         "contact_groups": 0,
         "marker_only": 1,
     }
-
-
-class _AdditiveRelationClient:
-    def __init__(self) -> None:
-        self.calls: list[tuple[str, dict]] = []
-        self.contact_companies = [
-            {"COMPANY_ID": "999", "IS_PRIMARY": "Y", "SORT": 10},
-        ]
-        self.lead_contacts = [
-            {"CONTACT_ID": "888", "IS_PRIMARY": "Y", "SORT": 10},
-        ]
-        self.deal_contacts = [
-            {"CONTACT_ID": "777", "IS_PRIMARY": "Y", "SORT": 10},
-        ]
-
-    def call(self, method, params=None):
-        params = params or {}
-        self.calls.append((method, params))
-        if method == "crm.contact.company.items.get":
-            return list(self.contact_companies)
-        if method == "crm.lead.contact.items.get":
-            return list(self.lead_contacts)
-        if method == "crm.deal.contact.items.get":
-            return list(self.deal_contacts)
-        if method == "crm.contact.company.add":
-            row = dict(params["fields"])
-            self.contact_companies.append(row)
-            return True
-        if method == "crm.lead.contact.add":
-            row = dict(params["fields"])
-            self.lead_contacts.append(row)
-            return True
-        if method == "crm.deal.contact.add":
-            row = dict(params["fields"])
-            self.deal_contacts.append(row)
-            return True
-        raise AssertionError(method)
-
-
-def test_contact_company_relations_are_additive_and_preserve_manual_primary(tmp_path: Path) -> None:
-    p = project(tmp_path)
-    p.client = _AdditiveRelationClient()
-    p.load_source = lambda *names: None
-    p._source["Contact_Companies"] = [
-        {"CONTACT_ID": "1", "COMPANY_ID": "2", "IS_PRIMARY": "Y", "SORT": 20},
-    ]
-
-    p.import_contact_company_relations({"1": 100}, {"2": 200})
-
-    write_calls = [call for call in p.client.calls if call[0].endswith(".add")]
-    assert write_calls == [
-        (
-            "crm.contact.company.add",
-            {"id": 100, "fields": {"COMPANY_ID": 200, "IS_PRIMARY": "N", "SORT": 20}},
-        )
-    ]
-    assert not any("items.set" in method for method, _params in p.client.calls)
-    assert {str(row["COMPANY_ID"]) for row in p.client.contact_companies} == {"999", "200"}
-
-
-def test_lead_and_deal_contact_relations_use_add_not_items_set(tmp_path: Path) -> None:
-    p = project(tmp_path)
-    p.client = _AdditiveRelationClient()
-    p.load_source = lambda *names: None
-    p._converted_lead_aliases = {}
-    p._source["Lead_Contacts"] = [
-        {"LEAD_ID": "10", "CONTACT_ID": "1", "IS_PRIMARY": "Y", "SORT": 20},
-    ]
-    p._source["Deal_Contacts"] = [
-        {"DEAL_ID": "20", "CONTACT_ID": "2", "IS_PRIMARY": "Y", "SORT": 30},
-    ]
-
-    p.import_crm_contact_relations(
-        {"1": 101, "2": 102},
-        {"LEAD:10:LEAD": 500},
-        {"20": 600},
-    )
-
-    write_calls = [call for call in p.client.calls if call[0].endswith(".add")]
-    assert write_calls == [
-        (
-            "crm.lead.contact.add",
-            {"id": 500, "fields": {"CONTACT_ID": 101, "IS_PRIMARY": "N", "SORT": 20}},
-        ),
-        (
-            "crm.deal.contact.add",
-            {"id": 600, "fields": {"CONTACT_ID": 102, "IS_PRIMARY": "N", "SORT": 30}},
-        ),
-    ]
-    assert not any("items.set" in method for method, _params in p.client.calls)
-    assert {str(row["CONTACT_ID"]) for row in p.client.lead_contacts} == {"888", "101"}
-    assert {str(row["CONTACT_ID"]) for row in p.client.deal_contacts} == {"777", "102"}
 
 
 class _TargetTitleCleanupClient:

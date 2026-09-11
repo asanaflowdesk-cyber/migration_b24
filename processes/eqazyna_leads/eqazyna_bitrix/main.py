@@ -8,6 +8,10 @@ from pathlib import Path
 from typing import Iterable
 
 from .bitrix_client import BitrixClient
+from .distribution import (
+    DEFAULT_DISTRIBUTION_SPREADSHEET_ID,
+    GoogleSheetDistributionSource,
+)
 from .egov_client import EgovClient
 from .exporter import write_xlsx
 from .lead_pipeline import LeadPipeline, LeadPipelineConfig
@@ -80,9 +84,35 @@ def parse_args() -> argparse.Namespace:
         "--manager-ids",
         default=os.getenv(
             "BITRIX_MANAGER_IDS",
-            "22,23,16,17,18,38,44,39,19,15",
+            "",
         ),
-        help="Approved manager IDs used for history inheritance and random least-loaded distribution",
+        help="Deprecated compatibility option; production distribution is read from Google Sheets",
+    )
+    parser.add_argument(
+        "--distribution-sheet-id",
+        default=os.getenv(
+            "DISTRIBUTION_SHEET_ID",
+            DEFAULT_DISTRIBUTION_SPREADSHEET_ID,
+        ),
+        help="Google Sheets workbook containing user_list and Company_fix",
+    )
+    parser.add_argument(
+        "--distribution-users-sheet",
+        default=os.getenv("DISTRIBUTION_USERS_SHEET", "user_list"),
+    )
+    parser.add_argument(
+        "--distribution-fixes-sheet",
+        default=os.getenv("DISTRIBUTION_FIXES_SHEET", "Company_fix"),
+    )
+    parser.add_argument(
+        "--distribution-timeout",
+        type=int,
+        default=int(os.getenv("DISTRIBUTION_SHEET_TIMEOUT", "30")),
+    )
+    parser.add_argument(
+        "--astana-department-id",
+        type=int,
+        default=int(os.getenv("ASTANA_DEPARTMENT_ID", "46")),
     )
     parser.add_argument(
         "--failure-reason-field",
@@ -199,8 +229,6 @@ def _parse_min_created_date(raw: str | None):
 def main() -> int:
     args = parse_args()
     settings = Settings.from_env()
-    if args.push_bitrix and not args.no_egov and not settings.egov_api_key:
-        raise SystemExit("EGOV_API_KEY is required for Bitrix24 write and dry-run modes")
     statuses = [status.strip() for status in args.statuses.split(",") if status.strip()]
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     xlsx_path = args.out or f"exports/eqazyna_bitrix_leads_{timestamp}.xlsx"
@@ -261,6 +289,19 @@ def main() -> int:
             polite_delay_seconds=settings.bitrix_polite_delay_seconds,
             verify_ssl=settings.bitrix_tls_verify,
         )
+        distribution = GoogleSheetDistributionSource(
+            args.distribution_sheet_id,
+            users_sheet=args.distribution_users_sheet,
+            assignments_sheet=args.distribution_fixes_sheet,
+            timeout=args.distribution_timeout,
+        ).load()
+        MANAGER_NAMES.update(
+            {
+                user.user_id: user.full_name
+                for user in distribution.users
+                if user.full_name
+            }
+        )
         lead_pipeline = LeadPipeline(
             client,
             LeadPipelineConfig(
@@ -280,7 +321,7 @@ def main() -> int:
                     getattr(
                         args,
                         "manager_ids",
-                        "22,23,16,17,18,38,44,39,19,15",
+                        "",
                     )
                 ),
                 failure_reason_field=getattr(
@@ -288,6 +329,8 @@ def main() -> int:
                     "failure_reason_field",
                     "UF_CRM_1785508658316",
                 ),
+                distribution=distribution,
+                astana_department_id=args.astana_department_id,
             ),
         )
         print(
@@ -302,8 +345,9 @@ def main() -> int:
         if resolved_preset is not None:
             print(f"    Resolved company requisite preset: {resolved_preset}")
         print(
-            "    Manager pool: "
-            f"{getattr(args, 'manager_ids', '22,23,16,17,18,38,44,39,19,15')}"
+            "    Google Sheets distribution: "
+            f"users={len(distribution.users)}, company_fix={len(distribution.company_assignments)}, "
+            f"workbook={args.distribution_sheet_id}"
         )
         print(
             "    Failure reason field: "

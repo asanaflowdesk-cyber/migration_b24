@@ -14,18 +14,8 @@
     "CRM_Activities": 134,
     "Users": 56
   },
-  "expected_unique_addresses": 907,
-  "source_orphan_deal_company": [
-    {
-      "deal_id": "668",
-      "company_id": "382"
-    },
-    {
-      "deal_id": "1344",
-      "company_id": "730"
-    }
-  ],
   "source_deals_routed_to_leads": 1233,
+  "expected_unique_addresses": 907,
   "source_deals_kept_as_deals": 10,
   "expected_target_leads_total": 1233,
   "expected_target_deals_total": 10,

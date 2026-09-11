@@ -115,7 +115,7 @@ class FileTransfer:
     @staticmethod
     def _migration_filename(key: str, original_name: str) -> str:
         safe_name = Path(original_name).name or "file.bin"
-        digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:24]
+        digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:20]
         return f"B24MIG_{digest}__{safe_name}"
 
     def _upload(self, key: str, name: str, content: bytes) -> int:

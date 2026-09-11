@@ -2,14 +2,20 @@ from __future__ import annotations
 
 import hashlib
 import json
-import stat
 import zipfile
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any
 
 
 class DumpReader:
-    """Read and verify exported Bitrix24 JSON datasets from a directory or ZIP."""
+    """Read exported Bitrix24 JSON datasets from a directory or ZIP archive.
+
+    The exporter may wrap all files in one top-level directory. This reader
+    locates manifest.json and json/datasets automatically, so the migration
+    does not depend on the archive folder name.
+    """
+
+    _validated_files: set[tuple[str, int, int]] = set()
 
     def __init__(self, source: str | Path):
         self.path = Path(source)
@@ -17,10 +23,8 @@ class DumpReader:
             raise FileNotFoundError(self.path)
         self._zip: zipfile.ZipFile | None = None
         self._prefix = ""
-        self._root = self.path
         if self.path.is_file():
             self._zip = zipfile.ZipFile(self.path)
-            self._validate_zip_members()
             names = self._zip.namelist()
             manifest_candidates = [name for name in names if name.endswith("manifest.json")]
             if not manifest_candidates:
@@ -34,17 +38,6 @@ class DumpReader:
             manifest = min(manifest_candidates, key=lambda p: len(p.parts))
             self._root = manifest.parent
 
-    def _validate_zip_members(self) -> None:
-        assert self._zip is not None
-        for info in self._zip.infolist():
-            name = info.filename.replace("\\", "/")
-            path = PurePosixPath(name)
-            if path.is_absolute() or ".." in path.parts:
-                raise ValueError(f"unsafe path in dump ZIP: {name}")
-            mode = (info.external_attr >> 16) & 0xFFFF
-            if stat.S_ISLNK(mode):
-                raise ValueError(f"symlink is not allowed in dump ZIP: {name}")
-
     def close(self) -> None:
         if self._zip:
             self._zip.close()
@@ -55,20 +48,17 @@ class DumpReader:
     def __exit__(self, *_: Any) -> None:
         self.close()
 
-    def _read_bytes(self, relative: str) -> bytes:
+    def _read_text(self, relative: str) -> str:
         if self._zip:
             name = self._prefix + relative.replace("\\", "/")
             try:
-                return self._zip.read(name)
+                return self._zip.read(name).decode("utf-8")
             except KeyError as exc:
                 raise FileNotFoundError(name) from exc
         path = self._root / relative
         if not path.exists():
             raise FileNotFoundError(path)
-        return path.read_bytes()
-
-    def _read_text(self, relative: str) -> str:
-        return self._read_bytes(relative).decode("utf-8")
+        return path.read_text(encoding="utf-8")
 
     def manifest(self) -> dict[str, Any]:
         value = json.loads(self._read_text("manifest.json"))
@@ -76,43 +66,39 @@ class DumpReader:
             raise ValueError("Invalid manifest format")
         return value
 
-    def validate_manifest(self) -> dict[str, Any]:
-        manifest = self.manifest()
-        datasets = manifest.get("datasets")
-        if not isinstance(datasets, list):
-            raise ValueError("manifest.datasets must be an array")
+    def validate(self) -> dict[str, int]:
+        """Validate every dataset declared in the export manifest."""
+        if self.path.is_file():
+            stat = self.path.stat()
+            cache_key = (str(self.path.resolve()), stat.st_size, stat.st_mtime_ns)
+            if cache_key in self._validated_files:
+                return {"datasets_checked": len(self.manifest().get("datasets", []))}
+        else:
+            cache_key = None
         checked = 0
-        for item in datasets:
+        for item in self.manifest().get("datasets", []):
             if not isinstance(item, dict):
-                raise ValueError("invalid dataset entry in manifest")
-            dataset = str(item.get("dataset") or "").strip()
-            relative = str(item.get("file") or f"json/datasets/{dataset}.json").strip()
-            expected_sha = str(item.get("sha256") or "").lower().strip()
-            expected_rows = item.get("rows")
-            if not dataset or not expected_sha or expected_rows is None:
-                raise ValueError(f"incomplete manifest entry: {item!r}")
-            raw = self._read_bytes(relative)
-            actual_sha = hashlib.sha256(raw).hexdigest()
-            if actual_sha != expected_sha:
-                raise ValueError(
-                    f"SHA-256 mismatch for {dataset}: expected {expected_sha}, got {actual_sha}"
-                )
-            value = json.loads(raw.decode("utf-8"))
+                raise ValueError("Invalid dataset entry in manifest")
+            relative = str(item.get("file") or "")
+            if not relative:
+                raise ValueError("Dataset manifest entry has no file")
+            raw = self._read_text(relative).encode("utf-8")
+            expected_hash = str(item.get("sha256") or "")
+            if expected_hash and hashlib.sha256(raw).hexdigest() != expected_hash:
+                raise ValueError(f"Checksum mismatch for {relative}")
+            value = json.loads(raw)
             if not isinstance(value, list):
-                raise ValueError(f"Dataset {dataset} must contain a JSON array")
-            if len(value) != int(expected_rows):
-                raise ValueError(
-                    f"row count mismatch for {dataset}: expected {expected_rows}, got {len(value)}"
-                )
+                raise ValueError(f"Dataset {relative} must contain a JSON array")
+            expected_rows = item.get("rows")
+            if expected_rows is not None and len(value) != int(expected_rows):
+                raise ValueError(f"Row count mismatch for {relative}: {len(value)} != {expected_rows}")
             checked += 1
-        return {"ok": True, "datasets_checked": checked}
+        if cache_key is not None:
+            self._validated_files.add(cache_key)
+        return {"datasets_checked": checked}
 
     def dataset_names(self) -> list[str]:
-        return [
-            str(item.get("dataset"))
-            for item in self.manifest().get("datasets", [])
-            if isinstance(item, dict) and item.get("dataset")
-        ]
+        return [str(item.get("dataset")) for item in self.manifest().get("datasets", []) if item.get("dataset")]
 
     def rows(self, dataset: str) -> list[dict[str, Any]]:
         try:

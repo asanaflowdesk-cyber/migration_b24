@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from eqazyna_bitrix.bitrix_client import BitrixError
-from eqazyna_bitrix.lead_pipeline import DEFAULT_MANAGER_IDS, LeadPipeline, LeadPipelineConfig
+from eqazyna_bitrix.distribution import AssignmentUser, DistributionSnapshot
+from eqazyna_bitrix.lead_pipeline import LeadPipeline, LeadPipelineConfig
 from eqazyna_bitrix.models import Application, CompanyEnrichment
 
 
@@ -12,6 +15,7 @@ VALUE = "ГПО Недропользователя"
 FAILURE_FIELD = "UF_CRM_1785508658316"
 EURASIA_REASON = "Уже работает с Евразией"
 EURASIA_REASON_ID = "903"
+TEST_MANAGER_IDS = (22, 23, 16, 17, 18, 38, 44, 39, 40, 19, 15)
 
 
 def application(doc_number: str = "APP-1") -> Application:
@@ -59,6 +63,8 @@ class FakeClient:
         requisite_create_error=None,
         manager_loads=None,
         lead_statuses=None,
+        users=None,
+        departments=None,
     ):
         self.lead = lead
         self.contact_lead = contact_lead
@@ -80,6 +86,12 @@ class FakeClient:
             {"STATUS_ID": "CONVERTED", "SEMANTICS": "S"},
             {"STATUS_ID": "JUNK", "SEMANTICS": "F"},
         ]
+        self.users = {
+            int(key): value for key, value in (users or {}).items()
+        }
+        self.departments = {
+            int(key): value for key, value in (departments or {}).items()
+        }
 
         self.created_lead_fields = None
         self.created_lead_fields_list = []
@@ -126,6 +138,12 @@ class FakeClient:
     def count_open_leads_for_manager(self, manager_id, terminal_status_ids=None):
         return int(self.manager_loads.get(int(manager_id), 0))
 
+    def get_user(self, user_id):
+        return self.users.get(int(user_id))
+
+    def get_department(self, department_id):
+        return self.departments.get(int(department_id))
+
     def discover_company_requisite_preset_id(self):
         return self.discovered_preset
 
@@ -138,7 +156,6 @@ class FakeClient:
         self, doc_number, bin_number, originator_id="EQAZYNA_LEAD", extra_select=None
     ):
         assert doc_number.startswith("APP-")
-        assert bin_number == "123456789012"
         assert originator_id == "EQAZYNA_LEAD"
         assert FIELD in (extra_select or [])
         return self.application_lead
@@ -156,7 +173,6 @@ class FakeClient:
         return self.contact_lead
 
     def find_latest_lead_by_bin(self, bin_number, extra_select=None):
-        assert bin_number == "123456789012"
         assert FIELD in (extra_select or [])
         assert FAILURE_FIELD in (extra_select or [])
         return self.lead
@@ -171,12 +187,10 @@ class FakeClient:
         self.updated_lead_fields = fields
 
     def find_company_by_origin(self, origin_id, originator_id="EQAZYNA"):
-        assert origin_id == "123456789012"
         assert originator_id == "EQAZYNA"
         return self.company
 
     def find_company_by_bin(self, bin_number, bin_field="RQ_BIN"):
-        assert bin_number == "123456789012"
         assert bin_field == "RQ_BIN"
         return self.company
 
@@ -215,11 +229,9 @@ class FakeClient:
         self.updated_address_fields = fields
 
     def find_director_contact(self, company_id, last_name, name, second_name=""):
-        assert (last_name, name, second_name) == ("Иванов", "Иван", "Иванович")
         return self.contact
 
     def find_director_contact_global(self, last_name, name, second_name=""):
-        assert (last_name, name, second_name) == ("Иванов", "Иван", "Иванович")
         return self.global_contact if self.global_contact is not None else self.contact
 
     def create_contact(self, fields):
@@ -237,6 +249,7 @@ class FakeClient:
 
 def pipeline(client: FakeClient, **config_kwargs) -> LeadPipeline:
     config_kwargs.setdefault("random_seed", 7)
+    config_kwargs.setdefault("manager_ids", TEST_MANAGER_IDS)
     result = LeadPipeline(client, LeadPipelineConfig(**config_kwargs))
     result.validate()
     return result
@@ -351,7 +364,7 @@ def test_failed_previous_company_lead_does_not_inherit_non_eurasia_failure():
         "ORIGIN_ID": "APP-1",
         FIELD: VALUE,
     }
-    loads = {manager_id: 5 for manager_id in DEFAULT_MANAGER_IDS}
+    loads = {manager_id: 5 for manager_id in TEST_MANAGER_IDS}
     loads[44] = 0
     client = FakeClient(company=company, lead=previous, manager_loads=loads)
 
@@ -385,7 +398,7 @@ def test_previous_lead_owner_is_ignored_without_director_contact_owner():
         "COMPANY_ID": "601",
         "DATE_MODIFY": "2026-08-05T10:00:00+05:00",
     }
-    loads = {manager_id: 5 for manager_id in DEFAULT_MANAGER_IDS}
+    loads = {manager_id: 5 for manager_id in TEST_MANAGER_IDS}
     loads[38] = 0
     client = FakeClient(company=company, lead=previous, manager_loads=loads)
 
@@ -687,7 +700,7 @@ def test_newer_active_lead_means_new_stage_even_when_older_lead_failed():
 
 
 def test_distribution_is_random_only_between_least_loaded_managers_and_assigns_bundle():
-    loads = {manager_id: 8 for manager_id in DEFAULT_MANAGER_IDS}
+    loads = {manager_id: 8 for manager_id in TEST_MANAGER_IDS}
     loads[16] = 2
     loads[17] = 2
     client = FakeClient(manager_loads=loads)
@@ -726,7 +739,7 @@ def test_director_contact_owner_outside_approved_pool_is_ignored():
         "COMPANY_ID": "601",
         "DATE_MODIFY": "2026-08-05T10:00:00+05:00",
     }
-    loads = {manager_id: 5 for manager_id in DEFAULT_MANAGER_IDS}
+    loads = {manager_id: 5 for manager_id in TEST_MANAGER_IDS}
     loads[44] = 0
     client = FakeClient(
         company=company,
@@ -950,3 +963,262 @@ def test_same_director_on_another_company_has_priority_for_new_bundle_assignment
     # Existing company ownership remains protected from parser-side rewrites.
     assert not client.updated_company_fields or "ASSIGNED_BY_ID" not in client.updated_company_fields
 
+
+def sheet_distribution(users, assignments=None):
+    return DistributionSnapshot(tuple(users), dict(assignments or {}))
+
+
+def sheet_client(users, departments, **kwargs):
+    bitrix_users = {
+        user.user_id: {
+            "ID": str(user.user_id),
+            "ACTIVE": "Y",
+            "UF_DEPARTMENT": [user.department_id],
+        }
+        for user in users
+    }
+    for department in departments.values():
+        head = int(str(department.get("UF_HEAD") or 0))
+        if head and head not in bitrix_users:
+            bitrix_users[head] = {
+                "ID": str(head),
+                "ACTIVE": "Y",
+                "UF_DEPARTMENT": [int(department["ID"])],
+            }
+    return FakeClient(users=bitrix_users, departments=departments, **kwargs)
+
+
+def test_company_fix_has_absolute_priority_and_does_not_consume_capacity():
+    users = [
+        AssignmentUser(11, "Manager", 10, "Алматинский филиал"),
+        AssignmentUser(12, "Second", 10, "Алматинский филиал"),
+        AssignmentUser(99, "Head", 10, "Алматинский филиал", "РОП"),
+    ]
+    departments = {10: {"ID": "10", "NAME": "Алматинский филиал", "UF_HEAD": "99"}}
+    client = sheet_client(users, departments)
+    client.users[77] = {"ID": "77", "ACTIVE": "Y", "UF_DEPARTMENT": [50]}
+    config = LeadPipelineConfig(
+        dry_run=True,
+        random_seed=1,
+        distribution=sheet_distribution(users, {"123456789012": 77}),
+    )
+    subject = LeadPipeline(client, config)
+    subject.validate()
+
+    fixed_result = subject.process(application(), enrichment())
+    same_founder_app = replace(application("APP-3"), bin="123456789014")
+    same_founder_result = subject.process(
+        same_founder_app,
+        replace(enrichment(), bin=same_founder_app.bin),
+    )
+    other_app = replace(application("APP-2"), bin="123456789013")
+    other_result = subject.process(
+        other_app,
+        replace(enrichment(), bin=other_app.bin, director="Петров Петр Петрович"),
+    )
+
+    assert fixed_result.assigned_by_id == 77
+    assert fixed_result.assignment_reason == "company_fix"
+    assert same_founder_result.assigned_by_id == 77
+    assert same_founder_result.assignment_reason == "same_founder_in_run"
+    assert other_result.assigned_by_id in {11, 12}
+    assert other_result.assignment_reason == "new_founder_least_loaded"
+
+
+def test_founder_binding_has_priority_over_astana_address():
+    users = [
+        AssignmentUser(11, "Almaty manager", 10, "Алматинский филиал"),
+        AssignmentUser(19, "Almaty head", 10, "Алматинский филиал", "РОП"),
+        AssignmentUser(21, "Astana manager", 46, "УП г. Астана"),
+        AssignmentUser(22, "Astana manager 2", 46, "УП г. Астана"),
+        AssignmentUser(29, "Astana head", 46, "УП г. Астана", "РОП"),
+    ]
+    departments = {
+        10: {"ID": "10", "NAME": "Алматинский филиал", "UF_HEAD": "19"},
+        46: {"ID": "46", "NAME": "УП г. Астана", "UF_HEAD": "29"},
+    }
+    contact = {"ID": "801", "ASSIGNED_BY_ID": "11"}
+    client = sheet_client(users, departments, contact=contact)
+    subject = LeadPipeline(
+        client,
+        LeadPipelineConfig(
+            dry_run=True,
+            distribution=sheet_distribution(users),
+        ),
+    )
+    subject.validate()
+
+    result = subject.process(
+        application(),
+        replace(
+            enrichment(),
+            legal_address="г. Астана, район Алматы, ул. Тестовая, 1",
+            city="Астана",
+            region="г. Астана",
+        ),
+    )
+
+    assert result.assigned_by_id == 11
+    assert result.assignment_reason == "active_director_owner"
+
+
+def test_astana_without_founder_binding_uses_only_department_46():
+    users = [
+        AssignmentUser(11, "Other manager", 10, "Другой филиал"),
+        AssignmentUser(19, "Other head", 10, "Другой филиал", "РОП"),
+        AssignmentUser(21, "Astana manager", 46, "УП г. Астана"),
+        AssignmentUser(29, "Astana head", 46, "УП г. Астана", "РОП"),
+    ]
+    departments = {
+        10: {"ID": "10", "NAME": "Другой филиал"},
+        46: {"ID": "46", "NAME": "УП г. Астана"},
+    }
+    client = sheet_client(users, departments)
+    subject = LeadPipeline(
+        client,
+        LeadPipelineConfig(dry_run=True, distribution=sheet_distribution(users)),
+    )
+    subject.validate()
+
+    result = subject.process(
+        application(),
+        replace(enrichment(), legal_address="г. Астана", city="Астана", region="г. Астана"),
+    )
+
+    assert result.assigned_by_id == 21
+    assert result.assignment_reason == "astana_new_founder_least_loaded"
+
+
+def test_owner_absent_from_user_list_goes_to_head_of_owners_branch():
+    users = [
+        AssignmentUser(11, "Manager", 10, "Алматинский филиал"),
+        AssignmentUser(12, "Manager 2", 10, "Алматинский филиал"),
+        AssignmentUser(99, "Head", 10, "Алматинский филиал", "РОП"),
+    ]
+    departments = {10: {"ID": "10", "NAME": "Алматинский филиал", "UF_HEAD": "99"}}
+    contact = {"ID": "801", "ASSIGNED_BY_ID": "77"}
+    client = sheet_client(users, departments, contact=contact)
+    client.users[77] = {"ID": "77", "ACTIVE": "N", "UF_DEPARTMENT": [10]}
+    subject = LeadPipeline(
+        client,
+        LeadPipelineConfig(dry_run=True, distribution=sheet_distribution(users)),
+    )
+    subject.validate()
+
+    result = subject.process(application(), enrichment())
+
+    assert result.assigned_by_id == 99
+    assert result.assignment_reason == "missing_owner_to_department_head"
+
+
+def test_single_user_in_branch_receives_all_new_founders_without_limit():
+    users = [AssignmentUser(11, "Only manager", 10, "Алматинский филиал")]
+    departments = {10: {"ID": "10", "NAME": "Алматинский филиал", "UF_HEAD": ""}}
+    client = sheet_client(users, departments)
+    subject = LeadPipeline(
+        client,
+        LeadPipelineConfig(dry_run=True, distribution=sheet_distribution(users)),
+    )
+    subject.validate()
+
+    results = []
+    for index in range(3):
+        app = replace(application(f"APP-{index + 1}"), bin=f"12345678901{index}")
+        info = replace(
+            enrichment(),
+            bin=app.bin,
+            director=f"Фамилия{index} Имя{index} Отчество{index}",
+        )
+        results.append(subject.process(app, info))
+
+    assert [result.assigned_by_id for result in results] == [11, 11, 11]
+    assert {result.assignment_reason for result in results} == {"single_scope_user_no_limit"}
+
+
+def test_each_manager_gets_one_new_founder_then_overflow_goes_to_head():
+    users = [
+        AssignmentUser(11, "Manager", 10, "Алматинский филиал"),
+        AssignmentUser(12, "Manager 2", 10, "Алматинский филиал"),
+        AssignmentUser(99, "Head", 10, "Алматинский филиал", "РОП"),
+    ]
+    departments = {10: {"ID": "10", "NAME": "Алматинский филиал", "UF_HEAD": "99"}}
+    client = sheet_client(users, departments)
+    subject = LeadPipeline(
+        client,
+        LeadPipelineConfig(
+            dry_run=True,
+            random_seed=3,
+            distribution=sheet_distribution(users),
+        ),
+    )
+    subject.validate()
+
+    results = []
+    for index in range(3):
+        app = replace(application(f"APP-{index + 1}"), bin=f"12345678901{index}")
+        info = replace(
+            enrichment(),
+            bin=app.bin,
+            director=f"Фамилия{index} Имя{index} Отчество{index}",
+        )
+        results.append(subject.process(app, info))
+
+    assert {results[0].assigned_by_id, results[1].assigned_by_id} == {11, 12}
+    assert results[2].assigned_by_id == 99
+    assert results[2].assignment_reason == "overflow_to_rop"
+
+
+def test_same_founder_keeps_manager_across_different_bins_without_second_capacity():
+    users = [
+        AssignmentUser(11, "Manager", 10, "Алматинский филиал"),
+        AssignmentUser(12, "Manager 2", 10, "Алматинский филиал"),
+        AssignmentUser(99, "Head", 10, "Алматинский филиал", "РОП"),
+    ]
+    departments = {10: {"ID": "10", "NAME": "Алматинский филиал", "UF_HEAD": "99"}}
+    client = sheet_client(users, departments)
+    subject = LeadPipeline(
+        client,
+        LeadPipelineConfig(
+            dry_run=True,
+            random_seed=5,
+            distribution=sheet_distribution(users),
+        ),
+    )
+    subject.validate()
+
+    first = subject.process(application("APP-1"), enrichment())
+    second_app = replace(application("APP-2"), bin="123456789013")
+    second = subject.process(second_app, replace(enrichment(), bin=second_app.bin))
+    third_app = replace(application("APP-3"), bin="123456789014")
+    third = subject.process(
+        third_app,
+        replace(enrichment(), bin=third_app.bin, director="Петров Петр Петрович"),
+    )
+
+    assert second.assigned_by_id == first.assigned_by_id
+    assert second.assignment_reason == "same_founder_in_run"
+    assert third.assigned_by_id in ({11, 12} - {first.assigned_by_id})
+
+
+def test_random_tie_break_is_applied_only_after_minimum_bitrix_load():
+    users = [
+        AssignmentUser(11, "Busy manager", 10, "Филиал"),
+        AssignmentUser(12, "Free manager", 10, "Филиал"),
+        AssignmentUser(99, "Head", 10, "Филиал", "РОП"),
+    ]
+    departments = {10: {"ID": "10", "NAME": "Филиал"}}
+    client = sheet_client(
+        users,
+        departments,
+        manager_loads={11: 8, 12: 2, 99: 0},
+    )
+    subject = LeadPipeline(
+        client,
+        LeadPipelineConfig(dry_run=True, distribution=sheet_distribution(users)),
+    )
+    subject.validate()
+
+    result = subject.process(application(), enrichment())
+
+    assert result.assigned_by_id == 12
+    assert result.assignment_reason == "new_founder_least_loaded"

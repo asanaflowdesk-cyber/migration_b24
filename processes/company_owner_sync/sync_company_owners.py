@@ -11,12 +11,6 @@ from typing import Any, Iterable
 
 import xlsxwriter
 
-# Make the shared e-Qazyna Bitrix client importable even when this script is
-# launched directly from the repository root, not only through GitHub Actions.
-_EQAZYNA_ROOT = Path(__file__).resolve().parents[1] / "eqazyna_leads"
-if str(_EQAZYNA_ROOT) not in os.sys.path:
-    os.sys.path.insert(0, str(_EQAZYNA_ROOT))
-
 from eqazyna_bitrix.bitrix_client import BitrixClient
 from eqazyna_bitrix.settings import Settings
 
@@ -225,11 +219,10 @@ def build_desync_tree(
     director_contacts: Iterable[dict[str, Any]],
     users: dict[int, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Build company-scoped director ownership groups and keep only desyncs.
+    """Build per-company director -> company -> leads desync groups.
 
-    A normalized FIO is *not* a global identity key.  The owner source is the
-    director contact selected for the same company.  This prevents namesakes in
-    unrelated companies from propagating ASSIGNED_BY_ID across the portal.
+    The selected director contact owner is the source of truth for that company.
+    Equal normalized names in different companies never establish identity.
     """
     users = users or {}
     companies_list = list(companies)
@@ -251,72 +244,109 @@ def build_desync_tree(
         company_leads.sort(key=lead_sort_key)
 
     selected_contact_by_company = _select_company_director_contacts(
-        companies_list, leads_list, contacts_list
+        companies_list,
+        leads_list,
+        contacts_list,
     )
 
+    # A matching FIO is not a global person identifier. Keep every company as
+    # an independent ownership group so namesakes cannot reassign each other's
+    # companies.
+    company_ids_by_group: dict[tuple[int, str], list[int]] = defaultdict(list)
+    for company_id, contact in selected_contact_by_company.items():
+        key = director_key(contact)
+        if key.strip("|"):
+            company_ids_by_group[(company_id, key)].append(company_id)
+
     result: list[dict[str, Any]] = []
-    for company_id, canonical in sorted(
-        selected_contact_by_company.items(),
-        key=lambda item: str(company_by_id.get(item[0], {}).get("TITLE") or "").casefold(),
-    ):
-        company = company_by_id.get(company_id)
-        if company is None:
+    for (group_company_id, key), company_ids in company_ids_by_group.items():
+        selected = selected_contact_by_company[group_company_id]
+        contacts = [
+            contact
+            for contact in contacts_list
+            if director_key(contact) == key
+            and normalized_id(contact.get("COMPANY_ID")) == group_company_id
+        ] or [selected]
+        if not contacts:
             continue
+        canonical = _canonical_contact(contacts)
         root_owner_id = normalized_id(canonical.get("ASSIGNED_BY_ID"))
-        company_owner_id = normalized_id(company.get("ASSIGNED_BY_ID"))
-        linked_leads = leads_by_company.get(company_id, [])
-        lead_owner_ids = {
+        contact_owner_ids = {
             owner_id
-            for owner_id in (normalized_id(lead.get("ASSIGNED_BY_ID")) for lead in linked_leads)
+            for owner_id in (normalized_id(contact.get("ASSIGNED_BY_ID")) for contact in contacts)
             if owner_id is not None
         }
-        company_mismatch = root_owner_id is None or company_owner_id != root_owner_id
-        lead_mismatch = (
-            any(normalized_id(lead.get("ASSIGNED_BY_ID")) != root_owner_id for lead in linked_leads)
-            if root_owner_id is not None
-            else bool(linked_leads)
-        )
-        if not (company_mismatch or lead_mismatch):
+
+        company_nodes: list[dict[str, Any]] = []
+        # The visible report compares the related entities to the canonical
+        # director owner. Duplicate contact cards alone do not create a row
+        # that would look synchronized without explaining why it was included.
+        has_desync = root_owner_id is None
+
+        for company_id in sorted(
+            set(company_ids),
+            key=lambda cid: str(company_by_id.get(cid, {}).get("TITLE") or "").casefold(),
+        ):
+            company = company_by_id.get(company_id)
+            if company is None:
+                continue
+            company_owner_id = normalized_id(company.get("ASSIGNED_BY_ID"))
+            linked_leads = leads_by_company.get(company_id, [])
+            lead_owner_ids = {
+                owner_id
+                for owner_id in (normalized_id(lead.get("ASSIGNED_BY_ID")) for lead in linked_leads)
+                if owner_id is not None
+            }
+
+            company_mismatch = root_owner_id is None or company_owner_id != root_owner_id
+            lead_mismatch = any(
+                normalized_id(lead.get("ASSIGNED_BY_ID")) != root_owner_id
+                for lead in linked_leads
+            ) if root_owner_id is not None else bool(linked_leads)
+            has_desync = has_desync or company_mismatch or lead_mismatch
+
+            company_nodes.append(
+                {
+                    "company_id": company_id,
+                    "company_title": str(company.get("TITLE") or "").strip(),
+                    "company_owner_id": company_owner_id,
+                    "company_owner_name": display_user(users.get(company_owner_id), company_owner_id),
+                    "company_mismatch": company_mismatch,
+                    "unique_lead_owner_count": len(lead_owner_ids),
+                    "leads": [
+                        {
+                            "lead_id": normalized_id(lead.get("ID")),
+                            "lead_title": str(lead.get("TITLE") or "").strip(),
+                            "lead_owner_id": normalized_id(lead.get("ASSIGNED_BY_ID")),
+                            "lead_owner_name": display_user(
+                                users.get(normalized_id(lead.get("ASSIGNED_BY_ID"))),
+                                normalized_id(lead.get("ASSIGNED_BY_ID")),
+                            ),
+                            "lead_mismatch": (
+                                root_owner_id is None
+                                or normalized_id(lead.get("ASSIGNED_BY_ID")) != root_owner_id
+                            ),
+                        }
+                        for lead in linked_leads
+                    ],
+                }
+            )
+
+        if not has_desync:
             continue
 
-        company_node = {
-            "company_id": company_id,
-            "company_title": str(company.get("TITLE") or "").strip(),
-            "company_owner_id": company_owner_id,
-            "company_owner_name": display_user(users.get(company_owner_id), company_owner_id),
-            "company_mismatch": company_mismatch,
-            "unique_lead_owner_count": len(lead_owner_ids),
-            "leads": [
-                {
-                    "lead_id": normalized_id(lead.get("ID")),
-                    "lead_title": str(lead.get("TITLE") or "").strip(),
-                    "lead_owner_id": normalized_id(lead.get("ASSIGNED_BY_ID")),
-                    "lead_owner_name": display_user(
-                        users.get(normalized_id(lead.get("ASSIGNED_BY_ID"))),
-                        normalized_id(lead.get("ASSIGNED_BY_ID")),
-                    ),
-                    "lead_mismatch": (
-                        root_owner_id is None
-                        or normalized_id(lead.get("ASSIGNED_BY_ID")) != root_owner_id
-                    ),
-                }
-                for lead in linked_leads
-            ],
-        }
         result.append(
             {
-                "director_key": f"company:{company_id}|{director_key(canonical)}",
-                "identity_scope": "company",
-                "director_contact_id": normalized_id(canonical.get("ID")),
+                "director_key": key,
                 "director_name": display_director(canonical),
                 "director_owner_id": root_owner_id,
                 "director_owner_name": display_user(users.get(root_owner_id), root_owner_id),
-                "director_contact_owner_count": 1 if root_owner_id is not None else 0,
-                "companies": [company_node],
+                "director_contact_owner_count": len(contact_owner_ids),
+                "companies": company_nodes,
             }
         )
 
-    result.sort(key=lambda group: (group["director_name"].casefold(), group["director_key"]))
+    result.sort(key=lambda group: group["director_name"].casefold())
     return result
 
 
@@ -375,8 +405,11 @@ def apply_updates(client: BitrixClient, rows: list[dict[str, Any]]) -> None:
 def write_tree_xlsx(path: Path, tree: list[dict[str, Any]]) -> None:
     """Write a sparse tree exactly as: director -> company -> leads."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    workbook = xlsxwriter.Workbook(path, {"strings_to_formulas": False, "strings_to_urls": False})
+    workbook = xlsxwriter.Workbook(path)
     ws = workbook.add_worksheet("Рассинхрон")
+
+    def write_literal(row: int, column: int, value: Any, cell_format: Any) -> None:
+        ws.write_string(row, column, str(value or ""), cell_format)
 
     header = workbook.add_format(
         {
@@ -421,8 +454,8 @@ def write_tree_xlsx(path: Path, tree: list[dict[str, Any]]) -> None:
             first_company_row = True
             for lead in leads:
                 if first_root_row:
-                    ws.write(row_idx, 0, group.get("director_name", ""), root_fmt)
-                    ws.write(
+                    write_literal(row_idx, 0, group.get("director_name", ""), root_fmt)
+                    write_literal(
                         row_idx,
                         1,
                         group.get("director_owner_name", ""),
@@ -434,17 +467,17 @@ def write_tree_xlsx(path: Path, tree: list[dict[str, Any]]) -> None:
                     ws.write_blank(row_idx, 1, None, lead_fmt)
 
                 if first_company_row:
-                    ws.write(row_idx, 2, company.get("company_title", ""), company_fmt)
+                    write_literal(row_idx, 2, company.get("company_title", ""), company_fmt)
                     company_owner_format = mismatch_fmt if company.get("company_mismatch") else company_owner_fmt
-                    ws.write(row_idx, 3, company.get("company_owner_name", ""), company_owner_format)
+                    write_literal(row_idx, 3, company.get("company_owner_name", ""), company_owner_format)
                     first_company_row = False
                 else:
                     ws.write_blank(row_idx, 2, None, lead_fmt)
                     ws.write_blank(row_idx, 3, None, lead_fmt)
 
-                ws.write(row_idx, 4, lead.get("lead_title", ""), lead_fmt)
+                write_literal(row_idx, 4, lead.get("lead_title", ""), lead_fmt)
                 lead_owner_format = mismatch_fmt if lead.get("lead_mismatch") else lead_owner_fmt
-                ws.write(row_idx, 5, lead.get("lead_owner_name", ""), lead_owner_format)
+                write_literal(row_idx, 5, lead.get("lead_owner_name", ""), lead_owner_format)
                 row_idx += 1
 
     ws.freeze_panes(1, 0)
@@ -532,7 +565,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Scan ownership desync as director -> company -> leads. "
-            "The company-linked director contact owner is the source of truth; FIO is never a global identity key."
+            "The responsible manager of the director contact is the source of truth."
         )
     )
     parser.add_argument("--apply", action="store_true", help="update company owners only; default is dry-run")

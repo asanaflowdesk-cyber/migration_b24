@@ -34,54 +34,10 @@ def source_client(required: bool) -> BitrixClient | None:
     if not url:
         if required:
             raise RuntimeError(
-                "SOURCE_BITRIX_WEBHOOK_URL is required for cloud preflight and child-content enrichment"
+                "SOURCE_BITRIX_WEBHOOK_URL is required for direct cloud-to-box import"
             )
         return None
     return BitrixClient.from_env("SOURCE_BITRIX_WEBHOOK_URL")
-
-
-def _explained_skip(row: dict[str, object]) -> bool:
-    """Return True only for intentionally lossy skips approved by config/policy."""
-    message = str(row.get("message") or "").casefold()
-    operation = str(row.get("operation") or "")
-    target_id = str(row.get("target_id") or "").strip()
-    if target_id and target_id not in {"0", "none"}:
-        # Idempotent "already present" paths are not data loss.
-        return True
-    if operation == "map_user" and "unused source user" in message:
-        return True
-    if operation == "create_task" and "excluded by configured source users" in message:
-        return True
-    if operation == "link_requisite" and ("routed" in message or "not applicable" in message):
-        return True
-    return False
-
-
-def _import_exit_code(project: MigrationProject) -> int:
-    errors = [row for row in project.report.actions if row.get("status") in {"ERROR", "FATAL"}]
-    skips = [row for row in project.report.actions if row.get("status") == "SKIP"]
-    warnings = [row for row in project.report.actions if row.get("status") == "WARN"]
-    unexplained_skips = [row for row in skips if not _explained_skip(row)]
-    failed = bool(errors or unexplained_skips)
-    project.report.extra["import_result"] = {
-        "policy": "fail_on_error_or_unexplained_loss",
-        "skipped": len(skips),
-        "warnings": len(warnings),
-        "errors": len(errors),
-        "unexplained_skips": len(unexplained_skips),
-        "workflow_failed": failed,
-    }
-    if failed:
-        logging.error(
-            "Import is incomplete: errors=%s unexplained_skips=%s warnings=%s",
-            len(errors), len(unexplained_skips), len(warnings),
-        )
-        return 2
-    logging.info(
-        "Import completed: explained_skips=%s warnings=%s errors=0",
-        len(skips), len(warnings),
-    )
-    return 0
 
 
 def main() -> int:
@@ -138,7 +94,26 @@ def main() -> int:
 
         elif args.command == "import":
             project.import_all(dry_run=args.dry_run, max_items=args.max_items)
-            exit_code = _import_exit_code(project)
+
+            # Existing/already-processed records may be SKIP and optional child
+            # data may be WARN. Any ERROR means the import is incomplete.
+            skipped = sum(1 for row in project.report.actions if row.get("status") == "SKIP")
+            warnings = sum(1 for row in project.report.actions if row.get("status") == "WARN")
+            errors = sum(1 for row in project.report.actions if row.get("status") == "ERROR")
+            project.report.extra["import_result"] = {
+                "policy": "fail_on_error",
+                "skipped": skipped,
+                "warnings": warnings,
+                "errors": errors,
+                "workflow_failed": bool(errors),
+            }
+            logging.info(
+                "Import completed: skipped=%s, warnings=%s, errors=%s",
+                skipped,
+                warnings,
+                errors,
+            )
+            exit_code = 2 if errors else 0
 
         elif args.command == "verify":
             result = project.verify()

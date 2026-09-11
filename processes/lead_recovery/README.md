@@ -20,4 +20,6 @@
 
 ID пользователя определяется безопасно: сначала из input `moved_by_id`, затем из repository variable `LEAD_RECOVERY_MOVED_BY_ID`. Вызов `user.current` не используется, поэтому CRM-only webhook не требует дополнительного user scope. Если ID не задан ни одним способом, поток останавливается до любых изменений.
 
+Workflow передаёт пользовательские значения через окружение в `run_from_env.py`; wrapper проверяет тип и диапазон до сборки аргументов, поэтому input не интерполируется в Windows `cmd`.
+
 Для HTTP timeout workflow передаёт значение в `HTTP_TIMEOUT_SECONDS`, которое действительно читает общий `BitrixClient`.

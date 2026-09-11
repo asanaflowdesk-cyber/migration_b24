@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import re
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -13,8 +15,6 @@ else:
 
 import requests
 
-from common.security import sanitize_secret_text
-
 
 class BitrixError(RuntimeError):
     pass
@@ -25,6 +25,17 @@ TRANSIENT_CODES = {
     "OPERATION_TIME_LIMIT",
     "OVERLOAD_LIMIT",
 }
+
+_WEBHOOK_SECRET_RE = re.compile(r"(/rest(?:/api)?/\d+/)[^/\s]+(/?)", re.I)
+
+
+def _safe_error(value: Any) -> str:
+    return _WEBHOOK_SECRET_RE.sub(r"\1REDACTED\2", str(value))
+
+
+def _read_only(method: str) -> bool:
+    lowered = method.casefold()
+    return lowered != "batch" and lowered.endswith((".get", ".list", ".fields", ".getlist", ".current"))
 
 
 @dataclass(slots=True)
@@ -50,13 +61,6 @@ class BitrixClient:
             }
         )
 
-    @staticmethod
-    def _retry_safe(method: str) -> bool:
-        name = method.casefold()
-        if name == "batch":
-            return False
-        return name.endswith((".get", ".list", ".fields", ".current"))
-
     def _request_data(
         self,
         method: str,
@@ -65,10 +69,8 @@ class BitrixClient:
         url = self.webhook_url + method + ".json"
         payload = payload or {}
         last_error: Exception | None = None
-        retry_safe = self._retry_safe(method)
-        attempts = self.retries + 1 if retry_safe else 1
 
-        for attempt in range(attempts):
+        for attempt in range(self.retries + 1):
             try:
                 response = self.session.post(
                     url,
@@ -79,45 +81,37 @@ class BitrixClient:
                 try:
                     data = response.json()
                 except Exception as exc:
-                    raise requests.HTTPError(
-                        f"HTTP {response.status_code}; invalid JSON response"
+                    raise BitrixError(
+                        f"{method}: Bitrix returned non-JSON response ({len(response.content)} bytes)"
                     ) from exc
-                if not isinstance(data, dict):
-                    raise requests.HTTPError(
-                        f"HTTP {response.status_code}; unexpected JSON type {type(data).__name__}"
-                    )
 
                 if response.status_code >= 500:
                     raise requests.HTTPError(f"HTTP {response.status_code}")
                 if response.status_code >= 400 or "error" in data:
                     code = str(data.get("error") or f"HTTP_{response.status_code}")
                     description = str(
-                        data.get("error_description") or data.get("error") or response.reason
+                        data.get("error_description")
+                        or data.get("error")
+                        or response.reason
                     )
-                    if retry_safe and code in TRANSIENT_CODES and attempt + 1 < attempts:
+                    if code in TRANSIENT_CODES and attempt < self.retries:
                         time.sleep(min(30.0, 2.0**attempt))
                         continue
                     raise BitrixError(f"{method}: {code}: {description}")
 
                 if self.polite_delay_seconds:
                     time.sleep(self.polite_delay_seconds)
-                return data
+                return data if isinstance(data, dict) else {"result": data}
             except BitrixError:
                 raise
             except (requests.RequestException, OSError) as exc:
                 last_error = exc
-                if not retry_safe:
-                    raise BitrixError(
-                        f"{method}: write outcome is ambiguous; automatic replay disabled: "
-                        f"{sanitize_secret_text(exc)}"
-                    ) from exc
-                if attempt + 1 >= attempts:
+                if attempt >= self.retries or not _read_only(method):
                     break
                 time.sleep(min(20.0, 1.5**attempt))
 
-        raise BitrixError(
-            f"{method}: request failed after retries: {sanitize_secret_text(last_error)}"
-        )
+        suffix = "after retries" if _read_only(method) else "without unsafe retry"
+        raise BitrixError(f"{method}: request failed {suffix}: {_safe_error(last_error)}") from None
 
     def call(self, method: str, payload: dict[str, Any] | None = None) -> Any:
         return self._request_data(method, payload).get("result")
@@ -126,32 +120,33 @@ class BitrixClient:
         self,
         method: str,
         payload: dict[str, Any] | None = None,
-        *,
-        max_pages: int = 10000,
     ) -> list[dict[str, Any]]:
         base = dict(payload or {})
-        start: Any = base.pop("start", 0)
+        start = int(base.pop("start", 0) or 0)
         rows: list[dict[str, Any]] = []
-        seen_next: set[str] = set()
+        seen_starts: set[int] = set()
+        seen_pages: set[str] = set()
+        max_pages = 10_000
         for _page in range(max_pages):
+            if start in seen_starts:
+                raise BitrixError(f"{method}: repeated pagination start={start}")
+            seen_starts.add(start)
             request_payload = {**base, "start": start}
             data = self._request_data(method, request_payload)
             result = data.get("result")
+            fingerprint = json.dumps(result, ensure_ascii=False, sort_keys=True, default=str)
+            if fingerprint in seen_pages:
+                raise BitrixError(f"{method}: repeated page at start={start}")
+            seen_pages.add(fingerprint)
             if isinstance(result, list):
                 rows.extend(row for row in result if isinstance(row, dict))
             next_value = data.get("next")
-            if next_value in (None, "", False):
-                return rows
-            marker = str(next_value)
-            if marker in seen_next or marker == str(start):
-                raise BitrixError(
-                    f"{method}: pagination repeated next={marker}; refusing partial data"
-                )
-            seen_next.add(marker)
-            start = next_value
-        raise BitrixError(
-            f"{method}: pagination exceeded max_pages={max_pages}; refusing partial data"
-        )
+            if next_value in (None, ""):
+                break
+            start = int(next_value)
+        else:
+            raise BitrixError(f"{method}: exceeded pagination limit of {max_pages} pages")
+        return rows
 
     # ---------- field metadata ----------
 
@@ -203,6 +198,18 @@ class BitrixClient:
             },
         )
         return sum(1 for row in rows if str(row.get("STATUS_ID") or "") not in terminal)
+
+    # ---------- users and departments used by lead distribution ----------
+
+    def get_user(self, user_id: int) -> dict[str, Any] | None:
+        rows = self.list_all("user.get", {"FILTER": {"ID": int(user_id)}})
+        wanted = str(int(user_id))
+        return next((row for row in rows if str(row.get("ID") or "") == wanted), None)
+
+    def get_department(self, department_id: int) -> dict[str, Any] | None:
+        rows = self.list_all("department.get", {"ID": int(department_id)})
+        wanted = str(int(department_id))
+        return next((row for row in rows if str(row.get("ID") or "") == wanted), None)
 
     def discover_company_requisite_preset_id(self) -> int | None:
         """Return the preset already used by company requisites in the box.

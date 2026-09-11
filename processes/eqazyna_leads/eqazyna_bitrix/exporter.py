@@ -56,7 +56,7 @@ COLUMNS = [
 def write_xlsx(results: Iterable[ProcessResult], output_path: str | Path) -> Path:
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    workbook = xlsxwriter.Workbook(str(path), {"strings_to_formulas": False, "strings_to_urls": False})
+    workbook = xlsxwriter.Workbook(str(path))
     worksheet = workbook.add_worksheet("eqazyna_leads")
 
     header_format = workbook.add_format(
@@ -92,7 +92,10 @@ def write_xlsx(results: Iterable[ProcessResult], output_path: str | Path) -> Pat
                     string=str(value),
                 )
             else:
-                worksheet.write(row_index, column_index, value if value is not None else "", text_format)
+                if isinstance(value, str) or value is None:
+                    worksheet.write_string(row_index, column_index, value or "", text_format)
+                else:
+                    worksheet.write(row_index, column_index, value, text_format)
 
     worksheet.autofilter(0, 0, max(last_row, 1), len(COLUMNS) - 1)
     worksheet.freeze_panes(1, 0)

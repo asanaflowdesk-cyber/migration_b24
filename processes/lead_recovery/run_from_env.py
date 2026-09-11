@@ -8,24 +8,23 @@ import recover_failed_leads
 
 
 def main() -> int:
-    mode = os.environ.get("INPUT_MODE", "").strip().casefold()
-    raw_days = os.environ.get("INPUT_DAYS", "").strip()
-    raw_moved_by = os.environ.get("INPUT_MOVED_BY_ID", "").strip()
-    if mode not in {"dry_run", "apply"}:
-        print(f"ERROR: invalid INPUT_MODE: {mode!r}", file=sys.stderr)
-        return 2
-    if not re.fullmatch(r"\d{1,2}", raw_days) or not 1 <= int(raw_days) <= 90:
-        print(f"ERROR: INPUT_DAYS must be an integer from 1 to 90: {raw_days!r}", file=sys.stderr)
-        return 2
-    if raw_moved_by and (not re.fullmatch(r"\d+", raw_moved_by) or int(raw_moved_by) <= 0):
-        print("ERROR: INPUT_MOVED_BY_ID must be empty or a positive integer", file=sys.stderr)
-        return 2
+    mode = os.getenv("INPUT_MODE", "").strip().casefold()
+    days = os.getenv("INPUT_DAYS", "").strip()
+    moved_by_id = os.getenv("INPUT_MOVED_BY_ID", "").strip()
 
-    argv = ["recover_failed_leads.py", "--days", raw_days, "--output-dir", "output"]
-    if raw_moved_by:
-        argv.extend(["--moved-by-id", raw_moved_by])
+    if mode not in {"dry_run", "apply"}:
+        raise SystemExit(f"invalid INPUT_MODE: {mode!r}")
+    if not re.fullmatch(r"\d{1,2}", days) or not 1 <= int(days) <= 90:
+        raise SystemExit("INPUT_DAYS must be an integer from 1 to 90")
+    if moved_by_id and (not moved_by_id.isdigit() or int(moved_by_id) <= 0):
+        raise SystemExit("INPUT_MOVED_BY_ID must be a positive integer")
+
+    argv = ["recover_failed_leads.py", "--days", days, "--output-dir", "output"]
+    if moved_by_id:
+        argv.extend(["--moved-by-id", moved_by_id])
     if mode == "apply":
         argv.append("--apply")
+
     previous = sys.argv
     try:
         sys.argv = argv

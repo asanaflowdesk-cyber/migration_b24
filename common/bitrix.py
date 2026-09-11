@@ -9,8 +9,6 @@ from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
 from urllib.parse import urlencode
 
-from common.security import sanitize_secret_text
-
 try:
     import truststore
 except ImportError:  # pragma: no cover
@@ -21,6 +19,22 @@ else:
 import requests
 
 LOG = logging.getLogger(__name__)
+
+
+_WEBHOOK_SECRET_RE = re.compile(r"(/rest(?:/api)?/\d+/)[^/\s]+(/?)", re.I)
+
+
+def sanitize_error(value: Any) -> str:
+    """Return an exception/message safe for logs and exported reports."""
+    return _WEBHOOK_SECRET_RE.sub(r"\1REDACTED\2", str(value))
+
+
+def _is_read_only_method(method: str) -> bool:
+    """Classify Bitrix methods that can be retried after an ambiguous failure."""
+    lowered = method.casefold()
+    if lowered == "batch":
+        return False
+    return lowered.endswith((".get", ".list", ".fields", ".getlist", ".current"))
 
 
 class BitrixError(RuntimeError):
@@ -116,39 +130,18 @@ class BitrixClient:
         description = str(data.get("error_description") or error or "Unknown Bitrix error")
         return code, description
 
-    @staticmethod
-    def _retry_safe(method: str) -> bool:
-        """Return True only for REST calls that are safe to replay automatically."""
-        name = method.casefold()
-        if name == "batch":
-            return False
-        safe_suffixes = (".get", ".list", ".fields", ".current")
-        safe_exact = {
-            "department.get",
-            "user.get",
-            "user.current",
-            "crm.status.list",
-            "crm.requisite.preset.list",
-            "crm.activity.binding.list",
-            "disk.folder.getchildren",
-            "task.checklistitem.getlist",
-        }
-        return name in safe_exact or name.endswith(safe_suffixes)
-
     def _raw_url(self, method: str, params: Mapping[str, Any] | None, *, base: str, json_suffix: bool) -> dict[str, Any]:
         params = dict(params or {})
         url = base + method + (".json" if json_suffix else "")
         last: Exception | None = None
-        retry_safe = self._retry_safe(method)
-        max_attempts = self.retries + 1 if retry_safe else 1
-        for attempt in range(max_attempts):
+        for attempt in range(self.retries + 1):
             try:
                 response = self.session.post(url, json=params, timeout=self.timeout)
                 try:
                     data = response.json()
                 except Exception as exc:
                     raise requests.HTTPError(
-                        f"HTTP {response.status_code}; invalid JSON response"
+                        f"HTTP {response.status_code}; invalid JSON response ({len(response.content)} bytes)"
                     ) from exc
                 if not isinstance(data, dict):
                     raise requests.HTTPError(
@@ -156,16 +149,14 @@ class BitrixClient:
                     )
                 if "error" in data:
                     code, desc = self._error_parts(data)
-                    if (
-                        retry_safe
-                        and code in {"QUERY_LIMIT_EXCEEDED", "OPERATION_TIME_LIMIT", "OVERLOAD_LIMIT"}
-                        and attempt + 1 < max_attempts
-                    ):
+                    if code in {"QUERY_LIMIT_EXCEEDED", "OPERATION_TIME_LIMIT", "OVERLOAD_LIMIT"} and attempt < self.retries:
                         wait = min(60.0, 2.0 ** attempt)
                         LOG.warning("%s throttled: %s. retry in %.1fs", method, code, wait)
                         time.sleep(wait)
                         continue
                     raise BitrixError(method, code, desc, data)
+                if response.status_code >= 500:
+                    raise requests.HTTPError(f"HTTP {response.status_code}")
                 if response.status_code >= 400:
                     raise requests.HTTPError(f"HTTP {response.status_code}")
                 if self.delay:
@@ -175,20 +166,16 @@ class BitrixClient:
                 raise
             except Exception as exc:
                 last = exc
-                safe_error = sanitize_secret_text(exc)
-                if not retry_safe:
-                    raise RuntimeError(
-                        f"{method} write outcome is ambiguous after transport/HTTP failure; "
-                        f"automatic replay is disabled: {safe_error}"
-                    ) from exc
-                if attempt + 1 >= max_attempts:
+                # A timeout/reset after *.add/*.update/batch may happen after
+                # Bitrix committed the mutation. Blindly repeating it can
+                # create duplicates or apply the same change twice.
+                if attempt >= self.retries or not _is_read_only_method(method):
                     break
                 wait = min(30.0, 1.5 ** attempt)
-                LOG.warning("%s request failed (%s), retry in %.1fs", method, safe_error, wait)
+                LOG.warning("%s request failed (%s), retry in %.1fs", method, sanitize_error(exc), wait)
                 time.sleep(wait)
-        raise RuntimeError(
-            f"{method} failed after retries: {sanitize_secret_text(last)}"
-        )
+        suffix = "after retries" if _is_read_only_method(method) else "without unsafe retry"
+        raise RuntimeError(f"{method} failed {suffix}: {sanitize_error(last)}") from None
 
     def raw(self, method: str, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
         return self._raw_url(method, params, base=self.base, json_suffix=True)
@@ -215,7 +202,7 @@ class BitrixClient:
                 if attempt >= self.retries:
                     break
                 time.sleep(min(20.0, 1.5 ** attempt))
-        raise RuntimeError(f"file download failed after retries: {sanitize_secret_text(last)}")
+        raise RuntimeError(f"file download failed after retries: {sanitize_error(last)}") from None
 
     def list_all(
         self,
@@ -228,16 +215,19 @@ class BitrixClient:
         start: Any = base.pop("start", 0)
         rows: list[dict[str, Any]] = []
         seen_fingerprints: set[str] = set()
+        seen_starts: set[str] = set()
         for _page in range(1, max_pages + 1):
+            start_key = str(start)
+            if start_key in seen_starts:
+                raise RuntimeError(f"{method} pagination repeated start={start_key}")
+            seen_starts.add(start_key)
             payload = dict(base)
             payload["start"] = start
             raw = self.raw(method, payload)
             items = _extract_items(raw.get("result"))
-            fingerprint = json.dumps(items[:2], ensure_ascii=False, sort_keys=True, default=str) + f"|{len(items)}"
+            fingerprint = json.dumps(items, ensure_ascii=False, sort_keys=True, default=str)
             if fingerprint in seen_fingerprints:
-                raise RuntimeError(
-                    f"{method} pagination repeated a page at start={start}; refusing partial data"
-                )
+                raise RuntimeError(f"{method} repeated page detected at start={start}")
             seen_fingerprints.add(fingerprint)
             rows.extend(items)
             next_value = raw.get("next")
@@ -245,9 +235,7 @@ class BitrixClient:
                 break
             start = next_value
         else:
-            raise RuntimeError(
-                f"{method} pagination exceeded max_pages={max_pages}; refusing partial data"
-            )
+            raise RuntimeError(f"{method} exceeded pagination limit of {max_pages} pages")
         return rows
 
     def batch(self, commands: Mapping[str, tuple[str, Mapping[str, Any]]], *, halt: int = 0) -> BatchResult:
@@ -298,7 +286,7 @@ class BitrixClient:
                 except BitrixError as exc:
                     yield {}, {key: {"error": exc.code, "error_description": exc.description}}
                 except Exception as exc:
-                    yield {}, {key: {"error": "REQUEST_ERROR", "error_description": sanitize_secret_text(exc)}}
+                    yield {}, {key: {"error": "REQUEST_ERROR", "error_description": str(exc)}}
                 continue
             if chunk and (len(chunk) >= size or encoded_size + command_size > max_encoded_chars):
                 ready = flush()

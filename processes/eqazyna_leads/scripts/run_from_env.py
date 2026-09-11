@@ -81,10 +81,6 @@ def main() -> int:
     elif mode != "apply":
         raise SystemExit(f"Unknown INPUT_MODE: {mode!r}")
 
-    if not value("EGOV_API_KEY"):
-        args.append("--no-egov")
-        print("INFO: EGOV_API_KEY is empty; eGov enrichment is disabled for this run")
-
     if page_list:
         args.extend(["--page-list", page_list])
 
