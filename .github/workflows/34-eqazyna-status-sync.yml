@@ -1,0 +1,126 @@
+name: 34 | e-Qazyna — синхронизация статусов заявок
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "dry_run — только показать изменения; apply — изменить стадии лидов"
+        required: true
+        default: dry_run
+        type: choice
+        options: [dry_run, apply]
+      max_items:
+        description: "Сколько лидов проверить; 0 = все e-Qazyna лиды"
+        required: true
+        default: "0"
+        type: string
+      doc_type:
+        description: "Тип документа e-Qazyna"
+        required: true
+        default: "Заявка на разведку ТПИ"
+        type: string
+      failure_stage_name:
+        description: "Название стадии лида для Отклонено / Отозвано / Аннулировано"
+        required: true
+        default: "Провал"
+        type: string
+      potential_stage_name:
+        description: "Название стадии лида для Выдана лицензия"
+        required: true
+        default: "Потенциальные сделки"
+        type: string
+      confirm:
+        description: "Для apply введите SYNC_EQAZYNA_STATUSES"
+        required: false
+        default: ""
+        type: string
+
+concurrency:
+  group: eqazyna-application-status-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  NODE_USE_SYSTEM_CA: "1"
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: "utf-8"
+
+jobs:
+  eqazyna-status-sync:
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: cmd
+        working-directory: processes/eqazyna_status_sync
+
+    steps:
+      - name: Получить код репозитория
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Найти Python и создать локальное окружение
+        run: call ..\..\scripts\prepare-python.cmd
+
+      - name: Установить зависимости
+        env:
+          CUSTOM_PIP_INDEX_URL: ${{ vars.PIP_INDEX_URL }}
+        run: |
+          if not "%CUSTOM_PIP_INDEX_URL%"=="" set "PIP_INDEX_URL=%CUSTOM_PIP_INDEX_URL%"
+          ".venv\Scripts\python.exe" -m pip install -r requirements.txt
+
+      - name: Проверить код
+        env:
+          PYTHONPATH: ${{ github.workspace }};${{ github.workspace }}\processes\eqazyna_leads;${{ github.workspace }}\processes\eqazyna_status_sync
+        run: |
+          chcp 65001 >nul
+          ".venv\Scripts\python.exe" -m pytest -q tests
+          if errorlevel 1 exit /b 1
+          ".venv\Scripts\python.exe" sync_eqazyna_statuses.py --help >nul
+
+      - name: Проверить подтверждение боевого запуска
+        if: ${{ inputs.mode == 'apply' && inputs.confirm != 'SYNC_EQAZYNA_STATUSES' }}
+        run: |
+          echo Для записи в Bitrix24 введите SYNC_EQAZYNA_STATUSES
+          exit /b 1
+
+      - name: Сверить статусы заявок и стадии лидов
+        env:
+          PYTHONPATH: ${{ github.workspace }};${{ github.workspace }}\processes\eqazyna_leads;${{ github.workspace }}\processes\eqazyna_status_sync
+          TARGET_BITRIX_WEBHOOK_URL: ${{ secrets.TARGET_BITRIX_WEBHOOK_URL }}
+          BITRIX_VERIFY_SSL: ${{ vars.BITRIX_VERIFY_SSL || 'true' }}
+          BITRIX_CA_BUNDLE: ${{ vars.BITRIX_CA_BUNDLE }}
+          BITRIX_REQUEST_TIMEOUT: ${{ vars.BITRIX_REQUEST_TIMEOUT || '45' }}
+          BITRIX_POLITE_DELAY_SECONDS: ${{ vars.BITRIX_POLITE_DELAY_SECONDS || '0.05' }}
+          EQAZYNA_REQUEST_TIMEOUT: ${{ vars.EQAZYNA_REQUEST_TIMEOUT || '60' }}
+          EQAZYNA_MAX_RETRIES: ${{ vars.EQAZYNA_MAX_RETRIES || '4' }}
+          EQAZYNA_RETRY_BASE_SLEEP_SECONDS: ${{ vars.EQAZYNA_RETRY_BASE_SLEEP_SECONDS || '3' }}
+          EQAZYNA_POLITE_DELAY_SECONDS: ${{ vars.EQAZYNA_POLITE_DELAY_SECONDS || '0.2' }}
+          BITRIX_EQAZYNA_ORIGINATORS: "EQAZYNA_LEAD,EQAZYNA"
+          INPUT_MODE: ${{ inputs.mode }}
+          INPUT_MAX_ITEMS: ${{ inputs.max_items }}
+          INPUT_DOC_TYPE: ${{ inputs.doc_type }}
+          INPUT_FAILURE_STAGE_NAME: ${{ inputs.failure_stage_name }}
+          INPUT_POTENTIAL_STAGE_NAME: ${{ inputs.potential_stage_name }}
+        run: |
+          chcp 65001 >nul
+          if "%TARGET_BITRIX_WEBHOOK_URL%"=="" (
+            echo Не задан secret TARGET_BITRIX_WEBHOOK_URL
+            exit /b 1
+          )
+          if not exist output mkdir output
+          echo RUNNER=%RUNNER_NAME% / %RUNNER_OS% / %RUNNER_ARCH%
+          ".venv\Scripts\python.exe" -u run_from_env.py
+          if errorlevel 1 exit /b 1
+          type output\eqazyna_status_sync_summary.json
+          type output\eqazyna_status_sync_journal.txt
+
+      - name: Загрузить отчет
+        if: ${{ always() }}
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: 34-eqazyna-status-sync-${{ github.run_number }}
+          path: processes/eqazyna_status_sync/output/
+          if-no-files-found: warn
+          retention-days: 3

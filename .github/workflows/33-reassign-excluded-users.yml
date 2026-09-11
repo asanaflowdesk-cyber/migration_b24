@@ -1,18 +1,21 @@
-name: 33 | Исключённые пользователи — перенос ответственных
+name: 33 | Исключённые пользователи — перенос пакетов
 
 on:
   workflow_dispatch:
     inputs:
       excluded_user_ids:
-        description: "ID исключённых пользователей через запятую, например: 15,17,19,22,23,39,44"
+        description: "Исключённые пользователи"
         required: true
+        default: "15,17,19,22,23,39,44"
         type: string
       mode:
         description: "dry_run — только план; apply — выполнить перенос"
         required: true
         default: dry_run
         type: choice
-        options: [dry_run, apply]
+        options:
+          - dry_run
+          - apply
       confirm:
         description: "Для apply введите REASSIGN_EXCLUDED_USERS"
         required: false
@@ -41,10 +44,10 @@ jobs:
         working-directory: processes/excluded_user_reassignment
 
     steps:
-      - name: Получить код репозитория
-        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: Получить код
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
 
-      - name: Найти Python и создать локальное окружение
+      - name: Подготовить Python
         run: call ..\..\scripts\prepare-python.cmd
 
       - name: Установить зависимости
@@ -62,24 +65,26 @@ jobs:
           ".venv\Scripts\python.exe" -m pytest -q tests
           if errorlevel 1 exit /b 1
           ".venv\Scripts\python.exe" reassign_excluded_users.py --help >nul
+          if errorlevel 1 exit /b 1
 
-      - name: Проверить подтверждение боевого запуска
+      - name: Проверить подтверждение apply
         if: ${{ inputs.mode == 'apply' && inputs.confirm != 'REASSIGN_EXCLUDED_USERS' }}
         run: |
-          echo Для записи в коробку введите REASSIGN_EXCLUDED_USERS
+          echo Для apply введите REASSIGN_EXCLUDED_USERS
           exit /b 1
 
-      - name: Рассчитать или выполнить переназначение
+      - name: Перенести пакеты
         env:
           PYTHONPATH: ${{ github.workspace }};${{ github.workspace }}\processes\eqazyna_leads;${{ github.workspace }}\processes\excluded_user_reassignment
           TARGET_BITRIX_WEBHOOK_URL: ${{ secrets.TARGET_BITRIX_WEBHOOK_URL }}
+          EXCLUDED_USER_IDS: ${{ inputs.excluded_user_ids }}
           REASSIGN_TARGET_ROP_IDS: "72,73"
+          REASSIGN_PROTECTED_LEAD_IDS: "401"
+          REASSIGN_PROGRESS_EVERY: ${{ vars.REASSIGN_PROGRESS_EVERY || '25' }}
+          REASSIGN_FINAL_WAIT_SECONDS: ${{ vars.REASSIGN_FINAL_WAIT_SECONDS || '2' }}
           BITRIX_VERIFY_SSL: ${{ vars.BITRIX_VERIFY_SSL || 'true' }}
           BITRIX_CA_BUNDLE: ${{ vars.BITRIX_CA_BUNDLE }}
           BITRIX_REQUEST_TIMEOUT: ${{ vars.BITRIX_REQUEST_TIMEOUT || '45' }}
-          REASSIGN_FINAL_WAIT_SECONDS: ${{ vars.REASSIGN_FINAL_WAIT_SECONDS || '2' }}
-          REASSIGN_PROGRESS_EVERY: ${{ vars.REASSIGN_PROGRESS_EVERY || '25' }}
-          EXCLUDED_USER_IDS: ${{ inputs.excluded_user_ids }}
           RUN_MODE: ${{ inputs.mode }}
         run: |
           chcp 65001 >nul
@@ -96,9 +101,9 @@ jobs:
           )
           if errorlevel 1 exit /b 1
 
-      - name: Загрузить единый отчёт
+      - name: Загрузить отчёт
         if: ${{ always() }}
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
           name: 33-excluded-user-reassignment-${{ github.run_number }}
           path: processes/excluded_user_reassignment/output/excluded_user_reassignment.csv
