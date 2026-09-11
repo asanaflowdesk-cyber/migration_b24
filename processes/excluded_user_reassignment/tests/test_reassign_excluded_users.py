@@ -2,15 +2,13 @@ import pytest
 
 from reassign_excluded_users import (
     Package,
-    ReassignmentError,
     add_package_context,
     assign_targets,
     build_packages,
     build_rows,
-    choose_existing_owner,
-    package_taldyk_owners,
     parse_id_set,
     plan_packages,
+    protected_taldyk_managers,
     update_owner_safely,
 )
 
@@ -73,68 +71,73 @@ def test_same_founder_across_companies_is_one_package():
     assert packages[0].lead_ids == {101, 102}
 
 
-def test_nonexcluded_lead_is_context_not_changed():
+def test_nonexcluded_lead_is_context_but_is_never_changed():
     companies = [company(1, 13)]
     contacts = [contact(11, 1, 13)]
     leads = [lead(101, 1, 11, 15), lead(102, 1, 11, 13)]
     packages = build_packages(companies, contacts, leads, {15})
     add_package_context(packages, companies, contacts, leads)
-    target, reason = choose_existing_owner(packages[0], companies, contacts, leads, {15}, (72, 73))
-    assert target == 13
-    assert reason.startswith("keep_existing")
+    eligible, skipped = plan_packages(packages, {16, 18, 38}, set(), (72, 73))
+    assert not skipped
+    assert eligible[0].target_owner_id in {72, 73}
 
-    packages[0].target_owner_id = 13
-    packages[0].target_reason = reason
-    rows = build_rows(packages, [], companies, contacts, leads, {15}, {13: "Manager 13", 15: "Old"})
+    rows = build_rows(eligible, [], companies, contacts, leads, {15}, {13: "Manager 13", 15: "Old", 72: "ROP72", 73: "ROP73"})
     lead_ids = {r["entity_id"] for r in rows if r["entity_type"] == "lead"}
     assert lead_ids == {101}
-    assert next(r for r in rows if r["entity_type"] == "lead")["new_owner_id"] == 13
 
 
-def test_existing_manual_owner_beats_partial_rop_assignment():
+def test_existing_manual_owner_does_not_block_or_anchor_package():
     companies = [company(1, 13)]
-    contacts = [contact(11, 1, 72)]
+    contacts = [contact(11, 1, 13)]
     leads = [lead(101, 1, 11, 15), lead(102, 1, 11, 13)]
     packages = build_packages(companies, contacts, leads, {15})
     add_package_context(packages, companies, contacts, leads)
-    target, _ = choose_existing_owner(packages[0], companies, contacts, leads, {15}, (72, 73))
-    assert target == 13
+    eligible, skipped = plan_packages(packages, {16, 18, 38}, set(), (72, 73))
+    assert not skipped
+    assert eligible[0].target_owner_id in {72, 73}
+    assert eligible[0].target_owner_id != 13
 
 
-def test_partial_rop_package_keeps_existing_rop():
+def test_existing_partial_rop_assignment_does_not_anchor_package():
     companies = [company(1, 72)]
     contacts = [contact(11, 1, 72)]
     leads = [lead(101, 1, 11, 15)]
     packages = build_packages(companies, contacts, leads, {15})
     add_package_context(packages, companies, contacts, leads)
-    target, reason = choose_existing_owner(packages[0], companies, contacts, leads, {15}, (72, 73))
-    assert target == 72
-    assert reason == "continue_existing_rop_package"
+    eligible, skipped = plan_packages(packages, {16, 18, 38}, set(), (72, 73))
+    assert not skipped
+    assert eligible[0].target_reason == "balanced_between_rops_72_73"
+    assert eligible[0].target_owner_id in {72, 73}
 
 
-def test_taldyk_package_is_skipped_even_if_other_branch_also_present():
-    companies = [company(1, 15)]
-    contacts = [contact(11, 1, 15)]
+@pytest.mark.parametrize("manager_id", [16, 18, 38])
+def test_package_linked_to_protected_taldyk_manager_is_skipped(manager_id):
+    companies = [company(1, manager_id)]
+    contacts = [contact(11, 1, manager_id)]
+    leads = [lead(101, 1, 11, 15), lead(102, 1, 11, manager_id)]
+    packages = build_packages(companies, contacts, leads, {15})
+    add_package_context(packages, companies, contacts, leads)
+    eligible, skipped = plan_packages(packages, {16, 18, 38}, set(), (72, 73))
+    assert eligible == []
+    assert len(skipped) == 1
+    assert skipped[0].skip_reason == f"protected_taldyk_manager:{manager_id}"
+
+
+def test_other_manager_is_not_protected_even_if_package_has_existing_owner():
+    companies = [company(1, 13)]
+    contacts = [contact(11, 1, 13)]
     leads = [lead(101, 1, 11, 15), lead(102, 1, 11, 13)]
     packages = build_packages(companies, contacts, leads, {15})
     add_package_context(packages, companies, contacts, leads)
-    eligible, skipped = plan_packages(
-        packages, companies, contacts, leads, {15}, (72, 73),
-        {15: {"Талдыкорганский филиал"}, 13: {"Алматинский филиал"}}, set(),
-    )
-    assert eligible == []
-    assert len(skipped) == 1
-    assert skipped[0].skip_reason.startswith("taldykorgan:")
+    eligible, skipped = plan_packages(packages, {16, 18, 38}, set(), (72, 73))
+    assert not skipped
+    assert len(eligible) == 1
+    assert eligible[0].target_owner_id in {72, 73}
 
 
-def test_rop_department_is_ignored_for_taldyk_gate():
-    package = Package("x", lead_ids={101}, context_owner_ids={15, 72})
-    result = package_taldyk_owners(
-        package,
-        {15: {"Алматы"}, 72: {"Талдыкорганский филиал"}},
-        {72, 73},
-    )
-    assert result == set()
+def test_protected_manager_detection_uses_context_owner_ids():
+    package = Package("x", lead_ids={101}, context_owner_ids={15, 18, 72})
+    assert protected_taldyk_managers(package, {16, 18, 38}) == {18}
 
 
 def test_protected_lead_401_skips_whole_package():
@@ -143,9 +146,7 @@ def test_protected_lead_401_skips_whole_package():
     leads = [lead(401, 1, 11, 15), lead(402, 1, 11, 15)]
     packages = build_packages(companies, contacts, leads, {15})
     add_package_context(packages, companies, contacts, leads)
-    eligible, skipped = plan_packages(
-        packages, companies, contacts, leads, {15}, (72, 73), {15: {"Алматы"}}, {401}
-    )
+    eligible, skipped = plan_packages(packages, {16, 18, 38}, {401}, (72, 73))
     assert eligible == []
     assert len(skipped) == 1
     assert skipped[0].skip_reason == "protected_lead:401"
@@ -164,6 +165,18 @@ def test_unassigned_packages_balance_by_lead_count():
         for rop in (72, 73)
     }
     assert loads == {72: 5, 73: 5}
+
+
+def test_plan_balances_all_nonprotected_packages_even_with_mixed_existing_owners():
+    companies = [company(1, 13), company(2, 40)]
+    contacts = [contact(11, 1, 13, last="Петров"), contact(12, 2, 40, last="Сидоров")]
+    leads = [lead(101, 1, 11, 15), lead(102, 2, 12, 15)]
+    packages = build_packages(companies, contacts, leads, {15})
+    add_package_context(packages, companies, contacts, leads)
+    eligible, skipped = plan_packages(packages, {16, 18, 38}, set(), (72, 73))
+    assert not skipped
+    assert len(eligible) == 2
+    assert {p.target_owner_id for p in eligible} == {72, 73}
 
 
 def test_build_rows_never_changes_status():
@@ -199,16 +212,3 @@ def test_ambiguous_timeout_is_accepted_when_readback_confirms_commit():
     update_owner_safely(client, "lead", 101, 72, attempts=3)
     assert client.owner == 72
     assert client.update_calls == 1
-
-
-def test_multiple_manual_owners_without_unique_company_anchor_is_blocking():
-    companies = [company(1, 13), company(2, 70)]
-    contacts = [
-        contact(11, 1, 13, last="Петров"),
-        contact(12, 2, 70, last="Петров"),
-    ]
-    leads = [lead(101, 1, 11, 15), lead(102, 2, 12, 15)]
-    packages = build_packages(companies, contacts, leads, {15})
-    add_package_context(packages, companies, contacts, leads)
-    with pytest.raises(ReassignmentError, match="несколькими действующими владельцами"):
-        choose_existing_owner(packages[0], companies, contacts, leads, {15}, (72, 73))

@@ -6,7 +6,7 @@ import json
 import os
 import re
 import time
-from collections import Counter, defaultdict
+from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
@@ -21,7 +21,7 @@ class ReassignmentError(RuntimeError):
 
 DEFAULT_TARGET_ROPS = (72, 73)
 DEFAULT_PROTECTED_LEAD_IDS = {401}
-TALDYKORGAN_TOKENS = ("талдыкорган", "талдықорған", "taldykorgan")
+DEFAULT_PROTECTED_TALDYK_MANAGER_IDS = {16, 18, 38}
 
 
 def normalized_id(value: Any) -> int | None:
@@ -315,97 +315,17 @@ def add_package_context(
         package.context_owner_ids = owners
 
 
-def _is_taldyk_name(name: str) -> bool:
-    norm = _norm_text(name)
-    return any(token in norm for token in TALDYKORGAN_TOKENS)
 
-
-def package_taldyk_owners(
+def protected_taldyk_managers(
     package: Package,
-    department_names_by_owner: dict[int, set[str]],
-    target_rop_ids: set[int],
+    protected_manager_ids: set[int],
 ) -> set[int]:
-    # 72/73 may already occur only because of an earlier partial run; their own
-    # department must not retroactively classify the source package as Taldykorgan.
-    source_context = package.context_owner_ids - target_rop_ids
-    return {
-        owner_id for owner_id in source_context
-        if any(_is_taldyk_name(name) for name in department_names_by_owner.get(owner_id, set()))
-    }
+    """Managers whose linked package must stay untouched.
 
-
-def choose_existing_owner(
-    package: Package,
-    companies: Iterable[dict[str, Any]],
-    contacts: Iterable[dict[str, Any]],
-    leads: Iterable[dict[str, Any]],
-    excluded_user_ids: set[int],
-    target_rop_ids: tuple[int, int],
-) -> tuple[int | None, str]:
-    """Return the already established package owner when one exists.
-
-    Rules:
-    - manual/non-excluded assignment wins over automatic 72/73 remnants;
-    - exactly one 72/73 means a partially completed package and is continued;
-    - if both 72 and 73 are present, choose the one holding more package entities;
-    - conflicting multiple manual owners are a hard preflight error, never guessed.
+    Business rule: Taldykorgan packages linked to managers 16/18/38 are protected.
+    The manager IDs are authoritative; department-name heuristics are intentionally not used.
     """
-    companies = list(companies)
-    contacts = list(contacts)
-    leads = list(leads)
-    company_by_id = {eid: row for row in companies if (eid := entity_id(row)) is not None}
-    contact_by_id = {eid: row for row in contacts if (eid := entity_id(row)) is not None}
-    lead_by_id = {eid: row for row in leads if (eid := entity_id(row)) is not None}
-    target_set = set(target_rop_ids)
-
-    active_owners: list[int] = []
-    for cid in package.company_ids:
-        if (owner := normalized_id((company_by_id.get(cid) or {}).get("ASSIGNED_BY_ID"))) not in excluded_user_ids and owner:
-            active_owners.append(owner)
-    for cid in package.contact_ids:
-        if (owner := normalized_id((contact_by_id.get(cid) or {}).get("ASSIGNED_BY_ID"))) not in excluded_user_ids and owner:
-            active_owners.append(owner)
-    for lid in package.context_lead_ids:
-        if (owner := normalized_id((lead_by_id.get(lid) or {}).get("ASSIGNED_BY_ID"))) not in excluded_user_ids and owner:
-            active_owners.append(owner)
-
-    if not active_owners:
-        return None, ""
-
-    manual = sorted(set(active_owners) - target_set)
-    if len(manual) == 1:
-        return manual[0], "keep_existing_package_owner"
-    if len(manual) > 1:
-        # A unique package-level owner is the safest anchor even if contextual
-        # non-excluded leads have other owners.
-        company_manual = {
-            owner for cid in package.company_ids
-            if (owner := normalized_id((company_by_id.get(cid) or {}).get("ASSIGNED_BY_ID")))
-            and owner not in excluded_user_ids and owner not in target_set
-        }
-        if len(company_manual) == 1:
-            return next(iter(company_manual)), "keep_existing_company_owner"
-        contact_manual = {
-            owner for cid in package.contact_ids
-            if (owner := normalized_id((contact_by_id.get(cid) or {}).get("ASSIGNED_BY_ID")))
-            and owner not in excluded_user_ids and owner not in target_set
-        }
-        if len(contact_manual) == 1:
-            return next(iter(contact_manual)), "keep_existing_contact_owner"
-        raise ReassignmentError(
-            f"Пакет {package.key} уже распределён между несколькими действующими владельцами: "
-            + ",".join(map(str, manual))
-        )
-
-    targets = [owner for owner in active_owners if owner in target_set]
-    unique_targets = sorted(set(targets))
-    if len(unique_targets) == 1:
-        return unique_targets[0], "continue_existing_rop_package"
-    if len(unique_targets) == 2:
-        counts = Counter(targets)
-        best = sorted(unique_targets, key=lambda oid: (-counts[oid], oid))[0]
-        return best, "heal_split_rop_package"
-    return None, ""
+    return package.context_owner_ids & protected_manager_ids
 
 
 def assign_targets(
@@ -428,41 +348,50 @@ def assign_targets(
         loads[target] += len(package.lead_ids)
 
 
+
 def plan_packages(
     packages: list[Package],
-    companies: list[dict[str, Any]],
-    contacts: list[dict[str, Any]],
-    leads: list[dict[str, Any]],
-    excluded_user_ids: set[int],
-    target_rop_ids: tuple[int, int],
-    department_names_by_owner: dict[int, set[str]],
+    protected_manager_ids: set[int],
     protected_lead_ids: set[int],
+    target_rop_ids: tuple[int, int],
 ) -> tuple[list[Package], list[PackageDecision]]:
-    target_set = set(target_rop_ids)
+    """Apply the final package gate.
+
+    Only two things can stop a package:
+    1) it contains an explicitly protected lead (401 by default);
+    2) it is linked to one of the protected Taldykorgan managers (16/18/38 by default).
+
+    Every other package is redistributed from scratch, evenly between the target ROPs.
+    Existing non-excluded owners do not anchor or block the package.
+    """
     eligible: list[Package] = []
     skipped: list[PackageDecision] = []
 
     for package in packages:
         protected = package.lead_ids & protected_lead_ids
         if protected:
-            skipped.append(PackageDecision(package, f"protected_lead:{','.join(map(str, sorted(protected)))}"))
+            skipped.append(
+                PackageDecision(
+                    package,
+                    f"protected_lead:{','.join(map(str, sorted(protected)))}",
+                )
+            )
             continue
 
-        taldyk = package_taldyk_owners(package, department_names_by_owner, target_set)
-        if taldyk:
-            details = []
-            for oid in sorted(taldyk):
-                names = "/".join(sorted(department_names_by_owner.get(oid, set())))
-                details.append(f"{oid}:{names}" if names else str(oid))
-            skipped.append(PackageDecision(package, "taldykorgan:" + " | ".join(details)))
+        protected_managers = protected_taldyk_managers(package, protected_manager_ids)
+        if protected_managers:
+            skipped.append(
+                PackageDecision(
+                    package,
+                    "protected_taldyk_manager:"
+                    + ",".join(map(str, sorted(protected_managers))),
+                )
+            )
             continue
 
-        existing_owner, reason = choose_existing_owner(
-            package, companies, contacts, leads, excluded_user_ids, target_rop_ids
-        )
-        if existing_owner is not None:
-            package.target_owner_id = existing_owner
-            package.target_reason = reason
+        # Final rule: every other package goes to the ROP balancing pool.
+        package.target_owner_id = None
+        package.target_reason = ""
         eligible.append(package)
 
     assign_targets(eligible, target_rop_ids)
@@ -523,29 +452,6 @@ def user_name(user: dict[str, Any] | None, user_id: int) -> str:
     )
     return name or f"ID {user_id}"
 
-
-def department_names_for_users(
-    client: BitrixClient,
-    users: dict[int, dict[str, Any]],
-) -> dict[int, set[str]]:
-    department_cache: dict[int, str] = {}
-    result: dict[int, set[str]] = defaultdict(set)
-    for user_id, user in users.items():
-        raw = user.get("UF_DEPARTMENT")
-        if not isinstance(raw, (list, tuple)):
-            raw = [raw] if raw not in (None, "") else []
-        for value in raw:
-            dep_id = normalized_id(value)
-            if dep_id is None:
-                continue
-            if dep_id not in department_cache:
-                rows = client.list_all("department.get", {"ID": dep_id})
-                row = next((r for r in rows if normalized_id(r.get("ID")) == dep_id), None)
-                department_cache[dep_id] = str((row or {}).get("NAME") or "")
-            name = department_cache[dep_id]
-            if name:
-                result[user_id].add(name)
-    return dict(result)
 
 
 def validate_target_users(
@@ -635,7 +541,12 @@ def build_rows(
     for decision in skipped:
         package = decision.package
         meta = package_meta(package)
-        action = "skipped_protected_lead" if decision.skip_reason.startswith("protected_lead:") else "skipped_taldykorgan"
+        if decision.skip_reason.startswith("protected_lead:"):
+            action = "skipped_protected_lead"
+        elif decision.skip_reason.startswith("protected_taldyk_manager:"):
+            action = "skipped_protected_taldyk_manager"
+        else:
+            action = "skipped"
         for lid in sorted(package.lead_ids):
             lead = lead_by_id.get(lid, {})
             old_owner = normalized_id(lead.get("ASSIGNED_BY_ID"))
@@ -817,8 +728,14 @@ def run(
     apply: bool,
     target_rop_ids: tuple[int, int] = DEFAULT_TARGET_ROPS,
     protected_lead_ids: set[int] | None = None,
+    protected_taldyk_manager_ids: set[int] | None = None,
 ) -> dict[str, Any]:
     protected_lead_ids = set(DEFAULT_PROTECTED_LEAD_IDS if protected_lead_ids is None else protected_lead_ids)
+    protected_taldyk_manager_ids = set(
+        DEFAULT_PROTECTED_TALDYK_MANAGER_IDS
+        if protected_taldyk_manager_ids is None
+        else protected_taldyk_manager_ids
+    )
     if excluded_user_ids & set(target_rop_ids):
         raise ReassignmentError("Целевые РОП не могут входить в список исключённых пользователей")
 
@@ -826,28 +743,14 @@ def run(
     packages = build_packages(companies, contacts, leads, excluded_user_ids)
     add_package_context(packages, companies, contacts, leads)
 
-    owner_ids = set(excluded_user_ids) | set(target_rop_ids)
+    owner_ids = set(excluded_user_ids) | set(target_rop_ids) | set(protected_taldyk_manager_ids)
     owner_ids.update(*(package.context_owner_ids for package in packages))
     users = load_users(client, owner_ids)
     validate_target_users(users, target_rop_ids)
-    departments = department_names_for_users(client, users)
 
     eligible, skipped = plan_packages(
-        packages, companies, contacts, leads, excluded_user_ids,
-        target_rop_ids, departments, protected_lead_ids,
+        packages, protected_taldyk_manager_ids, protected_lead_ids, target_rop_ids
     )
-
-    # Existing package owners selected by the preflight must exist. We do not
-    # silently replace a manually distributed package with 72/73.
-    existing_targets = {
-        p.target_owner_id for p in eligible
-        if p.target_owner_id is not None and p.target_owner_id not in target_rop_ids
-    }
-    missing_existing = sorted(oid for oid in existing_targets if oid not in users)
-    if missing_existing:
-        raise ReassignmentError(
-            "Не удалось прочитать действующих владельцев пакетов: " + ",".join(map(str, missing_existing))
-        )
 
     user_names = {uid: user_name(user, uid) for uid, user in users.items()}
     rows = build_rows(
@@ -856,7 +759,9 @@ def run(
 
     transfer_rows = [r for r in rows if not str(r["action"]).startswith("skipped_")]
     pending_rows = [r for r in transfer_rows if r["action"] == "pending"]
-    skipped_taldyk = [d for d in skipped if d.skip_reason.startswith("taldykorgan:")]
+    skipped_taldyk_managers = [
+        d for d in skipped if d.skip_reason.startswith("protected_taldyk_manager:")
+    ]
     skipped_protected = [d for d in skipped if d.skip_reason.startswith("protected_lead:")]
 
     def count_type(kind: str, subset: list[dict[str, Any]]) -> int:
@@ -865,7 +770,9 @@ def run(
     print(
         "[ПЛАН] "
         f"исходных пакетов: {len(packages)}; к переносу: {len(eligible)}; "
-        f"пропущено Талдыкорган: {len(skipped_taldyk)} пакетов/{sum(len(d.package.lead_ids) for d in skipped_taldyk)} лидов; "
+        f"защищено Талдыкорган (менеджеры {','.join(map(str, sorted(protected_taldyk_manager_ids)))}): "
+        f"{len(skipped_taldyk_managers)} пакетов/"
+        f"{sum(len(d.package.lead_ids) for d in skipped_taldyk_managers)} лидов; "
         f"защищённые лиды: {sum(len(d.package.lead_ids) for d in skipped_protected)}; "
         f"изменений: {len(pending_rows)} "
         f"(лиды {count_type('lead', pending_rows)}, компании {count_type('company', pending_rows)}, контакты {count_type('contact', pending_rows)}).",
@@ -919,8 +826,11 @@ def run(
         "excluded_user_ids": sorted(excluded_user_ids),
         "packages_total": len(packages),
         "packages_transfer": len(eligible),
-        "packages_skipped_taldykorgan": len(skipped_taldyk),
-        "leads_skipped_taldykorgan": sum(len(d.package.lead_ids) for d in skipped_taldyk),
+        "protected_taldyk_manager_ids": sorted(protected_taldyk_manager_ids),
+        "packages_skipped_protected_taldyk_managers": len(skipped_taldyk_managers),
+        "leads_skipped_protected_taldyk_managers": sum(
+            len(d.package.lead_ids) for d in skipped_taldyk_managers
+        ),
         "protected_lead_ids": sorted(protected_lead_ids),
         "rows_total_transfer": len(transfer_rows),
         "changes_planned": len(pending_rows),
@@ -944,7 +854,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Переносит только ответственных у пакетов лидов исключённых пользователей. "
-            "Стадии лидов не меняет. Пакеты, связанные с Талдыкорганом, не трогает."
+            "Стадии лидов не меняет. Не трогает только пакеты, связанные с "
+            "защищёнными менеджерами Талдыкоргана."
         )
     )
     parser.add_argument(
@@ -963,10 +874,14 @@ def main() -> int:
         if len(target_ids) != 2:
             raise ReassignmentError("REASSIGN_TARGET_ROP_IDS должен содержать ровно два ID")
         protected = parse_optional_id_set(os.getenv("REASSIGN_PROTECTED_LEAD_IDS", "401"))
+        protected_taldyk_managers = parse_optional_id_set(
+            os.getenv("REASSIGN_PROTECTED_TALDYK_MANAGER_IDS", "16,18,38")
+        )
         summary = run(
             build_client(), excluded, Path(args.output_dir), apply=args.apply,
             target_rop_ids=(target_ids[0], target_ids[1]),
             protected_lead_ids=protected,
+            protected_taldyk_manager_ids=protected_taldyk_managers,
         )
         print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
         return 1 if args.apply and summary["final_verify_errors"] else 0
