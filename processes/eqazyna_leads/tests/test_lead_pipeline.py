@@ -1089,6 +1089,113 @@ def test_astana_without_founder_binding_uses_only_department_46():
     assert result.assignment_reason == "astana_new_founder_least_loaded"
 
 
+def test_astana_uses_sales_departments_65_and_66_when_parent_46_is_empty():
+    users = [
+        AssignmentUser(71, "Astana parent head", 46, "УП г. Астана", "РОП"),
+        AssignmentUser(61, "Sales 2 manager", 65, "Отдел продаж №2"),
+        AssignmentUser(72, "Sales 2 head", 65, "Отдел продаж №2", "РОП"),
+        AssignmentUser(62, "Sales 1 manager", 66, "Отдел продаж №1"),
+        AssignmentUser(73, "Sales 1 head", 66, "Отдел продаж №1", "РОП"),
+        AssignmentUser(31, "Taldyk manager", 14, "УП г. Талдыкорган"),
+    ]
+    departments = {
+        46: {"ID": "46", "NAME": "УП г. Астана", "UF_HEAD": "71"},
+        65: {"ID": "65", "NAME": "Отдел продаж №2", "PARENT": "46", "UF_HEAD": "72"},
+        66: {"ID": "66", "NAME": "Отдел продаж №1", "PARENT": "46", "UF_HEAD": "73"},
+        14: {"ID": "14", "NAME": "УП г. Талдыкорган"},
+    }
+    client = sheet_client(users, departments, manager_loads={61: 0, 62: 4})
+    subject = LeadPipeline(
+        client,
+        LeadPipelineConfig(dry_run=True, distribution=sheet_distribution(users)),
+    )
+    subject.validate()
+
+    result = subject.process(
+        application(),
+        replace(enrichment(), legal_address="г. Астана", city="Астана", region="г. Астана"),
+    )
+
+    assert result.assigned_by_id == 61
+    assert result.assigned_by_id != 71
+    assert result.assignment_reason == "astana_new_founder_least_loaded"
+
+
+def test_astana_child_departments_overflow_between_rops_72_and_73():
+    users = [
+        AssignmentUser(61, "Sales 2 manager", 65, "Отдел продаж №2"),
+        AssignmentUser(72, "Sales 2 head", 65, "Отдел продаж №2", "РОП"),
+        AssignmentUser(62, "Sales 1 manager", 66, "Отдел продаж №1"),
+        AssignmentUser(73, "Sales 1 head", 66, "Отдел продаж №1", "РОП"),
+    ]
+    departments = {
+        65: {"ID": "65", "NAME": "Отдел продаж №2", "PARENT": "46", "UF_HEAD": "72"},
+        66: {"ID": "66", "NAME": "Отдел продаж №1", "PARENT": "46", "UF_HEAD": "73"},
+    }
+    client = sheet_client(
+        users,
+        departments,
+        manager_loads={61: 0, 62: 0, 72: 3, 73: 1},
+    )
+    subject = LeadPipeline(
+        client,
+        LeadPipelineConfig(
+            dry_run=True,
+            random_seed=1,
+            distribution=sheet_distribution(users),
+        ),
+    )
+    subject.validate()
+
+    results = []
+    for index in range(3):
+        app = replace(application(f"APP-AST-{index}"), bin=f"2234567890{index:02d}")
+        info = replace(
+            enrichment(),
+            bin=app.bin,
+            director=f"Астана{index} Тест{index} Тестович{index}",
+            legal_address="г. Астана",
+            city="Астана",
+            region="г. Астана",
+        )
+        results.append(subject.process(app, info))
+
+    assert {results[0].assigned_by_id, results[1].assigned_by_id} == {61, 62}
+    assert results[2].assigned_by_id == 73
+    assert results[2].assignment_reason == "astana_overflow_to_rop"
+
+
+def test_missing_owner_from_parent_46_falls_back_to_child_department_rop():
+    users = [
+        AssignmentUser(61, "Sales 2 manager", 65, "Отдел продаж №2"),
+        AssignmentUser(72, "Sales 2 head", 65, "Отдел продаж №2", "РОП"),
+        AssignmentUser(62, "Sales 1 manager", 66, "Отдел продаж №1"),
+        AssignmentUser(73, "Sales 1 head", 66, "Отдел продаж №1", "РОП"),
+    ]
+    departments = {
+        65: {"ID": "65", "NAME": "Отдел продаж №2", "PARENT": "46", "UF_HEAD": "72"},
+        66: {"ID": "66", "NAME": "Отдел продаж №1", "PARENT": "46", "UF_HEAD": "73"},
+    }
+    contact = {"ID": "801", "ASSIGNED_BY_ID": "77"}
+    client = sheet_client(
+        users,
+        departments,
+        contact=contact,
+        manager_loads={61: 0, 62: 0, 72: 5, 73: 1},
+    )
+    client.users[77] = {"ID": "77", "ACTIVE": "N", "UF_DEPARTMENT": [46]}
+    subject = LeadPipeline(
+        client,
+        LeadPipelineConfig(dry_run=True, distribution=sheet_distribution(users)),
+    )
+    subject.validate()
+
+    result = subject.process(application(), enrichment())
+
+    assert result.assigned_by_id == 73
+    assert result.assignment_reason == "missing_owner_to_department_head"
+
+
 def test_owner_absent_from_user_list_goes_to_astana_head():
     users = [
         AssignmentUser(11, "Manager", 46, "УП г. Астана"),

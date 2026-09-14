@@ -75,6 +75,9 @@ class LeadPipelineConfig:
     random_seed: int | None = None
     distribution: DistributionSnapshot | None = None
     astana_department_id: int = 46
+    # Active Astana sales users live in the two child departments. The parent
+    # DepartmentID=46 remains the region marker, but its head is not a sales ROP.
+    astana_sales_department_ids: tuple[int, ...] = (65, 66)
 
 
 @dataclass(slots=True)
@@ -114,6 +117,15 @@ class LeadPipeline:
         )
         self._manager_loads: dict[int, int] = {}
         self._distribution = config.distribution
+        self._astana_sales_department_ids = {
+            int(value)
+            for value in config.astana_sales_department_ids
+            if str(value).strip().isdigit() and int(value) > 0
+        }
+        self._astana_department_ids = {
+            int(config.astana_department_id),
+            *self._astana_sales_department_ids,
+        }
         self._assignment_users: dict[int, AssignmentUser] = {
             user.user_id: user for user in (config.distribution.users if config.distribution else ())
         }
@@ -235,6 +247,7 @@ class LeadPipeline:
         for manager_id in sorted(fixed_ids):
             self._get_active_user(manager_id)
 
+        active_astana_departments = set(self._active_astana_scope_department_ids())
         for department_id in sorted(self._users_by_department):
             members = [
                 user.user_id
@@ -246,7 +259,7 @@ class LeadPipeline:
                 for user in self._assignment_users.values()
                 if user.department_id == department_id and is_branch_head(user.role)
             ]
-            if department_id != self.config.astana_department_id:
+            if department_id not in active_astana_departments:
                 # Outside Astana no overflow-to-ROP rule is used. A branch may
                 # legitimately contain several managers and no ROP.
                 continue
@@ -871,7 +884,10 @@ class LeadPipeline:
                 return owner_id, "active_director_owner"
             owner_departments = self._owner_department_ids(owner_id)
             for department_id in owner_departments:
-                if department_id in self._users_by_department:
+                if (
+                    department_id in self._users_by_department
+                    or department_id in self._astana_department_ids
+                ):
                     selected, reason = self._department_fallback(department_id)
                     self._founder_assignments[founder_key] = selected
                     return selected, reason
@@ -894,10 +910,11 @@ class LeadPipeline:
         )
         is_astana = branch_key(address) == "astana"
         if is_astana:
-            scope_users = sorted(
-                set(self._users_by_department.get(self.config.astana_department_id, []))
+            scope_users = self._astana_scope_users()
+            scope_label = (
+                "подразделения Астаны DepartmentID="
+                + ",".join(map(str, self._active_astana_scope_department_ids()))
             )
-            scope_label = f"DepartmentID={self.config.astana_department_id}"
         else:
             # Outside Astana the existing behaviour remains global: choose
             # between all current managers from user_list by current load.
@@ -975,10 +992,18 @@ class LeadPipeline:
 
     def _department_fallback(self, department_id: int) -> tuple[int, str]:
         members = sorted(set(self._users_by_department.get(department_id, [])))
+        is_astana_department = department_id in self._astana_department_ids
+        if is_astana_department and (
+            department_id == self.config.astana_department_id or not members
+        ):
+            # A former employee can still belong to parent DepartmentID=46,
+            # while all active sales participants live in child departments
+            # 65 and 66. Fall back to the whole Astana scope in that case.
+            members = self._astana_scope_users()
         if len(members) == 1:
             selected = members[0]
             reason = "missing_owner_to_single_department_user"
-        elif department_id != self.config.astana_department_id:
+        elif not is_astana_department:
             regular_members = [
                 user_id
                 for user_id in members
@@ -991,15 +1016,36 @@ class LeadPipeline:
             selected = self._select_sheet_least_loaded(regular_members)
             return selected, "missing_owner_to_department_least_loaded"
         else:
-            head = self._department_heads.get(department_id)
-            if head is None:
+            heads = [
+                user_id
+                for user_id in members
+                if is_branch_head(self._assignment_users[user_id].role)
+            ]
+            if not heads:
                 raise DistributionError(
                     f"Для Астаны DepartmentID={department_id} не указан РОП в user_list"
                 )
-            selected = head
-            reason = "missing_owner_to_department_head"
+            selected = self._select_sheet_least_loaded(heads)
+            return selected, "missing_owner_to_department_head"
         self._manager_loads[selected] = self._manager_loads.get(selected, 0) + 1
         return selected, reason
+
+    def _astana_scope_users(self) -> list[int]:
+        return sorted(
+            {
+                user_id
+                for department_id in self._active_astana_scope_department_ids()
+                for user_id in self._users_by_department.get(department_id, [])
+            }
+        )
+
+    def _active_astana_scope_department_ids(self) -> list[int]:
+        child_departments = sorted(
+            department_id
+            for department_id in self._astana_sales_department_ids
+            if self._users_by_department.get(department_id)
+        )
+        return child_departments or [self.config.astana_department_id]
 
     def _select_sheet_least_loaded(self, user_ids: list[int]) -> int:
         minimum = min(self._manager_loads.get(user_id, 0) for user_id in user_ids)
