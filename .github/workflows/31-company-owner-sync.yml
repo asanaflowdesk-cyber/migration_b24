@@ -1,10 +1,10 @@
-name: 31 | Компании — ответственный по контакту руководителя
+name: 31 | Пакеты учредителей — единый ответственный
 
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "dry_run — только отчет; apply — исправить ответственных компаний"
+        description: "dry_run — только отчет; apply — синхронизировать контакты, компании и лиды"
         required: true
         default: dry_run
         type: choice
@@ -65,7 +65,7 @@ jobs:
           echo Для записи в коробку введите SYNC_COMPANY_OWNERS
           exit /b 1
 
-      - name: Сверить ответственных компаний
+      - name: Сверить ответственных пакетов учредителей
         env:
           PYTHONPATH: ${{ github.workspace }}\processes\company_owner_sync;${{ github.workspace }}\processes\eqazyna_leads
           TARGET_BITRIX_WEBHOOK_URL: ${{ secrets.TARGET_BITRIX_WEBHOOK_URL }}
