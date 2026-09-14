@@ -53,6 +53,40 @@ def test_latest_changed_contact_is_source_and_other_contact_is_synced():
     assert ("contact", 100, 18) in {(row["entity"], row["id"], row["target"]) for row in build_update_rows(packages)}
 
 
+def test_update_plan_contains_auditable_before_and_after_values():
+    packages, _ = build_packages(
+        [company(10, 9)],
+        [lead(1, 10, 8)],
+        [contact(100, "Иванов Иван Иванович", 17, 10)],
+        [requisite(10, "Иванов Иван Иванович")],
+    )
+
+    rows = build_update_rows(packages)
+
+    assert rows == [
+        {
+            "fio": "Иванов Иван Иванович",
+            "entity": "company",
+            "id": 10,
+            "title": "Компания 10",
+            "current": 9,
+            "target": 17,
+            "source_contact_id": 100,
+            "status": "planned",
+        },
+        {
+            "fio": "Иванов Иван Иванович",
+            "entity": "lead",
+            "id": 1,
+            "title": "Лид 1",
+            "current": 8,
+            "target": 17,
+            "source_contact_id": 100,
+            "status": "planned",
+        },
+    ]
+
+
 def test_fio_requires_last_and_first_name():
     assert person_from_text("Иванов") is None
 
