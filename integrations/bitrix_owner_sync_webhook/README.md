@@ -9,7 +9,7 @@ Vercel Function принимает событие `ONCRMCONTACTUPDATE` из Bitr
 - `BITRIX_WEBHOOK_KEY` — случайная секретная строка длиной не менее 32 символов.
 - `BITRIX_ALLOWED_DOMAIN` — домен портала без протокола, например `portal.bitrix24.ru`.
 - `GITHUB_REPOSITORY` — `asanaflowdesk-cyber/migration_b24`.
-- `GITHUB_DISPATCH_TOKEN` — fine-grained GitHub token с доступом Actions: write к репозиторию.
+- `GITHUB_DISPATCH_TOKEN` — fine-grained GitHub token с правом Contents: write к репозиторию.
 
 ## Адреса локального приложения Bitrix24
 
