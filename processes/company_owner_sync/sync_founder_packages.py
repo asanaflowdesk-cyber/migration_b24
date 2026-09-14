@@ -143,7 +143,13 @@ def build_packages(
         if len(keys) == 1:
             company_key[company_id] = next(iter(keys))
         elif len(keys) > 1:
-            skipped.append({"type": "company_conflicting_fio", "company_id": company_id})
+            company = company_by_id.get(company_id, {})
+            skipped.append({
+                "type": "company_conflicting_fio",
+                "company_id": company_id,
+                "company_title": str(company.get("TITLE") or "").strip(),
+                "fio": " / ".join(display_person(key) for key in sorted(keys)),
+            })
 
     leads_by_company: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for lead in leads:
@@ -190,7 +196,11 @@ def build_packages(
             "owner_id": owner_id,
             "source_contact_id": normalized_id(source.get("ID")),
             "contacts": [
-                {"id": normalized_id(item.get("ID")), "owner_id": normalized_id(item.get("ASSIGNED_BY_ID"))}
+                {
+                    "id": normalized_id(item.get("ID")),
+                    "title": display_person(key),
+                    "owner_id": normalized_id(item.get("ASSIGNED_BY_ID")),
+                }
                 for item in group_contacts
             ],
             "companies": company_nodes,
@@ -206,16 +216,29 @@ def build_update_rows(packages: Iterable[dict[str, Any]]) -> list[dict[str, Any]
     for package in packages:
         target = normalized_id(package.get("owner_id"))
         source_id = normalized_id(package.get("source_contact_id"))
+
+        def add_row(entity: str, item: dict[str, Any]) -> None:
+            rows.append({
+                "fio": package["fio"],
+                "entity": entity,
+                "id": normalized_id(item.get("id")),
+                "title": str(item.get("title") or "").strip(),
+                "current": normalized_id(item.get("owner_id")),
+                "target": target,
+                "source_contact_id": source_id,
+                "status": "planned",
+            })
+
         for contact in package.get("contacts", []):
             item_id = normalized_id(contact.get("id"))
             if item_id and item_id != source_id and normalized_id(contact.get("owner_id")) != target:
-                rows.append({"fio": package["fio"], "entity": "contact", "id": item_id, "target": target, "status": "planned"})
+                add_row("contact", contact)
         for company in package.get("companies", []):
             if normalized_id(company.get("owner_id")) != target:
-                rows.append({"fio": package["fio"], "entity": "company", "id": company["id"], "target": target, "status": "planned"})
+                add_row("company", company)
             for lead in company.get("leads", []):
                 if normalized_id(lead.get("owner_id")) != target:
-                    rows.append({"fio": package["fio"], "entity": "lead", "id": lead["id"], "target": target, "status": "planned"})
+                    add_row("lead", lead)
     return rows
 
 
@@ -237,22 +260,51 @@ def load(client: BitrixClient, method: str, select: list[str], filter_: dict[str
 def write_report(path: Path, packages: list[dict[str, Any]], rows: list[dict[str, Any]], skipped: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     book = xlsxwriter.Workbook(path)
-    ws = book.add_worksheet("Пакеты")
-    headers = ["ФИО", "Ответственный ID", "Источник контакт ID", "Компаний", "Лидов", "Изменений"]
     head = book.add_format({"bold": True, "bg_color": "#D9EAF7", "border": 1})
+    plan = book.add_worksheet("План изменений")
+    plan_headers = [
+        "ФИО пакета", "Тип карточки", "ID", "Название / ФИО",
+        "Текущий ответственный ID", "Новый ответственный ID",
+        "Источник контакт ID", "Результат", "Ошибка",
+    ]
+    for col, value in enumerate(plan_headers):
+        plan.write(0, col, value, head)
+    entity_names = {"contact": "Контакт", "company": "Компания", "lead": "Лид"}
+    status_names = {"planned": "Будет изменён", "updated": "Изменён", "error": "Ошибка"}
+    for index, row in enumerate(rows, 1):
+        plan.write_row(index, 0, [
+            row["fio"], entity_names.get(row["entity"], row["entity"]), row["id"], row.get("title", ""),
+            row.get("current", ""), row["target"], row.get("source_contact_id", ""),
+            status_names.get(row["status"], row["status"]), row.get("error", ""),
+        ])
+    plan.autofilter(0, 0, max(len(rows), 1), len(plan_headers) - 1)
+    plan.freeze_panes(1, 0)
+    plan.set_column(0, 0, 36); plan.set_column(1, 2, 18); plan.set_column(3, 3, 45)
+    plan.set_column(4, 8, 24)
+
+    ws = book.add_worksheet("Пакеты")
+    headers = ["ФИО", "Ответственный ID", "Источник контакт ID", "Контактов", "Компаний", "Лидов", "Изменений"]
     for col, value in enumerate(headers):
         ws.write(0, col, value, head)
     changes_by_fio: dict[str, int] = defaultdict(int)
     for row in rows:
         changes_by_fio[row["fio"]] += 1
     for index, package in enumerate(packages, 1):
-        ws.write_row(index, 0, [package["fio"], package["owner_id"], package["source_contact_id"], len(package["companies"]), sum(len(c["leads"]) for c in package["companies"]), changes_by_fio[package["fio"]]])
-    ws.set_column(0, 0, 36); ws.set_column(1, 5, 20); ws.freeze_panes(1, 0)
+        ws.write_row(index, 0, [package["fio"], package["owner_id"], package["source_contact_id"], len(package["contacts"]), len(package["companies"]), sum(len(c["leads"]) for c in package["companies"]), changes_by_fio[package["fio"]]])
+    ws.autofilter(0, 0, max(len(packages), 1), len(headers) - 1)
+    ws.set_column(0, 0, 36); ws.set_column(1, 6, 20); ws.freeze_panes(1, 0)
     sk = book.add_worksheet("Пропуски")
-    sk.write_row(0, 0, ["Причина", "ФИО", "Компания ID"], head)
+    sk.write_row(0, 0, ["Причина", "ФИО / варианты ФИО", "Компания ID", "Компания"], head)
+    reason_names = {
+        "company_conflicting_fio": "У компании обнаружены разные ФИО руководителя",
+        "company_without_founder_contact": "Не найден контакт руководителя / учредителя",
+        "founder_without_owner": "У контакта нет ответственного",
+        "missing_patronymic_is_ambiguous": "Нет отчества, а ФИО неоднозначно",
+    }
     for index, item in enumerate(skipped, 1):
-        sk.write_row(index, 0, [item.get("type", ""), item.get("fio", ""), item.get("company_id", "")])
-    sk.set_column(0, 0, 38); sk.set_column(1, 1, 36); sk.set_column(2, 2, 18)
+        sk.write_row(index, 0, [reason_names.get(item.get("type", ""), item.get("type", "")), item.get("fio", ""), item.get("company_id", ""), item.get("company_title", "")])
+    sk.autofilter(0, 0, max(len(skipped), 1), 3)
+    sk.set_column(0, 0, 48); sk.set_column(1, 1, 48); sk.set_column(2, 2, 18); sk.set_column(3, 3, 45)
     book.close()
 
 
@@ -272,6 +324,9 @@ def run(client: BitrixClient, output_dir: Path, apply: bool) -> dict[str, int]:
         "companies": sum(len(item["companies"]) for item in packages),
         "leads": sum(len(company["leads"]) for item in packages for company in item["companies"]),
         "planned": len(rows),
+        "planned_contacts": sum(row["entity"] == "contact" for row in rows),
+        "planned_companies": sum(row["entity"] == "company" for row in rows),
+        "planned_leads": sum(row["entity"] == "lead" for row in rows),
         "updated": sum(row["status"] == "updated" for row in rows),
         "errors": sum(row["status"] == "error" for row in rows),
         "skipped": len(skipped),
