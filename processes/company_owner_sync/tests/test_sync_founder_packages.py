@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from sync_founder_packages import build_packages, build_update_rows, person_from_text
 
 
@@ -53,3 +55,11 @@ def test_latest_changed_contact_is_source_and_other_contact_is_synced():
 
 def test_fio_requires_last_and_first_name():
     assert person_from_text("Иванов") is None
+
+
+def test_workflow_runs_founder_package_module_only():
+    workflow = (
+        Path(__file__).resolve().parents[3] / ".github" / "workflows" / "31-company-owner-sync.yml"
+    ).read_text(encoding="utf-8")
+    assert "sync_founder_packages.py" in workflow
+    assert "sync_company_owners.py" not in workflow
