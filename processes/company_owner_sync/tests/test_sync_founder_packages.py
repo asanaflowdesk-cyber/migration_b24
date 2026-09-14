@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from sync_founder_packages import build_packages, build_update_rows, person_from_text
+from sync_founder_packages import (\n    build_packages,\n    build_update_rows,\n    person_from_text,\n    select_source_package,\n)
 
 
 def contact(item_id, fio, owner, company_id="", modified="2026-01-01"):

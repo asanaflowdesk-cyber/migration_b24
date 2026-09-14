@@ -1,0 +1,100 @@
+name: 31A | Автосинхронизация пакета учредителя
+
+on:
+  repository_dispatch:
+    types: [founder_owner_changed]
+  workflow_dispatch:
+    inputs:
+      contact_id:
+        description: "ID контакта-учредителя/руководителя"
+        required: true
+        type: string
+      mode:
+        description: "Режим запуска"
+        required: true
+        default: dry_run
+        type: choice
+        options:
+          - dry_run
+          - apply
+      confirm:
+        description: "Для apply введите SYNC_FOUNDER_PACKAGE"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: company-owner-director-contact-sync
+  cancel-in-progress: false
+
+env:
+  SOURCE_CONTACT_ID: ${{ github.event.client_payload.contact_id || inputs.contact_id }}
+
+jobs:
+  sync:
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate contact ID
+        shell: powershell
+        run: |
+          if ($env:SOURCE_CONTACT_ID -notmatch '^[1-9][0-9]*$') {
+            throw "Некорректный contact_id"
+          }
+
+      - name: Prepare Python
+        shell: powershell
+        run: |
+          py -3 -m venv .venv
+          .\.venv\Scripts\python.exe -m pip install --upgrade pip
+          .\.venv\Scripts\python.exe -m pip install -r requirements.txt pytest
+
+      - name: Tests
+        shell: powershell
+        run: .\.venv\Scripts\python.exe -m pytest processes/company_owner_sync/tests -q
+
+      - name: Resolve mode
+        id: mode
+        shell: powershell
+        run: |
+          if ('${{ github.event_name }}' -eq 'repository_dispatch') {
+            "apply=true" >> $env:GITHUB_OUTPUT
+            exit 0
+          }
+          if ('${{ inputs.mode }}' -eq 'apply') {
+            if ('${{ inputs.confirm }}' -ne 'SYNC_FOUNDER_PACKAGE') {
+              throw "Для применения введите SYNC_FOUNDER_PACKAGE"
+            }
+            "apply=true" >> $env:GITHUB_OUTPUT
+          } else {
+            "apply=false" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Synchronize founder package
+        shell: powershell
+        env:
+          B24_WEBHOOK: ${{ secrets.B24_WEBHOOK }}
+        run: |
+          $args = @(
+            "processes/company_owner_sync/sync_founder_packages.py",
+            "--output-dir", "output_event"
+          )
+          if ('${{ steps.mode.outputs.apply }}' -eq 'true') {
+            $args += "--apply"
+          }
+          .\.venv\Scripts\python.exe @args
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: 31A-founder-package-${{ env.SOURCE_CONTACT_ID }}-${{ github.run_id }}
+          path: output_event/
+          if-no-files-found: warn
+          retention-days: 30

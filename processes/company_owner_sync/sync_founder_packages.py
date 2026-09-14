@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -109,6 +110,7 @@ def build_packages(
     leads: Iterable[dict[str, Any]],
     contacts: Iterable[dict[str, Any]],
     requisites: Iterable[dict[str, Any]],
+    source_contact_id: int | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     companies = list(companies)
     leads = list(leads)
@@ -168,11 +170,23 @@ def build_packages(
         if not group_contacts:
             skipped.append({"type": "company_without_founder_contact", "fio": display_person(key)})
             continue
+        forced_source = next(
+            (
+                item
+                for item in group_contacts
+                if source_contact_id
+                and normalized_id(item.get("ID")) == source_contact_id
+            ),
+            None,
+        )
         owned_contacts = [item for item in group_contacts if normalized_id(item.get("ASSIGNED_BY_ID"))]
         if not owned_contacts:
             skipped.append({"type": "founder_without_owner", "fio": display_person(key)})
             continue
-        source = max(owned_contacts, key=modified_key)
+        if forced_source is not None and not normalized_id(forced_source.get("ASSIGNED_BY_ID")):
+            skipped.append({"type": "founder_without_owner", "fio": display_person(key)})
+            continue
+        source = forced_source or max(owned_contacts, key=modified_key)
         owner_id = normalized_id(source.get("ASSIGNED_BY_ID"))
         company_nodes = []
         for company_id in sorted(set(companies_by_key.get(key, []))):
@@ -209,6 +223,19 @@ def build_packages(
     for base in sorted(ambiguous_bases):
         skipped.append({"type": "missing_patronymic_is_ambiguous", "fio": display_person((*base, ""))})
     return packages, skipped
+
+
+def select_source_package(
+    packages: Iterable[dict[str, Any]],
+    source_contact_id: int,
+) -> dict[str, Any] | None:
+    for package in packages:
+        if any(
+            normalized_id(contact.get("id")) == source_contact_id
+            for contact in package.get("contacts", [])
+        ):
+            return package
+    return None
 
 
 def build_update_rows(packages: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -308,18 +335,96 @@ def write_report(path: Path, packages: list[dict[str, Any]], rows: list[dict[str
     book.close()
 
 
-def run(client: BitrixClient, output_dir: Path, apply: bool) -> dict[str, int]:
+def write_summary(output_dir: Path, summary: dict[str, Any]) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "company_owner_sync_summary.json").write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    print(json.dumps(summary, ensure_ascii=False))
+
+
+def run(
+    client: BitrixClient,
+    output_dir: Path,
+    apply: bool,
+    source_contact_id: int | None = None,
+) -> dict[str, Any]:
+    if source_contact_id:
+        source_contacts = load(
+            client,
+            "crm.contact.list",
+            [
+                "ID", "LAST_NAME", "NAME", "SECOND_NAME", "POST",
+                "COMPANY_ID", "ASSIGNED_BY_ID", "COMMENTS", "DATE_MODIFY",
+            ],
+            {"ID": source_contact_id},
+        )
+        source_contact = source_contacts[0] if source_contacts else None
+        if not source_contact:
+            summary = {
+                "source_contact_id": source_contact_id,
+                "ignored": 0,
+                "errors": 1,
+                "reason": "source_contact_not_found",
+            }
+            write_summary(output_dir, summary)
+            return summary
+        if not is_founder_contact(source_contact):
+            summary = {
+                "source_contact_id": source_contact_id,
+                "ignored": 1,
+                "errors": 0,
+                "reason": "not_founder_or_director",
+            }
+            write_summary(output_dir, summary)
+            return summary
+        if not normalized_id(source_contact.get("ASSIGNED_BY_ID")):
+            summary = {
+                "source_contact_id": source_contact_id,
+                "ignored": 0,
+                "errors": 1,
+                "reason": "source_contact_without_owner",
+            }
+            write_summary(output_dir, summary)
+            return summary
+
     companies = load(client, "crm.company.list", ["ID", "TITLE", "ASSIGNED_BY_ID"])
     leads = load(client, "crm.lead.list", ["ID", "TITLE", "COMPANY_ID", "CONTACT_ID", "ASSIGNED_BY_ID"])
     contacts = load(client, "crm.contact.list", ["ID", "LAST_NAME", "NAME", "SECOND_NAME", "POST", "COMPANY_ID", "ASSIGNED_BY_ID", "COMMENTS", "DATE_MODIFY"])
     requisites = load(client, "crm.requisite.list", ["ID", "ENTITY_ID", "ENTITY_TYPE_ID", "RQ_DIRECTOR"], {"ENTITY_TYPE_ID": 4})
-    packages, skipped = build_packages(companies, leads, contacts, requisites)
+    packages, skipped = build_packages(
+        companies,
+        leads,
+        contacts,
+        requisites,
+        source_contact_id=source_contact_id,
+    )
+    if source_contact_id:
+        source_package = select_source_package(packages, source_contact_id)
+        if source_package is None:
+            summary = {
+                "source_contact_id": source_contact_id,
+                "ignored": 0,
+                "errors": 1,
+                "reason": "source_contact_package_not_resolved",
+            }
+            write_summary(output_dir, summary)
+            return summary
+        packages = [source_package]
+        package_fio = str(source_package["fio"]).casefold()
+        skipped = [
+            item
+            for item in skipped
+            if package_fio in str(item.get("fio") or "").casefold()
+        ]
     rows = build_update_rows(packages)
     if apply:
         apply_updates(client, rows)
     output_dir.mkdir(parents=True, exist_ok=True)
     write_report(output_dir / "founder_package_owner_sync.xlsx", packages, rows, skipped)
     summary = {
+        "source_contact_id": source_contact_id or 0,
         "packages": len(packages),
         "companies": sum(len(item["companies"]) for item in packages),
         "leads": sum(len(company["leads"]) for item in packages for company in item["companies"]),
@@ -331,8 +436,7 @@ def run(client: BitrixClient, output_dir: Path, apply: bool) -> dict[str, int]:
         "errors": sum(row["status"] == "error" for row in rows),
         "skipped": len(skipped),
     }
-    (output_dir / "company_owner_sync_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(json.dumps(summary, ensure_ascii=False))
+    write_summary(output_dir, summary)
     return summary
 
 
@@ -340,6 +444,15 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Synchronize a founder's contacts, companies and leads to one owner")
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--output-dir", default="output")
+    source_from_env = str(os.getenv("SOURCE_CONTACT_ID") or "").strip()
+    if source_from_env and normalized_id(source_from_env) is None:
+        parser.error("SOURCE_CONTACT_ID must be a positive integer")
+    parser.add_argument(
+        "--source-contact-id",
+        type=int,
+        default=normalized_id(source_from_env),
+        help="Use this exact founder/director contact as the package owner source",
+    )
     args = parser.parse_args()
     settings = Settings.from_env()
     summary = run(
@@ -351,6 +464,7 @@ def main() -> int:
         ),
         Path(args.output_dir),
         args.apply,
+        source_contact_id=args.source_contact_id,
     )
     return 1 if summary["errors"] else 0
 
