@@ -271,13 +271,39 @@ def build_update_rows(packages: Iterable[dict[str, Any]]) -> list[dict[str, Any]
 
 def apply_updates(client: BitrixClient, rows: list[dict[str, Any]]) -> None:
     methods = {"contact": client.update_contact, "company": client.update_company, "lead": client.update_lead}
+    blocked: set[int] = set()
     for row in rows:
         try:
+            source_id = row["source_contact_id"]
+            if source_id in blocked:
+                raise RuntimeError("package_stopped_after_error; rerun with fresh CRM data")
+            source = client.call("crm.contact.get", {"id": source_id})
+            if not isinstance(source, dict) or not is_founder_contact(source):
+                raise RuntimeError("source_missing_or_no_longer_founder")
+            if normalized_id(source.get("ASSIGNED_BY_ID")) != row["target"]:
+                raise RuntimeError("source_owner_changed; rerun with fresh CRM data")
+            current = client.call(f"crm.{row['entity']}.get", {"id": row["id"]})
+            if not isinstance(current, dict):
+                raise RuntimeError("target_not_found")
+            current_owner = normalized_id(current.get("ASSIGNED_BY_ID"))
+            if current_owner == row["target"]:
+                row["status"] = "already_correct"
+                continue
+            if current_owner != row["current"]:
+                raise RuntimeError("target_owner_changed_since_plan; refusing to overwrite")
             methods[row["entity"]](str(row["id"]), {"ASSIGNED_BY_ID": row["target"]})
+            actual = client.call(f"crm.{row['entity']}.get", {"id": row["id"]})
+            if not isinstance(actual, dict) or normalized_id(actual.get("ASSIGNED_BY_ID")) != row["target"]:
+                raise RuntimeError("write_verification_failed")
+            source = client.call("crm.contact.get", {"id": source_id})
+            if not isinstance(source, dict) or normalized_id(source.get("ASSIGNED_BY_ID")) != row["target"]:
+                raise RuntimeError("source_owner_changed_during_write; rerun required")
             row["status"] = "updated"
         except Exception as exc:  # noqa: BLE001
+            blocked.add(row["source_contact_id"])
             row["status"] = "error"
-            row["error"] = str(exc)
+            # Do not persist exceptions from HTTP clients: they may contain webhook credentials.
+            row["error"] = str(exc) if type(exc) is RuntimeError else type(exc).__name__
 
 
 def load(client: BitrixClient, method: str, select: list[str], filter_: dict[str, Any] | None = None) -> list[dict[str, Any]]:
@@ -418,6 +444,19 @@ def run(
             for item in skipped
             if package_fio in str(item.get("fio") or "").casefold()
         ]
+    # The full scan can take minutes. Refresh the source after it, before planning.
+    for package in packages:
+        source = client.call("crm.contact.get", {"id": package["source_contact_id"]})
+        if not isinstance(source, dict) or not is_founder_contact(source) or not normalized_id(source.get("ASSIGNED_BY_ID")):
+            summary = {"errors": 1, "reason": "source_invalid_after_scan", "source_contact_id": package["source_contact_id"]}
+            write_summary(output_dir, summary)
+            return summary
+        package["owner_id"] = normalized_id(source["ASSIGNED_BY_ID"])
+        original = next(item for item in contacts if normalized_id(item.get("ID")) == package["source_contact_id"])
+        if any(source.get(field) != original.get(field) for field in ("LAST_NAME", "NAME", "SECOND_NAME", "COMPANY_ID")):
+            summary = {"errors": 1, "reason": "source_identity_changed_after_scan", "source_contact_id": package["source_contact_id"]}
+            write_summary(output_dir, summary)
+            return summary
     rows = build_update_rows(packages)
     if apply:
         apply_updates(client, rows)
@@ -433,6 +472,7 @@ def run(
         "planned_companies": sum(row["entity"] == "company" for row in rows),
         "planned_leads": sum(row["entity"] == "lead" for row in rows),
         "updated": sum(row["status"] == "updated" for row in rows),
+        "already_correct": sum(row["status"] == "already_correct" for row in rows),
         "errors": sum(row["status"] == "error" for row in rows),
         "skipped": len(skipped),
     }
@@ -454,6 +494,10 @@ def main() -> int:
         help="Use this exact founder/director contact as the package owner source",
     )
     args = parser.parse_args()
+    if args.source_contact_id is not None and args.source_contact_id <= 0:
+        parser.error("source-contact-id must be positive")
+    if os.getenv("GITHUB_EVENT_NAME") == "repository_dispatch" and not args.source_contact_id:
+        parser.error("repository_dispatch requires SOURCE_CONTACT_ID; full sync forbidden")
     settings = Settings.from_env()
     summary = run(
         BitrixClient(
