@@ -13,7 +13,14 @@ import requests
 
 from eqazyna_bitrix.bitrix_client import BitrixClient
 from eqazyna_bitrix.settings import Settings
-from sync_founder_packages import build_packages, load_snapshot, normalized_id, run, select_source_package
+from sync_founder_packages import (
+    build_packages,
+    is_founder_contact,
+    load_snapshot,
+    normalized_id,
+    run,
+    select_source_package,
+)
 
 
 def queue_call(url: str, key: str, action: str, **payload: Any) -> dict[str, Any]:
@@ -46,12 +53,25 @@ def process_claim(
     packages, _ = build_packages(
         snapshot["companies"], snapshot["leads"], snapshot["contacts"], snapshot["requisites"]
     )
+    contacts_by_id = {
+        contact_id: contact
+        for contact in snapshot["contacts"]
+        if (contact_id := normalized_id(contact.get("ID"))) is not None
+    }
     ids_by_fio: dict[str, list[int]] = defaultdict(list)
     unresolved: set[int] = set()
+    ignored: set[int] = set()
+    missing: set[int] = set()
     for contact_id in ids:
         package = select_source_package(packages, contact_id)
         if package is None:
-            unresolved.add(contact_id)
+            contact = contacts_by_id.get(contact_id)
+            if contact is None:
+                missing.add(contact_id)
+            elif not is_founder_contact(contact):
+                ignored.add(contact_id)
+            else:
+                unresolved.add(contact_id)
         else:
             ids_by_fio[str(package["fio"])].append(contact_id)
     conflicting = {contact_id for group in ids_by_fio.values() if len(group) > 1 for contact_id in group}
@@ -59,10 +79,18 @@ def process_claim(
     results: list[dict[str, Any]] = []
     failures = 0
     for item, contact_id in zip(items, ids):
-        if contact_id in unresolved:
+        if contact_id in ignored:
+            summary = {"errors": 0, "reason": "not_founder_or_director"}
+            outcome = "ignored"
+        elif contact_id in missing:
+            summary = {"errors": 1, "reason": "source_contact_not_found"}
+            outcome = "failed"
+        elif contact_id in unresolved:
             summary = {"errors": 1, "reason": "source_contact_package_not_resolved"}
+            outcome = "failed"
         elif contact_id in conflicting:
             summary = {"errors": 1, "reason": "multiple_contacts_for_same_package"}
+            outcome = "failed"
         else:
             summary = run(
                 client,
@@ -71,6 +99,7 @@ def process_claim(
                 source_contact_ids=[contact_id],
                 snapshot=snapshot,
             )
+            outcome = "processed" if int(summary.get("errors") or 0) == 0 else "failed"
         success = int(summary.get("errors") or 0) == 0
         failures += not success
         results.append({
@@ -78,13 +107,14 @@ def process_claim(
             "version": int(item["version"]),
             "success": success,
             "error": "" if success else reason(summary),
+            "outcome": outcome,
         })
     return results, failures
 
 
 def process_queue(client: BitrixClient, queue_url: str, queue_key: str, output_dir: Path, max_batches: int) -> dict[str, Any]:
     worker_id = f"{os.getenv('GITHUB_RUN_ID', 'local')}-{uuid.uuid4().hex[:12]}"
-    total_items = total_failures = batches = 0
+    total_items = total_processed = total_ignored = total_failures = batches = 0
     for _ in range(max_batches):
         claim = queue_call(queue_url, queue_key, "claim", worker_id=worker_id, limit=500)
         items = claim.get("items") or []
@@ -101,9 +131,17 @@ def process_queue(client: BitrixClient, queue_url: str, queue_key: str, output_d
             failures = len(results)
         queue_call(queue_url, queue_key, "complete", claim_id=claim["claim_id"], results=results)
         total_items += len(results)
+        total_processed += sum(item.get("outcome") == "processed" for item in results)
+        total_ignored += sum(item.get("outcome") == "ignored" for item in results)
         total_failures += failures
 
-    summary = {"batches": batches, "items": total_items, "failures": total_failures}
+    summary = {
+        "batches": batches,
+        "items": total_items,
+        "processed": total_processed,
+        "ignored": total_ignored,
+        "failures": total_failures,
+    }
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "queue_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(summary, ensure_ascii=False))
