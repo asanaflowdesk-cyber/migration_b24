@@ -14,9 +14,7 @@ on:
         required: true
         default: dry_run
         type: choice
-        options:
-          - dry_run
-          - apply
+        options: [dry_run, apply]
       confirm:
         description: "Для apply введите SYNC_FOUNDER_PACKAGE"
         required: false
@@ -30,36 +28,52 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  NODE_USE_SYSTEM_CA: "1"
+  NODE_OPTIONS: "--use-system-ca"
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: "utf-8"
   SOURCE_CONTACT_ID: ${{ github.event.client_payload.contact_id || inputs.contact_id }}
 
 jobs:
   sync:
     runs-on: [self-hosted, Windows, X64]
     timeout-minutes: 60
+    defaults:
+      run:
+        shell: cmd
+        working-directory: processes/company_owner_sync
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Получить код репозитория
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
 
-      - name: Validate contact ID
+      - name: Проверить ID контакта
         shell: powershell
         run: |
           if ($env:SOURCE_CONTACT_ID -notmatch '^[1-9][0-9]*$') {
             throw "Некорректный contact_id"
           }
 
-      - name: Prepare Python
-        shell: powershell
+      - name: Найти Python и создать локальное окружение
+        run: call ..\..\scripts\prepare-python.cmd
+
+      - name: Установить зависимости
+        env:
+          CUSTOM_PIP_INDEX_URL: ${{ vars.PIP_INDEX_URL }}
         run: |
-          py -3 -m venv .venv
-          .\.venv\Scripts\python.exe -m pip install --upgrade pip
-          .\.venv\Scripts\python.exe -m pip install -r requirements.txt pytest
+          if not "%CUSTOM_PIP_INDEX_URL%"=="" set "PIP_INDEX_URL=%CUSTOM_PIP_INDEX_URL%"
+          ".venv\Scripts\python.exe" -m pip install -r requirements.txt
 
-      - name: Tests
-        shell: powershell
-        run: .\.venv\Scripts\python.exe -m pytest processes/company_owner_sync/tests -q
+      - name: Проверить код
+        env:
+          PYTHONPATH: ${{ github.workspace }}\processes\company_owner_sync;${{ github.workspace }}\processes\eqazyna_leads
+        run: |
+          chcp 65001 >nul
+          ".venv\Scripts\python.exe" -m pytest -q tests
+          if errorlevel 1 exit /b 1
+          ".venv\Scripts\python.exe" sync_founder_packages.py --help >nul
 
-      - name: Resolve mode
+      - name: Определить режим
         id: mode
         shell: powershell
         run: |
@@ -76,25 +90,34 @@ jobs:
             "apply=false" >> $env:GITHUB_OUTPUT
           }
 
-      - name: Synchronize founder package
-        shell: powershell
+      - name: Синхронизировать пакет учредителя
         env:
-          B24_WEBHOOK: ${{ secrets.B24_WEBHOOK }}
+          PYTHONPATH: ${{ github.workspace }}\processes\company_owner_sync;${{ github.workspace }}\processes\eqazyna_leads
+          TARGET_BITRIX_WEBHOOK_URL: ${{ secrets.TARGET_BITRIX_WEBHOOK_URL }}
+          BITRIX_VERIFY_SSL: ${{ vars.BITRIX_VERIFY_SSL || 'true' }}
+          BITRIX_CA_BUNDLE: ${{ vars.BITRIX_CA_BUNDLE }}
+          BITRIX_REQUEST_TIMEOUT: ${{ vars.BITRIX_REQUEST_TIMEOUT || '45' }}
         run: |
-          $args = @(
-            "processes/company_owner_sync/sync_founder_packages.py",
-            "--output-dir", "output_event"
+          chcp 65001 >nul
+          if "%TARGET_BITRIX_WEBHOOK_URL%"=="" (
+            echo Не задан secret TARGET_BITRIX_WEBHOOK_URL
+            exit /b 1
           )
-          if ('${{ steps.mode.outputs.apply }}' -eq 'true') {
-            $args += "--apply"
-          }
-          .\.venv\Scripts\python.exe @args
+          if not exist output_event mkdir output_event
+          if "${{ steps.mode.outputs.apply }}"=="true" (
+            ".venv\Scripts\python.exe" -u sync_founder_packages.py --apply --output-dir output_event
+          ) else (
+            ".venv\Scripts\python.exe" -u sync_founder_packages.py --output-dir output_event
+          )
+          if errorlevel 1 exit /b 1
+          type output_event\company_owner_sync_summary.json
+          dir output_event
 
-      - name: Upload report
-        if: always()
-        uses: actions/upload-artifact@v4
+      - name: Загрузить отчет
+        if: ${{ always() }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: 31A-founder-package-${{ env.SOURCE_CONTACT_ID }}-${{ github.run_id }}
-          path: output_event/
+          path: processes/company_owner_sync/output_event/
           if-no-files-found: warn
           retention-days: 30
