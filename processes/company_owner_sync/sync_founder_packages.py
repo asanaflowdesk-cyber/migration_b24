@@ -270,6 +270,8 @@ def build_update_rows(packages: Iterable[dict[str, Any]]) -> list[dict[str, Any]
 
 
 def apply_updates(client: BitrixClient, rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        return
     methods = {"contact": client.update_contact, "company": client.update_company, "lead": client.update_lead}
     blocked: set[int] = set()
     for row in rows:
@@ -308,6 +310,15 @@ def apply_updates(client: BitrixClient, rows: list[dict[str, Any]]) -> None:
 
 def load(client: BitrixClient, method: str, select: list[str], filter_: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     return client.list_all(method, {"order": {"ID": "ASC"}, "filter": filter_ or {}, "select": select})
+
+
+def load_snapshot(client: BitrixClient) -> dict[str, list[dict[str, Any]]]:
+    return {
+        "companies": load(client, "crm.company.list", ["ID", "TITLE", "ASSIGNED_BY_ID"]),
+        "leads": load(client, "crm.lead.list", ["ID", "TITLE", "COMPANY_ID", "CONTACT_ID", "ASSIGNED_BY_ID"]),
+        "contacts": load(client, "crm.contact.list", ["ID", "LAST_NAME", "NAME", "SECOND_NAME", "POST", "COMPANY_ID", "ASSIGNED_BY_ID", "COMMENTS", "DATE_MODIFY"]),
+        "requisites": load(client, "crm.requisite.list", ["ID", "ENTITY_ID", "ENTITY_TYPE_ID", "RQ_DIRECTOR"], {"ENTITY_TYPE_ID": 4}),
+    }
 
 
 def write_report(path: Path, packages: list[dict[str, Any]], rows: list[dict[str, Any]], skipped: list[dict[str, Any]]) -> None:
@@ -376,6 +387,7 @@ def run(
     apply: bool,
     source_contact_id: int | None = None,
     source_contact_ids: list[int] | None = None,
+    snapshot: dict[str, list[dict[str, Any]]] | None = None,
 ) -> dict[str, Any]:
     if source_contact_id:
         source_contacts = load(
@@ -416,10 +428,11 @@ def run(
             write_summary(output_dir, summary)
             return summary
 
-    companies = load(client, "crm.company.list", ["ID", "TITLE", "ASSIGNED_BY_ID"])
-    leads = load(client, "crm.lead.list", ["ID", "TITLE", "COMPANY_ID", "CONTACT_ID", "ASSIGNED_BY_ID"])
-    contacts = load(client, "crm.contact.list", ["ID", "LAST_NAME", "NAME", "SECOND_NAME", "POST", "COMPANY_ID", "ASSIGNED_BY_ID", "COMMENTS", "DATE_MODIFY"])
-    requisites = load(client, "crm.requisite.list", ["ID", "ENTITY_ID", "ENTITY_TYPE_ID", "RQ_DIRECTOR"], {"ENTITY_TYPE_ID": 4})
+    snapshot = snapshot or load_snapshot(client)
+    companies = snapshot["companies"]
+    leads = snapshot["leads"]
+    contacts = snapshot["contacts"]
+    requisites = snapshot["requisites"]
     packages, skipped = build_packages(
         companies,
         leads,
