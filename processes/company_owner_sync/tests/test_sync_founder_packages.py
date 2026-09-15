@@ -1,6 +1,11 @@
 from pathlib import Path
 
-from sync_founder_packages import (\n    build_packages,\n    build_update_rows,\n    person_from_text,\n    select_source_package,\n)
+from sync_founder_packages import (
+    build_packages,
+    build_update_rows,
+    person_from_text,
+    select_source_package,
+)
 
 
 def contact(item_id, fio, owner, company_id="", modified="2026-01-01"):
@@ -51,6 +56,32 @@ def test_latest_changed_contact_is_source_and_other_contact_is_synced():
     packages, _ = build_packages([company(10, 9), company(20, 8)], [], [contact(100, "Иванов Иван Иванович", 17, 10, "2026-01-01"), contact(200, "Иванов Иван Иванович", 18, 20, "2026-02-01")], [requisite(10, "Иванов Иван Иванович"), requisite(20, "Иванов Иван Иванович")])
     assert packages[0]["owner_id"] == 18
     assert ("contact", 100, 18) in {(row["entity"], row["id"], row["target"]) for row in build_update_rows(packages)}
+
+
+def test_event_contact_is_source_even_when_another_duplicate_is_newer():
+    packages, _ = build_packages(
+        [company(10, 9), company(20, 8)],
+        [],
+        [
+            contact(100, "Иванов Иван Иванович", 17, 10, "2026-01-01"),
+            contact(200, "Иванов Иван Иванович", 18, 20, "2026-02-01"),
+        ],
+        [
+            requisite(10, "Иванов Иван Иванович"),
+            requisite(20, "Иванов Иван Иванович"),
+        ],
+        source_contact_id=100,
+    )
+
+    package = select_source_package(packages, 100)
+
+    assert package is not None
+    assert package["owner_id"] == 17
+    assert package["source_contact_id"] == 100
+    assert ("contact", 200, 17) in {
+        (row["entity"], row["id"], row["target"])
+        for row in build_update_rows([package])
+    }
 
 
 def test_update_plan_contains_auditable_before_and_after_values():
