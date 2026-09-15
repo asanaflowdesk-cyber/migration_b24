@@ -24,7 +24,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: founder-package-${{ github.event.client_payload.contact_id || inputs.contact_id || github.run_id }}
+  group: founder-package-owner-writes
+  queue: max
   cancel-in-progress: false
 
 env:
@@ -68,7 +69,6 @@ jobs:
           "%GITHUB_WORKSPACE%\..\_venvs\company_owner_sync-%RUNNER_NAME%\Scripts\python.exe" -m pip install --disable-pip-version-check -r requirements.txt
 
       - name: Проверить код
-        if: ${{ github.event_name == 'workflow_dispatch' }}
         env:
           PYTHONPATH: ${{ github.workspace }}\processes\company_owner_sync;${{ github.workspace }}\processes\eqazyna_leads
         run: |
