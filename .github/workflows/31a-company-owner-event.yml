@@ -1,22 +1,10 @@
-name: 31A | Выбранные пакеты — массовый перенос
+name: 31A | Автоперенос очереди пакетов учредителей
 
 on:
-  workflow_dispatch:
-    inputs:
-      contact_ids:
-        description: "ID контактов через запятую, пробел или точку с запятой"
-        required: true
-        type: string
-      mode:
-        description: "Режим запуска"
-        required: true
-        default: dry_run
-        type: choice
-        options: [dry_run, apply]
-      confirm:
-        description: "Для apply введите SYNC_FOUNDER_PACKAGE"
-        required: false
-        type: string
+  repository_dispatch:
+    types: [founder_batch_ready]
+  schedule:
+    - cron: "*/10 * * * *"
 
 permissions:
   contents: read
@@ -32,12 +20,11 @@ env:
   PYTHONUTF8: "1"
   PYTHONIOENCODING: "utf-8"
   PYTHON_EXE: C:\Users\Alyona.Sachyova\AppData\Local\Programs\Python\Python312\python.exe
-  SOURCE_CONTACT_IDS: ${{ inputs.contact_ids }}
 
 jobs:
   sync:
     runs-on: [self-hosted, Windows, X64]
-    timeout-minutes: 60
+    timeout-minutes: 90
     defaults:
       run:
         shell: cmd
@@ -66,46 +53,38 @@ jobs:
           if not "%CUSTOM_PIP_INDEX_URL%"=="" set "PIP_INDEX_URL=%CUSTOM_PIP_INDEX_URL%"
           "%GITHUB_WORKSPACE%\..\_venvs\company_owner_sync-%RUNNER_NAME%\Scripts\python.exe" -m pip install --disable-pip-version-check -r requirements.txt
 
-      - name: Проверить код
+      - name: Проверить точку запуска
         env:
           PYTHONPATH: ${{ github.workspace }}\processes\company_owner_sync;${{ github.workspace }}\processes\eqazyna_leads
         run: |
           chcp 65001 >nul
-          "%GITHUB_WORKSPACE%\..\_venvs\company_owner_sync-%RUNNER_NAME%\Scripts\python.exe" -m pytest -q tests
+          "%GITHUB_WORKSPACE%\..\_venvs\company_owner_sync-%RUNNER_NAME%\Scripts\python.exe" queue_founder_packages.py --help >nul
           if errorlevel 1 exit /b 1
-          "%GITHUB_WORKSPACE%\..\_venvs\company_owner_sync-%RUNNER_NAME%\Scripts\python.exe" sync_founder_packages.py --help >nul
 
-      - name: Проверить подтверждение ручного apply
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'apply' && inputs.confirm != 'SYNC_FOUNDER_PACKAGE' }}
-        run: |
-          echo Для применения введите SYNC_FOUNDER_PACKAGE
-          exit /b 1
-
-      - name: Синхронизировать пакет учредителя
+      - name: Обработать накопленные пакеты одним потоком
         env:
           PYTHONPATH: ${{ github.workspace }}\processes\company_owner_sync;${{ github.workspace }}\processes\eqazyna_leads
           TARGET_BITRIX_WEBHOOK_URL: ${{ secrets.TARGET_BITRIX_WEBHOOK_URL }}
+          GOOGLE_QUEUE_URL: ${{ secrets.GOOGLE_QUEUE_URL }}
+          GOOGLE_QUEUE_KEY: ${{ secrets.GOOGLE_QUEUE_KEY }}
           BITRIX_VERIFY_SSL: ${{ vars.BITRIX_VERIFY_SSL || 'true' }}
           BITRIX_CA_BUNDLE: ${{ vars.BITRIX_CA_BUNDLE }}
           BITRIX_REQUEST_TIMEOUT: ${{ vars.BITRIX_REQUEST_TIMEOUT || '45' }}
-          APPLY_FLAG: ${{ (inputs.mode == 'apply') && '--apply' || '' }}
         run: |
           chcp 65001 >nul
-          if "%TARGET_BITRIX_WEBHOOK_URL%"=="" (
-            echo Не задан secret TARGET_BITRIX_WEBHOOK_URL
-            exit /b 1
-          )
+          if "%TARGET_BITRIX_WEBHOOK_URL%"=="" exit /b 1
+          if "%GOOGLE_QUEUE_URL%"=="" exit /b 1
+          if "%GOOGLE_QUEUE_KEY%"=="" exit /b 1
           if not exist output_event mkdir output_event
-          "%GITHUB_WORKSPACE%\..\_venvs\company_owner_sync-%RUNNER_NAME%\Scripts\python.exe" -u sync_founder_packages.py --batch %APPLY_FLAG% --output-dir output_event
+          "%GITHUB_WORKSPACE%\..\_venvs\company_owner_sync-%RUNNER_NAME%\Scripts\python.exe" -u queue_founder_packages.py --output-dir output_event
           if errorlevel 1 exit /b 1
-          type output_event\company_owner_sync_summary.json
-          dir output_event
+          type output_event\queue_summary.json
 
       - name: Загрузить отчет
         if: ${{ always() }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
-          name: 31A-selected-packages-${{ github.run_id }}
+          name: 31A-founder-queue-${{ github.run_id }}
           path: processes/company_owner_sync/output_event/
           if-no-files-found: warn
           retention-days: 30
