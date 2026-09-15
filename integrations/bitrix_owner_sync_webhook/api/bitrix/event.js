@@ -40,6 +40,22 @@ function parseBody(request) {
   return {};
 }
 
+async function queueRequest(action, payload = {}) {
+  const queueUrl = String(process.env.GOOGLE_QUEUE_URL || "").trim();
+  const queueKey = String(process.env.GOOGLE_QUEUE_KEY || "").trim();
+  if (!queueUrl.startsWith("https://script.google.com/macros/s/") || queueKey.length < 32) {
+    throw new Error("google_queue_not_configured");
+  }
+  const result = await fetch(queueUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ key: queueKey, action, ...payload }),
+  });
+  const data = await result.json().catch(() => ({}));
+  if (!result.ok || !data.ok) throw new Error(`google_queue_${action}_failed`);
+  return data;
+}
+
 export default async function handler(request, response) {
   if (request.method !== "POST") {
     response.setHeader("Allow", "POST");
@@ -72,6 +88,17 @@ export default async function handler(request, response) {
     return response.status(403).json({ error: "unexpected_bitrix_domain" });
   }
 
+  let queued;
+  try {
+    queued = await queueRequest("enqueue", {contact_id: contactId, event_ts: String(body.ts || "")});
+  } catch (error) {
+    console.error("Queue enqueue failed", error instanceof Error ? error.message : "unknown");
+    return response.status(502).json({ error: "queue_enqueue_failed" });
+  }
+  if (!queued.dispatch) {
+    return response.status(202).json({ accepted: true, queued: true, dispatched: false, contact_id: contactId });
+  }
+
   const githubToken = String(process.env.GITHUB_DISPATCH_TOKEN || "").trim();
   const githubRepository = String(process.env.GITHUB_REPOSITORY || "").trim();
   if (!githubToken || !/^[^/\s]+\/[^/\s]+$/.test(githubRepository)) {
@@ -90,11 +117,10 @@ export default async function handler(request, response) {
         "User-Agent": "bitrix-owner-sync-webhook",
       },
       body: JSON.stringify({
-        event_type: "founder_owner_changed",
+        event_type: "founder_batch_ready",
         client_payload: {
-          contact_id: contactId,
           bitrix_domain: actualDomain,
-          event_ts: String(body.ts || ""),
+          queue_version: String(queued.version || ""),
         },
       }),
     },
@@ -103,11 +129,12 @@ export default async function handler(request, response) {
   if (!githubResponse.ok) {
     const githubError = (await githubResponse.text()).slice(0, 500);
     console.error("GitHub dispatch failed", githubResponse.status, githubError);
+    await queueRequest("release_dispatch").catch(() => {});
     return response.status(502).json({
       error: "github_dispatch_failed",
       status: githubResponse.status,
     });
   }
 
-  return response.status(202).json({ accepted: true, contact_id: contactId });
+  return response.status(202).json({ accepted: true, queued: true, dispatched: true, contact_id: contactId });
 }
