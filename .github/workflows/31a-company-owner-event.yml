@@ -33,7 +33,6 @@ env:
   PYTHONUTF8: "1"
   PYTHONIOENCODING: "utf-8"
   PYTHON_EXE: C:\Users\Alyona.Sachyova\AppData\Local\Programs\Python\Python312\python.exe
-  SYNC_VENV_DIR: ${{ runner.workspace }}\_venvs\company_owner_sync
   SOURCE_CONTACT_ID: ${{ github.event.client_payload.contact_id || inputs.contact_id }}
 
 jobs:
@@ -55,18 +54,18 @@ jobs:
             echo Python не найден: %PYTHON_EXE%
             exit /b 1
           )
-          if not exist "%SYNC_VENV_DIR%\Scripts\python.exe" (
-            "%PYTHON_EXE%" -m venv "%SYNC_VENV_DIR%"
+          if not exist "%GITHUB_WORKSPACE%\..\_venvs\company_owner_sync\Scripts\python.exe" (
+            "%PYTHON_EXE%" -m venv "%GITHUB_WORKSPACE%\..\_venvs\company_owner_sync"
             if errorlevel 1 exit /b 1
           )
-          "%SYNC_VENV_DIR%\Scripts\python.exe" --version
+          "%GITHUB_WORKSPACE%\..\_venvs\company_owner_sync\Scripts\python.exe" --version
 
       - name: Установить зависимости
         env:
           CUSTOM_PIP_INDEX_URL: ${{ vars.PIP_INDEX_URL }}
         run: |
           if not "%CUSTOM_PIP_INDEX_URL%"=="" set "PIP_INDEX_URL=%CUSTOM_PIP_INDEX_URL%"
-          "%SYNC_VENV_DIR%\Scripts\python.exe" -m pip install --disable-pip-version-check -r requirements.txt
+          "%GITHUB_WORKSPACE%\..\_venvs\company_owner_sync\Scripts\python.exe" -m pip install --disable-pip-version-check -r requirements.txt
 
       - name: Проверить код
         if: ${{ github.event_name == 'workflow_dispatch' }}
@@ -74,9 +73,9 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}\processes\company_owner_sync;${{ github.workspace }}\processes\eqazyna_leads
         run: |
           chcp 65001 >nul
-          "%SYNC_VENV_DIR%\Scripts\python.exe" -m pytest -q tests
+          "%GITHUB_WORKSPACE%\..\_venvs\company_owner_sync\Scripts\python.exe" -m pytest -q tests
           if errorlevel 1 exit /b 1
-          "%SYNC_VENV_DIR%\Scripts\python.exe" sync_founder_packages.py --help >nul
+          "%GITHUB_WORKSPACE%\..\_venvs\company_owner_sync\Scripts\python.exe" sync_founder_packages.py --help >nul
 
       - name: Проверить подтверждение ручного apply
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'apply' && inputs.confirm != 'SYNC_FOUNDER_PACKAGE' }}
@@ -99,7 +98,7 @@ jobs:
             exit /b 1
           )
           if not exist output_event mkdir output_event
-          "%SYNC_VENV_DIR%\Scripts\python.exe" -u sync_founder_packages.py %APPLY_FLAG% --output-dir output_event
+          "%GITHUB_WORKSPACE%\..\_venvs\company_owner_sync\Scripts\python.exe" -u sync_founder_packages.py %APPLY_FLAG% --output-dir output_event
           if errorlevel 1 exit /b 1
           type output_event\company_owner_sync_summary.json
           dir output_event
