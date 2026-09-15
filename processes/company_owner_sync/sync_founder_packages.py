@@ -375,6 +375,7 @@ def run(
     output_dir: Path,
     apply: bool,
     source_contact_id: int | None = None,
+    source_contact_ids: list[int] | None = None,
 ) -> dict[str, Any]:
     if source_contact_id:
         source_contacts = load(
@@ -426,6 +427,21 @@ def run(
         requisites,
         source_contact_id=source_contact_id,
     )
+    if source_contact_ids is not None:
+        selected = []
+        selected_sources = {}
+        for contact_id in source_contact_ids:
+            package = select_source_package(packages, contact_id)
+            if package is None or (package["fio"] in selected_sources and selected_sources[package["fio"]] != contact_id):
+                summary = {"errors": 1, "reason": "unresolved_or_duplicate_package_source", "source_contact_id": contact_id}
+                write_summary(output_dir, summary)
+                return summary
+            if package["fio"] not in selected_sources:
+                package["source_contact_id"] = contact_id
+                selected.append(package)
+                selected_sources[package["fio"]] = contact_id
+        packages = selected
+        skipped = [item for item in skipped if any(str(package["fio"]).casefold() in str(item.get("fio") or "").casefold() for package in packages)]
     if source_contact_id:
         source_package = select_source_package(packages, source_contact_id)
         if source_package is None:
@@ -480,10 +496,18 @@ def run(
     return summary
 
 
+def parse_contact_ids(value: str) -> list[int]:
+    tokens = [token for token in re.split(r"[\s,;]+", value.strip()) if token]
+    if not tokens or any(not re.fullmatch(r"[0-9]+", token) or int(token) <= 0 for token in tokens):
+        raise ValueError("SOURCE_CONTACT_IDS must contain positive IDs separated by spaces, commas or semicolons")
+    return list(dict.fromkeys(int(token) for token in tokens))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Synchronize a founder's contacts, companies and leads to one owner")
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--output-dir", default="output")
+    parser.add_argument("--batch", action="store_true", help="Require SOURCE_CONTACT_IDS and process only that selection")
     source_from_env = str(os.getenv("SOURCE_CONTACT_ID") or "").strip()
     if source_from_env and normalized_id(source_from_env) is None:
         parser.error("SOURCE_CONTACT_ID must be a positive integer")
@@ -494,6 +518,14 @@ def main() -> int:
         help="Use this exact founder/director contact as the package owner source",
     )
     args = parser.parse_args()
+    batch_ids = None
+    if args.batch:
+        try:
+            batch_ids = parse_contact_ids(os.getenv("SOURCE_CONTACT_IDS", ""))
+        except ValueError as exc:
+            parser.error(str(exc))
+        if args.source_contact_id is not None:
+            parser.error("batch and single source are mutually exclusive")
     if args.source_contact_id is not None and args.source_contact_id <= 0:
         parser.error("source-contact-id must be positive")
     if os.getenv("GITHUB_EVENT_NAME") == "repository_dispatch" and not args.source_contact_id:
@@ -509,6 +541,7 @@ def main() -> int:
         Path(args.output_dir),
         args.apply,
         source_contact_id=args.source_contact_id,
+        source_contact_ids=batch_ids,
     )
     return 1 if summary["errors"] else 0
 
