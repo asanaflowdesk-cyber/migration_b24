@@ -16,7 +16,8 @@ on:
         type: string
 
 concurrency:
-  group: company-owner-director-contact-sync
+  group: founder-package-owner-writes
+  queue: max
   cancel-in-progress: false
 
 permissions:
