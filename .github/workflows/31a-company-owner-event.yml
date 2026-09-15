@@ -47,13 +47,6 @@ jobs:
       - name: Получить код репозитория
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
 
-      - name: Проверить ID контакта
-        shell: powershell
-        run: |
-          if ($env:SOURCE_CONTACT_ID -notmatch '^[1-9][0-9]*$') {
-            throw "Некорректный contact_id"
-          }
-
       - name: Найти Python и создать локальное окружение
         run: call ..\..\scripts\prepare-python.cmd
 
@@ -73,22 +66,11 @@ jobs:
           if errorlevel 1 exit /b 1
           ".venv\Scripts\python.exe" sync_founder_packages.py --help >nul
 
-      - name: Определить режим
-        id: mode
-        shell: powershell
+      - name: Проверить подтверждение ручного apply
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'apply' && inputs.confirm != 'SYNC_FOUNDER_PACKAGE' }}
         run: |
-          if ('${{ github.event_name }}' -eq 'repository_dispatch') {
-            "apply=true" >> $env:GITHUB_OUTPUT
-            exit 0
-          }
-          if ('${{ inputs.mode }}' -eq 'apply') {
-            if ('${{ inputs.confirm }}' -ne 'SYNC_FOUNDER_PACKAGE') {
-              throw "Для применения введите SYNC_FOUNDER_PACKAGE"
-            }
-            "apply=true" >> $env:GITHUB_OUTPUT
-          } else {
-            "apply=false" >> $env:GITHUB_OUTPUT
-          }
+          echo Для применения введите SYNC_FOUNDER_PACKAGE
+          exit /b 1
 
       - name: Синхронизировать пакет учредителя
         env:
@@ -97,6 +79,7 @@ jobs:
           BITRIX_VERIFY_SSL: ${{ vars.BITRIX_VERIFY_SSL || 'true' }}
           BITRIX_CA_BUNDLE: ${{ vars.BITRIX_CA_BUNDLE }}
           BITRIX_REQUEST_TIMEOUT: ${{ vars.BITRIX_REQUEST_TIMEOUT || '45' }}
+          APPLY_FLAG: ${{ (github.event_name == 'repository_dispatch' || inputs.mode == 'apply') && '--apply' || '' }}
         run: |
           chcp 65001 >nul
           if "%TARGET_BITRIX_WEBHOOK_URL%"=="" (
@@ -104,11 +87,7 @@ jobs:
             exit /b 1
           )
           if not exist output_event mkdir output_event
-          if "${{ steps.mode.outputs.apply }}"=="true" (
-            ".venv\Scripts\python.exe" -u sync_founder_packages.py --apply --output-dir output_event
-          ) else (
-            ".venv\Scripts\python.exe" -u sync_founder_packages.py --output-dir output_event
-          )
+          ".venv\Scripts\python.exe" -u sync_founder_packages.py %APPLY_FLAG% --output-dir output_event
           if errorlevel 1 exit /b 1
           type output_event\company_owner_sync_summary.json
           dir output_event
