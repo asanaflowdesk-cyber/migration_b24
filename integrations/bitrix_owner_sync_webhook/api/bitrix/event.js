@@ -85,10 +85,6 @@ export default async function handler(request, response) {
   if (!contactId) return response.status(400).json({error: "missing_contact_id"});
   if (!expectedDomain || actualDomain !== expectedDomain) return response.status(403).json({error: "unexpected_bitrix_domain"});
 
-  // Bitrix sends ONCRMCONTACTUPDATE for every contact field. Filter ordinary
-  // contacts before they ever reach the durable queue. If the event token cannot
-  // be used to read the contact, fail open and enqueue it so a real owner change
-  // is never lost; the Python worker performs the authoritative check again.
   const changedContact = await fetchChangedContact(body, contactId);
   if (changedContact && !isFounderContact(changedContact)) {
     return response.status(202).json({accepted: true, queued: false, dispatched: false, reason: "ordinary_contact", contact_id: contactId});
@@ -105,7 +101,16 @@ export default async function handler(request, response) {
     console.error("Queue enqueue failed", error instanceof Error ? error.message : "unknown");
     return response.status(502).json({error: "queue_enqueue_failed"});
   }
-  if (!queued.dispatch) return response.status(202).json({accepted: true, queued: true, dispatched: false, contact_id: contactId});
+
+  if (!queued.dispatch) {
+    return response.status(202).json({
+      accepted: true,
+      queued: queued.queued !== false,
+      dispatched: false,
+      reason: String(queued.reason || "queued_without_dispatch"),
+      contact_id: contactId,
+    });
+  }
 
   const githubToken = String(process.env.GITHUB_DISPATCH_TOKEN || "").trim();
   const githubRepository = String(process.env.GITHUB_REPOSITORY || "").trim();

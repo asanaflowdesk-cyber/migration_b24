@@ -1,4 +1,4 @@
-from queue_founder_packages import process_claim
+from queue_founder_packages import _coalesce_and_partition, process_claim
 
 
 class Client:
@@ -16,7 +16,14 @@ class Client:
         return self.contacts if method == "crm.contact.list" else []
 
     def call(self, method, payload):
+        if method == "batch":
+            raise RuntimeError("batch unavailable in unit double")
         return next(item for item in self.contacts if int(item["ID"]) == int(payload["id"]))
+
+    def update_contact(self, contact_id, fields):
+        row = next(item for item in self.contacts if int(item["ID"]) == int(contact_id))
+        row.update(fields)
+        return True
 
 
 def claim():
@@ -32,10 +39,38 @@ def test_claim_uses_one_crm_snapshot_for_multiple_packages(tmp_path):
     assert len(set(client.loads)) == 4
 
 
-def test_duplicate_contacts_for_one_package_fail_without_writes(tmp_path):
-    results, failures = process_claim(Client(duplicate=True), tmp_path, claim())
-    assert failures == 2
-    assert {item["error"] for item in results} == {"multiple_contacts_for_same_package"}
+def test_duplicate_contacts_for_one_package_are_coalesced_not_failed(tmp_path):
+    client = Client(duplicate=True)
+    results, failures = process_claim(client, tmp_path, claim())
+    assert failures == 0
+    assert all(item["success"] for item in results)
+    assert all(item.get("error", "") != "multiple_contacts_for_same_package" for item in results)
+    assert {int(item["ASSIGNED_BY_ID"]) for item in client.contacts} == {11}
+
+
+def test_overlap_partition_assigns_each_entity_to_only_one_job():
+    shared_company = {"id": 20, "title": "shared", "owner_id": 1, "leads": [{"id": 30, "title": "shared lead", "owner_id": 1}]}
+    jobs = [
+        {
+            "item": {"updated_at": "2026-09-16T10:00:00Z"},
+            "contact_id": 1,
+            "version": 1,
+            "operation_id": "a",
+            "package": {"fio": "A", "contacts": [{"id": 1}], "companies": [shared_company]},
+        },
+        {
+            "item": {"updated_at": "2026-09-16T10:01:00Z"},
+            "contact_id": 2,
+            "version": 1,
+            "operation_id": "b",
+            "package": {"fio": "B", "contacts": [{"id": 2}], "companies": [shared_company]},
+        },
+    ]
+    leaders, _aliases = _coalesce_and_partition(jobs)
+    owned = [set(job["owned_entity_keys"]) for job in leaders]
+    assert owned[0].isdisjoint(owned[1])
+    assert ("company", 20) in owned[1]
+    assert ("lead", 30) in owned[1]
 
 
 def test_ordinary_contact_is_ignored_without_failing_claim(tmp_path):
