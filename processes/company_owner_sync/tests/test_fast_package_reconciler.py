@@ -129,3 +129,9 @@ def test_queue_script_exposes_processing_status_and_batch_progress():
     assert "body.action === 'remember_owners'" in text
     assert "reason: 'worker_owner_update'" in text
     assert "reason: 'owner_unchanged'" in text
+
+
+def test_webhook_reports_suppressed_queue_event_as_not_queued():
+    root = Path(__file__).resolve().parents[3]
+    text = (root / "integrations/bitrix_owner_sync_webhook/api/bitrix/event.js").read_text(encoding="utf-8")
+    assert "queued: queued.queued !== false" in text
