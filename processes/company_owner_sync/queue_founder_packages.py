@@ -300,7 +300,7 @@ def process_claim(
 
     suppression_rows: list[dict[str, int]] = []
     for job in valid_jobs:
-        target = normalized_id(job["package"].get("owner_id"))
+        target = normalized_id(contacts_by_id.get(int(job["contact_id"]), {}).get("ASSIGNED_BY_ID"))
         if not target:
             continue
         for entity, entity_id in job["owned_entity_keys"]:
