@@ -84,6 +84,32 @@ def _clone_client(client: BitrixClient) -> BitrixClient:
     )
 
 
+def _load_snapshot_fast(client: BitrixClient) -> dict[str, list[dict[str, Any]]]:
+    """Load the four independent CRM collections concurrently on the real client."""
+    if not isinstance(client, BitrixClient):
+        return load_snapshot(client)
+
+    specs = {
+        "companies": ("crm.company.list", ["ID", "TITLE", "ASSIGNED_BY_ID"], {}),
+        "leads": ("crm.lead.list", ["ID", "TITLE", "COMPANY_ID", "CONTACT_ID", "ASSIGNED_BY_ID"], {}),
+        "contacts": (
+            "crm.contact.list",
+            ["ID", "LAST_NAME", "NAME", "SECOND_NAME", "POST", "COMPANY_ID", "ASSIGNED_BY_ID", "COMMENTS", "DATE_MODIFY"],
+            {},
+        ),
+        "requisites": ("crm.requisite.list", ["ID", "ENTITY_ID", "ENTITY_TYPE_ID", "RQ_DIRECTOR"], {"ENTITY_TYPE_ID": 4}),
+    }
+
+    def read(spec: tuple[str, list[str], dict[str, Any]]) -> list[dict[str, Any]]:
+        method, select, filter_ = spec
+        local = _clone_client(client)
+        return local.list_all(method, {"order": {"ID": "ASC"}, "filter": filter_, "select": select})
+
+    with ThreadPoolExecutor(max_workers=4, thread_name_prefix="owner-snapshot") as pool:
+        futures = {name: pool.submit(read, spec) for name, spec in specs.items()}
+        return {name: futures[name].result() for name in specs}
+
+
 def _result_payload(
     contact_id: int,
     version: int,
@@ -114,6 +140,75 @@ def _result_payload(
     }
 
 
+def _package_entity_keys(package: dict[str, Any]) -> set[tuple[str, int]]:
+    keys: set[tuple[str, int]] = set()
+    for contact in package.get("contacts", []):
+        if (item_id := normalized_id(contact.get("id"))) is not None:
+            keys.add(("contact", item_id))
+    for company in package.get("companies", []):
+        if (company_id := normalized_id(company.get("id"))) is not None:
+            keys.add(("company", company_id))
+        for lead in company.get("leads", []):
+            if (lead_id := normalized_id(lead.get("id"))) is not None:
+                keys.add(("lead", lead_id))
+    return keys
+
+
+def _job_rank(job: dict[str, Any]) -> tuple[str, int, int]:
+    item = job["item"]
+    return (str(item.get("updated_at") or ""), int(job["version"]), int(job["contact_id"]))
+
+
+def _coalesce_and_partition(jobs: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[tuple[int, int], tuple[int, int]]]:
+    """Coalesce duplicate package events and assign every CRM entity to one job.
+
+    Same-package events are processed once using the newest queue event. If bad
+    legacy data makes two different packages reference the same CRM card, that
+    card is owned by exactly one job (the newest event; a job's own source
+    contact has priority). This removes cross-thread writes without serializing
+    independent packages.
+    """
+    by_package: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for job in jobs:
+        by_package[str(job["package"].get("fio") or job["contact_id"])].append(job)
+
+    leaders: list[dict[str, Any]] = []
+    aliases: dict[tuple[int, int], tuple[int, int]] = {}
+    for group in by_package.values():
+        leader = max(group, key=_job_rank)
+        leader["members"] = list(group)
+        leaders.append(leader)
+        leader_key = (int(leader["contact_id"]), int(leader["version"]))
+        for member in group:
+            aliases[(int(member["contact_id"]), int(member["version"]))] = leader_key
+
+    leaders.sort(key=_job_rank)
+    winner: dict[tuple[str, int], tuple[int, tuple[int, tuple[str, int, int]]]] = {}
+    for index, job in enumerate(leaders):
+        rank = _job_rank(job)
+        source_key = ("contact", int(job["contact_id"]))
+        for entity_key in _package_entity_keys(job["package"]):
+            priority = (1 if entity_key == source_key else 0, rank)
+            current = winner.get(entity_key)
+            if current is None or priority > current[1]:
+                winner[entity_key] = (index, priority)
+
+    for index, job in enumerate(leaders):
+        job["owned_entity_keys"] = {
+            entity_key for entity_key, (winner_index, _priority) in winner.items() if winner_index == index
+        }
+    return leaders, aliases
+
+
+def _copy_result_for_member(payload: dict[str, Any], member: dict[str, Any]) -> dict[str, Any]:
+    copied = dict(payload)
+    copied["contact_id"] = int(member["contact_id"])
+    copied["version"] = int(member["version"])
+    if copied.get("operation_id"):
+        copied["operation_id"] = str(member["operation_id"])
+    return copied
+
+
 def process_claim(
     client: BitrixClient,
     output_dir: Path,
@@ -128,7 +223,7 @@ def process_claim(
         raise RuntimeError("queue_claim_contains_invalid_id")
 
     print(f"[PROCESSING] snapshot: start; queued={len(items)}", flush=True)
-    snapshot = load_snapshot(client)
+    snapshot = _load_snapshot_fast(client)
     packages, _ = build_packages(
         snapshot["companies"],
         snapshot["leads"],
@@ -148,7 +243,6 @@ def process_claim(
         for contact in snapshot["contacts"]
         if (contact_id := normalized_id(contact.get("ID"))) is not None
     }
-    ids_by_fio: dict[str, list[int]] = defaultdict(list)
     unresolved: set[int] = set()
     ignored: set[int] = set()
     missing: set[int] = set()
@@ -166,12 +260,10 @@ def process_claim(
                 unresolved.add(contact_id)
         else:
             packages_by_contact[contact_id] = package
-            ids_by_fio[str(package["fio"])].append(contact_id)
-    conflicting = {contact_id for group in ids_by_fio.values() if len(group) > 1 for contact_id in group}
 
     results_by_key: dict[tuple[int, int], dict[str, Any]] = {}
     journal_entries: list[dict[str, Any]] = []
-    valid_jobs: list[tuple[dict[str, Any], int, int, int, str, dict[str, Any]]] = []
+    raw_jobs: list[dict[str, Any]] = []
 
     for item, contact_id in zip(items, ids):
         assert contact_id is not None
@@ -188,25 +280,52 @@ def process_claim(
             results_by_key[(contact_id, version)] = _result_payload(
                 contact_id, version, False, "failed", "source_contact_package_not_resolved", "MANUAL_REVIEW", operation_id
             )
-        elif contact_id in conflicting:
-            results_by_key[(contact_id, version)] = _result_payload(
-                contact_id, version, False, "failed", "multiple_contacts_for_same_package", "MANUAL_REVIEW", operation_id
-            )
         else:
-            valid_jobs.append((item, contact_id, version, attempts, operation_id, packages_by_contact[contact_id]))
+            raw_jobs.append({
+                "item": item,
+                "contact_id": contact_id,
+                "version": version,
+                "attempts": attempts,
+                "operation_id": operation_id,
+                "package": packages_by_contact[contact_id],
+            })
+
+    valid_jobs, aliases = _coalesce_and_partition(raw_jobs)
+    duplicate_events = max(len(raw_jobs) - len(valid_jobs), 0)
+    overlap_count = sum(
+        1
+        for job in valid_jobs
+        if len(job["owned_entity_keys"]) < len(_package_entity_keys(job["package"]))
+    )
+
+    suppression_rows: list[dict[str, int]] = []
+    for job in valid_jobs:
+        target = normalized_id(job["package"].get("owner_id"))
+        if not target:
+            continue
+        for entity, entity_id in job["owned_entity_keys"]:
+            if entity == "contact" and entity_id != int(job["contact_id"]):
+                suppression_rows.append({"contact_id": entity_id, "owner_id": target})
+    if suppression_rows:
+        best_effort_queue_call(queue_url, queue_key, "remember_owners", owners=suppression_rows)
 
     total = len(items)
     finished = len(results_by_key)
     workers = max(1, min(int(os.getenv("OWNER_SYNC_WORKERS", "8") or 8), 16, len(valid_jobs) or 1))
     progress_every = max(1, int(os.getenv("OWNER_SYNC_PROGRESS_EVERY", "5") or 5))
     print(
-        f"[PROCESSING] packages: start; valid={len(valid_jobs)}; ignored={len(ignored)}; "
-        f"errors={len(missing) + len(unresolved) + len(conflicting)}; workers={workers}",
+        f"[PROCESSING] packages: start; jobs={len(valid_jobs)}; coalesced={duplicate_events}; "
+        f"overlap_partitioned={overlap_count}; ignored={len(ignored)}; "
+        f"errors={len(missing) + len(unresolved)}; workers={workers}",
         flush=True,
     )
 
-    def run_job(job: tuple[dict[str, Any], int, int, int, str, dict[str, Any]]):
-        _item, contact_id, version, attempts, operation_id, package = job
+    def run_job(job: dict[str, Any]):
+        contact_id = int(job["contact_id"])
+        version = int(job["version"])
+        attempts = int(job["attempts"])
+        operation_id = str(job["operation_id"])
+        package = job["package"]
         local_client = _clone_client(client) if isinstance(client, BitrixClient) else client
         result = process_package_fast(
             local_client,
@@ -216,6 +335,7 @@ def process_claim(
             operation_id,
             str(claim["claim_id"]),
             attempts,
+            owned_entity_keys=set(job["owned_entity_keys"]),
         )
         success = bool(result["success"])
         retryable = bool(result["retryable"])
@@ -232,16 +352,18 @@ def process_claim(
             operation_id,
             retryable,
         )
-        return contact_id, version, payload, result.get("operation") or {}, result.get("items") or []
+        return payload, result.get("operation") or {}, result.get("items") or []
 
     if valid_jobs:
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="owner-sync") as pool:
             future_map = {pool.submit(run_job, job): job for job in valid_jobs}
             for future in as_completed(future_map):
                 job = future_map[future]
-                _item, contact_id, version, _attempts, operation_id, _package = job
+                contact_id = int(job["contact_id"])
+                version = int(job["version"])
+                operation_id = str(job["operation_id"])
                 try:
-                    result_contact_id, result_version, payload, operation, operation_items = future.result()
+                    payload, operation, operation_items = future.result()
                 except Exception as exc:  # noqa: BLE001
                     payload = _result_payload(
                         contact_id,
@@ -253,15 +375,19 @@ def process_claim(
                         operation_id,
                         True,
                     )
-                    result_contact_id, result_version = contact_id, version
                     operation, operation_items = {}, []
-                results_by_key[(result_contact_id, result_version)] = payload
+
                 if operation:
                     journal_entries.append({"operation": operation, "items": operation_items})
-                finished += 1
+
+                for member in job.get("members", [job]):
+                    member_key = (int(member["contact_id"]), int(member["version"]))
+                    results_by_key[member_key] = _copy_result_for_member(payload, member)
+                    finished += 1
+
                 elapsed = time.monotonic() - started
                 print(
-                    f"[PROCESSING] {finished}/{total}; contact={result_contact_id}; "
+                    f"[PROCESSING] {finished}/{total}; contact={contact_id}; "
                     f"status={payload.get('status') or payload.get('outcome')}; elapsed={elapsed:.1f}s",
                     flush=True,
                 )
@@ -273,7 +399,7 @@ def process_claim(
                         claim_id=str(claim["claim_id"]),
                         completed=finished,
                         total=total,
-                        active_contact_id=result_contact_id,
+                        active_contact_id=contact_id,
                         status=str(payload.get("status") or payload.get("outcome") or "PROCESSING"),
                     )
 
@@ -286,6 +412,7 @@ def process_claim(
                 entries=journal_entries[start:start + 20],
             )
 
+    _ = aliases
     results: list[dict[str, Any]] = []
     for item, contact_id in zip(items, ids):
         assert contact_id is not None
