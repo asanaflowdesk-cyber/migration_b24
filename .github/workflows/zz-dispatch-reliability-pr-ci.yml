@@ -1,0 +1,30 @@
+name: Dispatch reliability PR CI (temporary)
+
+on:
+  push:
+    branches:
+      - fix/dispatch-retry-diagnostics
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Python dependencies
+        working-directory: processes/company_owner_sync
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
+      - name: Run owner-sync tests
+        working-directory: processes/company_owner_sync
+        env:
+          PYTHONPATH: ${{ github.workspace }}/processes/company_owner_sync:${{ github.workspace }}/processes/eqazyna_leads
+        run: python -m pytest -q tests
+      - name: Check webhook JavaScript syntax
+        working-directory: integrations/bitrix_owner_sync_webhook
+        run: npm run check
