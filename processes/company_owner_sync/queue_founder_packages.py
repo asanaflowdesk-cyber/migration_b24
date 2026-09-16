@@ -151,16 +151,28 @@ def process_claim(
             error = "" if success else reason(result.get("reason"))
 
         failures += not success
-        results.append({
-            "contact_id": contact_id,
-            "version": version,
-            "success": success,
-            "retryable": retryable,
-            "error": error,
-            "outcome": outcome,
-            "status": status,
-            "operation_id": operation_id,
-        })
+        if outcome == "ignored":
+            # Preserve the established success-result contract for ordinary contacts.
+            # Queue completion only needs success=True here; recovery metadata applies
+            # to actual package operations and must not change this legacy payload.
+            results.append({
+                "contact_id": contact_id,
+                "version": version,
+                "success": True,
+                "error": "",
+                "outcome": "ignored",
+            })
+        else:
+            results.append({
+                "contact_id": contact_id,
+                "version": version,
+                "success": success,
+                "retryable": retryable,
+                "error": error,
+                "outcome": outcome,
+                "status": status,
+                "operation_id": operation_id,
+            })
     return results, failures
 
 
