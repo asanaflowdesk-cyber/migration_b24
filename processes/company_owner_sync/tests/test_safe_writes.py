@@ -86,3 +86,10 @@ def test_workflows_share_bounded_serial_queue():
         assert "group: founder-package-owner-writes" in text
         assert "queue: max" in text
         assert "cancel-in-progress: false" in text
+
+
+def test_event_queue_has_manual_and_fast_recovery_triggers():
+    root = Path(__file__).resolve().parents[3]
+    text = (root / ".github/workflows" / "31a-company-owner-event.yml").read_text(encoding="utf-8")
+    assert "workflow_dispatch:" in text
+    assert 'cron: "*/5 * * * *"' in text
