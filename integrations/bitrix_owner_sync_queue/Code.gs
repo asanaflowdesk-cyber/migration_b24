@@ -17,6 +17,7 @@ const ITEM_HEADERS = [
 const LEASE_MS = 30 * 60 * 1000;
 const RETRY_MS = 2 * 60 * 1000;
 const MAX_ATTEMPTS = 5;
+const ACTIVE_STATES = new Set(['CLAIMED', 'PROCESSING']);
 
 function json_(value) {
   return ContentService.createTextOutput(JSON.stringify(value)).setMimeType(ContentService.MimeType.JSON);
@@ -55,6 +56,7 @@ function rows_(sheet) {
 }
 
 function iso_() { return new Date().toISOString(); }
+function active_(state) { return ACTIVE_STATES.has(String(state || '')); }
 
 function expired_(value, ageMs) {
   const time = new Date(value || 0).getTime();
@@ -63,7 +65,7 @@ function expired_(value, ageMs) {
 
 function normalizeStates_(rows) {
   rows.forEach(row => {
-    if (row[2] === 'CLAIMED' && expired_(row[6], LEASE_MS)) {
+    if (active_(row[2]) && expired_(row[6], LEASE_MS)) {
       row[2] = 'PENDING';
       row[4] = '';
       row[5] = '';
@@ -88,9 +90,11 @@ function doPost(e) {
     try {
       if (body.action === 'enqueue') return json_(enqueue_(body));
       if (body.action === 'claim') return json_(claim_(body));
+      if (body.action === 'progress') return json_(progress_(body));
       if (body.action === 'complete') return json_(complete_(body));
       if (body.action === 'release_dispatch') return json_(releaseDispatch_());
       if (body.action === 'log_operation') return json_(logOperation_(body));
+      if (body.action === 'log_operations') return json_(logOperations_(body));
       return json_({ok: false, error: 'unknown_action'});
     } finally {
       lock.releaseLock();
@@ -119,11 +123,11 @@ function enqueue_(body) {
     row[8] = '';
     row[9] = '';
     row[7] = 0;
-    if (row[2] !== 'CLAIMED') row[2] = 'PENDING';
+    if (!active_(row[2])) row[2] = 'PENDING';
   }
   writeRows_(sheet, rows);
   const props = PropertiesService.getScriptProperties();
-  const active = rows.some(row => row[2] === 'CLAIMED');
+  const active = rows.some(row => active_(row[2]));
   const dispatchPending = props.getProperty('DISPATCH_PENDING') === '1';
   const dispatch = !active && !dispatchPending;
   if (dispatch) props.setProperty('DISPATCH_PENDING', '1');
@@ -137,7 +141,7 @@ function claim_(body) {
   const sheet = sheet_();
   const rows = rows_(sheet);
   normalizeStates_(rows);
-  if (rows.some(row => row[2] === 'CLAIMED')) {
+  if (rows.some(row => active_(row[2]))) {
     writeRows_(sheet, rows);
     return {ok: true, busy: true, items: []};
   }
@@ -152,11 +156,12 @@ function claim_(body) {
   const now = iso_();
   const items = pending.map(index => {
     const row = rows[index];
-    row[2] = 'CLAIMED';
+    row[2] = 'PROCESSING';
     row[4] = claimId;
     row[5] = Number(row[1]);
     row[6] = now;
     row[7] = Number(row[7] || 0) + 1;
+    row[8] = 'PROCESSING 0/' + pending.length;
     return {
       contact_id: Number(row[0]),
       version: Number(row[5]),
@@ -166,6 +171,30 @@ function claim_(body) {
   });
   writeRows_(sheet, rows);
   return {ok: true, claim_id: claimId, items: items};
+}
+
+function progress_(body) {
+  const claimId = String(body.claim_id || '');
+  if (!claimId) return {ok: false, error: 'missing_claim_id'};
+  const completed = Math.max(Number(body.completed) || 0, 0);
+  const total = Math.max(Number(body.total) || 0, 0);
+  const activeContact = String(body.active_contact_id || '');
+  const status = String(body.status || 'PROCESSING').slice(0, 60);
+  const sheet = sheet_();
+  const rows = rows_(sheet);
+  const now = iso_();
+  let touched = 0;
+  const message = 'PROCESSING ' + completed + '/' + total + (activeContact ? '; contact=' + activeContact : '') + '; ' + status;
+  rows.forEach(row => {
+    if (!active_(row[2]) || String(row[4]) !== claimId) return;
+    row[2] = 'PROCESSING';
+    row[3] = now;
+    row[6] = now;
+    row[8] = message.slice(0, 250);
+    touched += 1;
+  });
+  writeRows_(sheet, rows);
+  return {ok: true, touched: touched, completed: completed, total: total};
 }
 
 function complete_(body) {
@@ -181,15 +210,13 @@ function complete_(body) {
   let superseded = 0;
   let supersededFailures = 0;
   rows.forEach(row => {
-    if (row[2] !== 'CLAIMED' || String(row[4]) !== claimId) return;
+    if (!active_(row[2]) || String(row[4]) !== claimId) return;
     const result = byKey[String(row[0]) + ':' + String(row[5])];
     if (!result) return;
     const hasNewerVersion = Number(row[1]) !== Number(row[5]);
     const retryable = result.retryable === true;
     const attempts = Number(row[7] || 0);
 
-    // A newer Bitrix event is authoritative. Never let an older completion,
-    // successful or failed, close/retry/manual-review the newer assignment.
     if (hasNewerVersion) {
       row[2] = 'PENDING';
       row[7] = 0;
@@ -222,19 +249,13 @@ function complete_(body) {
     superseded_failures: supersededFailures,
     pending: rows.filter(row => row[2] === 'PENDING').length,
     retry: rows.filter(row => row[2] === 'RETRY').length,
-    manual_review: rows.filter(row => row[2] === 'MANUAL_REVIEW').length
+    manual_review: rows.filter(row => row[2] === 'MANUAL_REVIEW').length,
+    processing: rows.filter(row => active_(row[2])).length
   };
 }
 
-function logOperation_(body) {
-  const operation = body.operation && typeof body.operation === 'object' ? body.operation : null;
-  const items = Array.isArray(body.items) ? body.items : [];
-  if (!operation || !operation.operation_id) return {ok: false, error: 'invalid_operation'};
-  const book = workbook_();
-  const opSheet = ensureSheet_(book, OPERATION_SHEET, OP_HEADERS);
-  const itemSheet = ensureSheet_(book, ITEM_SHEET, ITEM_HEADERS);
-  const now = iso_();
-  opSheet.appendRow([
+function operationRow_(operation, now) {
+  return [
     now,
     operation.operation_id || '', operation.claim_id || '', operation.contact_id || '', operation.fio || '',
     operation.from_owner_ids || '', operation.from_owner_names || '', operation.to_owner_id || '', operation.to_owner_name || '',
@@ -242,16 +263,47 @@ function logOperation_(body) {
     operation.package_companies || 0, operation.package_leads || 0, operation.planned || 0, operation.updated || 0,
     operation.already_correct || 0, operation.remaining || 0, operation.conflicts || 0, operation.failed || 0,
     operation.status || '', operation.last_error || ''
+  ];
+}
+
+function itemRows_(operation, items, now) {
+  return items.map(item => [
+    now, operation.operation_id || '', item.entity || '', item.entity_id || '', item.title || '',
+    item.from_owner_id || '', item.from_owner_name || '', item.to_owner_id || '', item.to_owner_name || '',
+    item.actual_owner_id || '', item.actual_owner_name || '', item.status || '', item.error || '', item.updated_at || ''
   ]);
-  if (items.length) {
-    const values = items.map(item => [
-      now, operation.operation_id || '', item.entity || '', item.entity_id || '', item.title || '',
-      item.from_owner_id || '', item.from_owner_name || '', item.to_owner_id || '', item.to_owner_name || '',
-      item.actual_owner_id || '', item.actual_owner_name || '', item.status || '', item.error || '', item.updated_at || ''
-    ]);
-    itemSheet.getRange(itemSheet.getLastRow() + 1, 1, values.length, ITEM_HEADERS.length).setValues(values);
+}
+
+function logOperation_(body) {
+  const operation = body.operation && typeof body.operation === 'object' ? body.operation : null;
+  const items = Array.isArray(body.items) ? body.items : [];
+  if (!operation || !operation.operation_id) return {ok: false, error: 'invalid_operation'};
+  return logOperations_({entries: [{operation: operation, items: items}]});
+}
+
+function logOperations_(body) {
+  const entries = Array.isArray(body.entries) ? body.entries : [];
+  if (!entries.length) return {ok: false, error: 'invalid_operations'};
+  const book = workbook_();
+  const opSheet = ensureSheet_(book, OPERATION_SHEET, OP_HEADERS);
+  const itemSheet = ensureSheet_(book, ITEM_SHEET, ITEM_HEADERS);
+  const now = iso_();
+  const operationRows = [];
+  const itemRows = [];
+  entries.forEach(entry => {
+    const operation = entry && entry.operation && typeof entry.operation === 'object' ? entry.operation : null;
+    const items = entry && Array.isArray(entry.items) ? entry.items : [];
+    if (!operation || !operation.operation_id) return;
+    operationRows.push(operationRow_(operation, now));
+    itemRows.push(...itemRows_(operation, items, now));
+  });
+  if (operationRows.length) {
+    opSheet.getRange(opSheet.getLastRow() + 1, 1, operationRows.length, OP_HEADERS.length).setValues(operationRows);
   }
-  return {ok: true, operation_id: String(operation.operation_id), items: items.length};
+  if (itemRows.length) {
+    itemSheet.getRange(itemSheet.getLastRow() + 1, 1, itemRows.length, ITEM_HEADERS.length).setValues(itemRows);
+  }
+  return {ok: true, operations: operationRows.length, items: itemRows.length};
 }
 
 function releaseDispatch_() {
