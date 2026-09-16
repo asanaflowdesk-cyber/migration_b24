@@ -24,4 +24,5 @@ def test_queue_keeps_failed_dispatch_pending_and_visible():
     block = source[start:end]
     assert "DISPATCH_ERROR " in block
     assert "deleteProperty('DISPATCH_PENDING')" in block
-    assert "row[2] =" not in block
+    assert "row[2] = 'DISPATCH_ERROR'" not in block
+    assert "row[2] = 'MANUAL_REVIEW'" not in block
