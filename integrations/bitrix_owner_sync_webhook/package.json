@@ -7,6 +7,6 @@
     "node": ">=20"
   },
   "scripts": {
-    "check": "node --check api/bitrix/app.js && node --check api/bitrix/install.js && node --check api/bitrix/event.js"
+    "check": "node --check api/bitrix/app.js && node --check api/bitrix/install.js && node --check api/bitrix/event.js && node --check api/bitrix/queue.js"
   }
 }
