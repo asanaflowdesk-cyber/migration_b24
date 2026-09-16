@@ -178,6 +178,8 @@ function complete_(body) {
   const rows = rows_(sheet);
   const now = iso_();
   let completed = 0;
+  let superseded = 0;
+  let supersededFailures = 0;
   rows.forEach(row => {
     if (row[2] !== 'CLAIMED' || String(row[4]) !== claimId) return;
     const result = byKey[String(row[0]) + ':' + String(row[5])];
@@ -185,13 +187,20 @@ function complete_(body) {
     const hasNewerVersion = Number(row[1]) !== Number(row[5]);
     const retryable = result.retryable === true;
     const attempts = Number(row[7] || 0);
-    if (result.success && !hasNewerVersion) {
+
+    // A newer Bitrix event is authoritative. Never let an older completion,
+    // successful or failed, close/retry/manual-review the newer assignment.
+    if (hasNewerVersion) {
+      row[2] = 'PENDING';
+      row[7] = 0;
+      row[8] = '';
+      row[9] = '';
+      superseded += 1;
+      if (!result.success) supersededFailures += 1;
+    } else if (result.success) {
       row[2] = 'DONE';
       row[8] = '';
       row[9] = now;
-    } else if (result.success && hasNewerVersion) {
-      row[2] = 'PENDING';
-      row[8] = '';
     } else if (retryable && attempts < MAX_ATTEMPTS) {
       row[2] = 'RETRY';
       row[8] = String(result.error || 'sync_failed').slice(0, 250);
@@ -209,6 +218,8 @@ function complete_(body) {
   return {
     ok: true,
     completed: completed,
+    superseded: superseded,
+    superseded_failures: supersededFailures,
     pending: rows.filter(row => row[2] === 'PENDING').length,
     retry: rows.filter(row => row[2] === 'RETRY').length,
     manual_review: rows.filter(row => row[2] === 'MANUAL_REVIEW').length
