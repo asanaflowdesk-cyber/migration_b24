@@ -96,9 +96,28 @@ def test_fast_reconciler_repairs_all_mixed_residual_owners(tmp_path):
     assert set(client.owners.values()) == {27}
     assert result["operation"]["planned"] == 6
     assert result["operation"]["updated"] == 6
-    # The package is handled in a handful of HTTP batch calls, not one REST
-    # request per get/update/verification for every entity.
     assert client.batch_calls <= 5
+
+
+def test_fast_reconciler_only_writes_entities_owned_by_this_parallel_job(tmp_path):
+    client = BatchClient()
+    result = process_package_fast(
+        client,
+        tmp_path,
+        package(),
+        source_contact_id=100,
+        operation_id="op-owned",
+        claim_id="claim-owned",
+        attempt=1,
+        owned_entity_keys={("company", 201), ("lead", 301)},
+    )
+    assert result["success"] is True
+    assert client.owners[("company", 201)] == 27
+    assert client.owners[("lead", 301)] == 27
+    assert client.owners[("company", 202)] == 32
+    assert client.owners[("lead", 302)] == 38
+    assert client.owners[("lead", 303)] == 38
+    assert client.owners[("contact", 101)] == 16
 
 
 def test_queue_script_exposes_processing_status_and_batch_progress():
@@ -107,3 +126,6 @@ def test_queue_script_exposes_processing_status_and_batch_progress():
     assert "row[2] = 'PROCESSING'" in text
     assert "body.action === 'progress'" in text
     assert "body.action === 'log_operations'" in text
+    assert "body.action === 'remember_owners'" in text
+    assert "reason: 'worker_owner_update'" in text
+    assert "reason: 'owner_unchanged'" in text
