@@ -53,6 +53,9 @@ def reason(value: Any) -> str:
 
 
 def operation_logger(queue_url: str, queue_key: str):
+    if not queue_url or not queue_key:
+        return lambda operation, items: None
+
     def log(operation: dict[str, Any], items: list[dict[str, Any]]) -> None:
         try:
             queue_call(queue_url, queue_key, "log_operation", operation=operation, items=items)
@@ -65,8 +68,8 @@ def process_claim(
     client: BitrixClient,
     output_dir: Path,
     claim: dict[str, Any],
-    queue_url: str,
-    queue_key: str,
+    queue_url: str = "",
+    queue_key: str = "",
 ) -> tuple[list[dict[str, Any]], int]:
     items = claim.get("items") or []
     ids = [normalized_id(item.get("contact_id")) for item in items]
