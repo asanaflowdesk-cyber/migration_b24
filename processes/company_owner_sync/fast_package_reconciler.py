@@ -45,12 +45,7 @@ def batch_execute(
     client: Any,
     operations: list[tuple[str, str, dict[str, Any]]],
 ) -> tuple[dict[str, Any], dict[str, str]]:
-    """Execute independent Bitrix calls in batches of 50.
-
-    Returns successful results and sanitized per-command error names. If a test
-    double or older portal cannot execute batch, the same commands fall back to
-    serial calls without changing business semantics.
-    """
+    """Execute independent Bitrix calls in batches of 50."""
     results: dict[str, Any] = {}
     errors: dict[str, str] = {}
     for group in _chunks(operations):
@@ -130,10 +125,12 @@ def apply_rows_fast(
 ) -> str:
     """Update one package using preflight/update/postflight batches.
 
-    Every write chunk is fenced by a fresh source-owner check. A target changed
-    by a human after our baseline is never overwritten.
+    The source founder remains the authority for the target owner. If a human
+    changes an individual target after our baseline, that row is deferred rather
+    than overwritten or turned into a manual-review error. The next queued event
+    or retry resolves it with fresh state.
     """
-    for chunk_no, group in enumerate(_chunks(rows), start=1):
+    for group in _chunks(rows):
         owner_before, source_error = _source_owner(client, source_contact_id)
         if source_error or owner_before != target_owner_id:
             return source_error or "source_owner_changed_during_operation"
@@ -150,8 +147,8 @@ def apply_rows_fast(
             if actual == target_owner_id:
                 row["status"] = "already_correct"
             elif actual != row["current"]:
-                row["status"] = "error"
-                row["error"] = "target_owner_changed_since_plan"
+                row["status"] = "deferred"
+                row["deferred_owner"] = actual
             else:
                 eligible.append(row)
 
@@ -180,8 +177,8 @@ def apply_rows_fast(
             elif verified_owners.get(key) == target_owner_id:
                 row["status"] = "updated"
             else:
-                row["status"] = "error"
-                row["error"] = "write_verification_failed"
+                row["status"] = "deferred"
+                row["deferred_owner"] = verified_owners.get(key)
 
         owner_after, source_error = _source_owner(client, source_contact_id)
         if source_error or owner_after != target_owner_id:
@@ -208,7 +205,7 @@ def _journal_rows(
         elif actual == baseline:
             status = "REMAINING"
         else:
-            status = "CONFLICT"
+            status = "DEFERRED"
         journal.append({
             "entity": item["entity"],
             "entity_id": item["id"],
@@ -234,6 +231,7 @@ def process_package_fast(
     operation_id: str,
     claim_id: str,
     attempt: int,
+    owned_entity_keys: set[tuple[str, int]] | None = None,
 ) -> dict[str, Any]:
     package = copy.deepcopy(package)
     owner_id, source_error = _source_owner(client, source_contact_id)
@@ -246,20 +244,18 @@ def process_package_fast(
     package["source_contact_id"] = source_contact_id
     package["owner_id"] = target_owner_id
     items = package_items(package, source_contact_id)
+    if owned_entity_keys is not None:
+        items = [item for item in items if (str(item["entity"]), int(item["id"])) in owned_entity_keys]
 
-    # The operation baseline is deliberately captured from live CRM, not from the
-    # old package snapshot. This allows a final assignment such as 16→38→27 to
-    # repair residual entities still owned by 16/14/32/45/38 without treating
-    # those pre-existing differences as conflicts.
     baseline_owners, baseline_errors = bulk_owners(client, items)
     for item in items:
         key = (item["entity"], item["id"])
         item["initial_owner_id"] = baseline_owners.get(key)
 
     old_owner_ids = sorted({
-        int(owner_id)
+        int(value)
         for item in items
-        if (owner_id := item.get("initial_owner_id")) and owner_id != target_owner_id
+        if (value := item.get("initial_owner_id")) and value != target_owner_id
     })
     operation = {
         "operation_id": operation_id,
@@ -273,9 +269,9 @@ def process_package_fast(
         "started_at": utc_now(),
         "finished_at": "",
         "attempt": attempt,
-        "package_contacts": max(len(package.get("contacts", [])) - 1, 0),
-        "package_companies": len(package.get("companies", [])),
-        "package_leads": sum(len(company.get("leads", [])) for company in package.get("companies", [])),
+        "package_contacts": sum(item["entity"] == "contact" for item in items),
+        "package_companies": sum(item["entity"] == "company" for item in items),
+        "package_leads": sum(item["entity"] == "lead" for item in items),
         "planned": 0,
         "updated": 0,
         "already_correct": 0,
@@ -318,8 +314,6 @@ def process_package_fast(
         if row["status"] == "REMAINING"
     ]
 
-    # One immediate reconciliation pass is enough for transient missed writes;
-    # anything still remaining is returned as PARTIAL and will be re-queued.
     if remaining_items and not stop_reason:
         retry_rows = [{
             "fio": operation["fio"],
@@ -335,22 +329,22 @@ def process_package_fast(
         final_owners, final_errors = bulk_owners(client, items)
         journal = _journal_rows(items, final_owners, final_errors, target_owner_id)
 
-    operation["remaining"] = sum(row["status"] == "REMAINING" for row in journal)
-    operation["conflicts"] = sum(row["status"] == "CONFLICT" for row in journal)
+    operation["remaining"] = sum(row["status"] in {"REMAINING", "DEFERRED"} for row in journal)
+    operation["conflicts"] = 0
     operation["failed"] = sum(row["status"] in {"FAILED", "MISSING"} for row in journal)
     operation["updated"] = sum(
         item.get("initial_owner_id") != target_owner_id and row["status"] == "DONE"
         for item, row in zip(items, journal)
     )
     if stop_reason:
-        operation["status"] = "MANUAL_REVIEW" if "source_owner_changed" in stop_reason else "PARTIAL"
+        operation["status"] = "PARTIAL"
         operation["last_error"] = stop_reason
-    elif operation["conflicts"] or operation["failed"]:
+    elif operation["failed"]:
         operation["status"] = "MANUAL_REVIEW"
-        operation["last_error"] = "conflict_or_missing_entity"
+        operation["last_error"] = "missing_or_unreadable_entity"
     elif operation["remaining"]:
         operation["status"] = "PARTIAL"
-        operation["last_error"] = "remaining_after_fast_retry"
+        operation["last_error"] = "fresh_change_deferred"
     else:
         operation["status"] = "DONE"
 
@@ -360,7 +354,7 @@ def process_package_fast(
     write_operation(output_dir, operation, journal)
 
     success = operation["status"] == "DONE"
-    retryable = operation["status"] == "PARTIAL" and not operation["conflicts"] and not operation["failed"]
+    retryable = operation["status"] == "PARTIAL" and not operation["failed"]
     return {
         "success": success,
         "retryable": retryable,
