@@ -18,6 +18,7 @@ const LEASE_MS = 30 * 60 * 1000;
 const RETRY_MS = 2 * 60 * 1000;
 const MAX_ATTEMPTS = 5;
 const ACTIVE_STATES = new Set(['CLAIMED', 'PROCESSING']);
+const SUPPRESS_TTL_MS = 5 * 60 * 1000;
 
 function json_(value) {
   return ContentService.createTextOutput(JSON.stringify(value)).setMimeType(ContentService.MimeType.JSON);
@@ -57,6 +58,8 @@ function rows_(sheet) {
 
 function iso_() { return new Date().toISOString(); }
 function active_(state) { return ACTIVE_STATES.has(String(state || '')); }
+function ownerKey_(contactId) { return 'OWNER_SYNC_LAST_' + String(contactId); }
+function suppressKey_(contactId) { return 'OWNER_SYNC_SUPPRESS_' + String(contactId); }
 
 function expired_(value, ageMs) {
   const time = new Date(value || 0).getTime();
@@ -93,6 +96,7 @@ function doPost(e) {
       if (body.action === 'progress') return json_(progress_(body));
       if (body.action === 'complete') return json_(complete_(body));
       if (body.action === 'release_dispatch') return json_(releaseDispatch_());
+      if (body.action === 'remember_owners') return json_(rememberOwners_(body));
       if (body.action === 'log_operation') return json_(logOperation_(body));
       if (body.action === 'log_operations') return json_(logOperations_(body));
       return json_({ok: false, error: 'unknown_action'});
@@ -108,6 +112,29 @@ function doPost(e) {
 function enqueue_(body) {
   const contactId = Number(body.contact_id);
   if (!Number.isSafeInteger(contactId) || contactId <= 0) return {ok: false, error: 'invalid_contact_id'};
+  const ownerId = Number(body.owner_id);
+  const hasOwner = Number.isSafeInteger(ownerId) && ownerId > 0;
+  const props = PropertiesService.getScriptProperties();
+
+  if (hasOwner) {
+    const suppressRaw = String(props.getProperty(suppressKey_(contactId)) || '');
+    const parts = suppressRaw.split(':');
+    const suppressOwner = Number(parts[0] || 0);
+    const suppressUntil = Number(parts[1] || 0);
+    if (suppressOwner === ownerId && suppressUntil >= Date.now()) {
+      props.deleteProperty(suppressKey_(contactId));
+      props.setProperty(ownerKey_(contactId), String(ownerId));
+      return {ok: true, queued: false, dispatch: false, reason: 'worker_owner_update', contact_id: contactId};
+    }
+    if (suppressRaw && suppressUntil < Date.now()) props.deleteProperty(suppressKey_(contactId));
+
+    const lastOwner = Number(props.getProperty(ownerKey_(contactId)) || 0);
+    if (lastOwner === ownerId) {
+      return {ok: true, queued: false, dispatch: false, reason: 'owner_unchanged', contact_id: contactId};
+    }
+    props.setProperty(ownerKey_(contactId), String(ownerId));
+  }
+
   const sheet = sheet_();
   const rows = rows_(sheet);
   normalizeStates_(rows);
@@ -126,12 +153,30 @@ function enqueue_(body) {
     if (!active_(row[2])) row[2] = 'PENDING';
   }
   writeRows_(sheet, rows);
-  const props = PropertiesService.getScriptProperties();
   const active = rows.some(row => active_(row[2]));
   const dispatchPending = props.getProperty('DISPATCH_PENDING') === '1';
   const dispatch = !active && !dispatchPending;
   if (dispatch) props.setProperty('DISPATCH_PENDING', '1');
-  return {ok: true, dispatch: dispatch, contact_id: contactId, version: rows[index][1]};
+  return {ok: true, queued: true, dispatch: dispatch, contact_id: contactId, version: rows[index][1]};
+}
+
+function rememberOwners_(body) {
+  const owners = Array.isArray(body.owners) ? body.owners : [];
+  if (!owners.length) return {ok: true, remembered: 0};
+  const props = PropertiesService.getScriptProperties();
+  const until = Date.now() + SUPPRESS_TTL_MS;
+  const values = {};
+  let remembered = 0;
+  owners.forEach(item => {
+    const contactId = Number(item && item.contact_id);
+    const ownerId = Number(item && item.owner_id);
+    if (!Number.isSafeInteger(contactId) || contactId <= 0) return;
+    if (!Number.isSafeInteger(ownerId) || ownerId <= 0) return;
+    values[suppressKey_(contactId)] = String(ownerId) + ':' + String(until);
+    remembered += 1;
+  });
+  if (remembered) props.setProperties(values, false);
+  return {ok: true, remembered: remembered};
 }
 
 function claim_(body) {
