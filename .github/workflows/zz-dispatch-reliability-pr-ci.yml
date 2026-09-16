@@ -29,4 +29,4 @@ jobs:
         working-directory: integrations/bitrix_owner_sync_webhook
         run: npm run check
 
-# temporary branch-only CI
+# temporary branch-only CI; rerun after contract-test fix
