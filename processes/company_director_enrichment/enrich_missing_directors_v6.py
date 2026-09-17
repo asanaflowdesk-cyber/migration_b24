@@ -92,9 +92,11 @@ def build_internal_repair_rows(
     snapshot: dict[str, list[dict[str, Any]]],
     workers: int,
 ) -> tuple[list[dict[str, Any]], set[int], set[int]]:
-    """Build rows that can be repaired from Bitrix itself, without public sites.
+    """Recover only partial work previously created by workflow 35.
 
-    Returns rows, handled company ids, conflict company ids.
+    Existing historical/manual director data is treated as already managed and
+    is never expanded into new contacts merely because RQ_DIRECTOR exists.
+    Public sources are used only when Bitrix has no director at all.
     """
     requisites_by_company: dict[int, list[dict[str, Any]]] = defaultdict(list)
     contacts_by_company: dict[int, list[dict[str, Any]]] = defaultdict(list)
@@ -117,8 +119,7 @@ def build_internal_repair_rows(
     primary_directors: dict[int, list[dict[str, Any]]] = {}
     req_directors: dict[int, set[str]] = {}
 
-    for company_id, company in companies.items():
-        del company
+    for company_id in companies:
         reqs = requisites_by_company.get(company_id, [])
         contacts = contacts_by_company.get(company_id, [])
         req_values = {
@@ -155,6 +156,8 @@ def build_internal_repair_rows(
         if not values:
             continue
 
+        # Any existing director in Bitrix means the company is not an external
+        # enrichment candidate. This preserves the original scope of workflow 35.
         handled.add(company_id)
         bin_number = base.current_bin(company, reqs)
         title = str(company.get("TITLE") or "")
@@ -182,17 +185,12 @@ def build_internal_repair_rows(
             )
             continue
 
-        director = next(iter(values))
-        has_req = bool(req_directors.get(company_id))
-        has_contact = bool(contacts)
-        managed = _managed_director_contact(contacts)
-
-        # Fully complete manually maintained records do not need to be touched.
-        # Managed contacts are rechecked so a partial previous 35 run repairs
-        # missing lead links/requisites on the next apply automatically.
-        if has_req and has_contact and not managed:
+        # Repair only records that workflow 35 itself created earlier. Without
+        # our marker, existing RQ_DIRECTOR/contact data is left untouched.
+        if not _managed_director_contact(contacts):
             continue
 
+        director = next(iter(values))
         rows.append(
             {
                 "company_id": company_id,
@@ -200,9 +198,9 @@ def build_internal_repair_rows(
                 "bin": bin_number,
                 "director": director,
                 "source": "bitrix",
-                "confidence": "internal",
+                "confidence": "internal_repair",
                 "status": "accepted",
-                "evidence": "Bitrix existing director",
+                "evidence": "Bitrix workflow-35 managed director",
                 "url": "",
                 "adata_status": "not_checked",
                 "adata_director": "",
@@ -237,7 +235,7 @@ def _external_rows(
 
     print(
         f"[DIRECTOR] external candidates={len(candidates)}; "
-        f"internal/excluded={len(excluded_company_ids)}",
+        f"known/excluded={len(excluded_company_ids)}",
         flush=True,
     )
     enriched = v3.enrich_candidates_two_sources(
@@ -274,7 +272,7 @@ def build_live_plan(
     seed_rows = v2._annotate_director_groups(seed_rows)
     print(
         f"[DIRECTOR] building live plan rows={len(seed_rows)} "
-        f"internal={len(internal_rows)} external={len(external_rows)}",
+        f"repair={len(internal_rows)} external={len(external_rows)}",
         flush=True,
     )
     rows = frozen.build_exact_dry_run_plan(client, seed_rows, workers)
@@ -328,7 +326,6 @@ def apply_live_plan_resilient(
             message = f"{key}:apply_error:{type(exc).__name__}:{exc}"
             row_errors.append(message)
             print(f"::warning::{message}", flush=True)
-            # Deliberately continue with the next independent director group.
             continue
 
     final_rows: list[dict[str, Any]] = []
@@ -350,8 +347,8 @@ def run(mode: str, output_dir: Path) -> int:
     )
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # The exact in-run plan is always persisted for audit. Apply does NOT depend
-    # on a previous run, artifact, PLAN_ID or commit SHA.
+    # Persist the exact same-run plan for audit only. The workflow never needs a
+    # previous artifact, run id, plan id or code SHA in order to execute.
     (output_dir / "company_director_live_plan.json").write_text(
         json.dumps(plan, ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -368,7 +365,6 @@ def run(mode: str, output_dir: Path) -> int:
         print(json.dumps(summary, ensure_ascii=False), flush=True)
         return 0
 
-    # Keep a readable copy of the exact plan immediately before mutations.
     report.write_report_v4(
         output_dir / "before_apply",
         rows,
@@ -396,8 +392,8 @@ def run(mode: str, output_dir: Path) -> int:
     print(json.dumps(summary, ensure_ascii=False), flush=True)
 
     # A global preflight failure means nothing was written and is a real run
-    # failure. Per-row errors are reported as warnings and do not stop unrelated
-    # groups; the next apply can repair those rows from current Bitrix state.
+    # failure. Per-group errors are reported and retried from live Bitrix state
+    # on the next apply; unrelated groups are not thrown away.
     return 0 if preflight_ok else 1
 
 
@@ -405,8 +401,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Self-contained director enrichment. Every run reads fresh Bitrix "
-            "state, repairs partial prior work, uses Adata/Kompra only for "
-            "truly unknown directors, and applies its own in-memory plan."
+            "state, repairs only workflow-35 partial work, uses Adata/Kompra "
+            "only for truly unknown directors, and applies its same-run plan."
         )
     )
     parser.add_argument(
