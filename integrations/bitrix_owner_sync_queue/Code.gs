@@ -19,7 +19,7 @@ const RETRY_MS = 2 * 60 * 1000;
 const MAX_ATTEMPTS = 5;
 const ACTIVE_STATES = new Set(['CLAIMED', 'PROCESSING']);
 const SUPPRESS_TTL_MS = 5 * 60 * 1000;
-const DISPATCH_LEASE_MS = 2 * 60 * 1000;
+const DISPATCH_LEASE_MS = 30 * 1000;
 
 function json_(value) {
   return ContentService.createTextOutput(JSON.stringify(value)).setMimeType(ContentService.MimeType.JSON);
