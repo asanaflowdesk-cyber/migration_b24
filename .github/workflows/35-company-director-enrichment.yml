@@ -23,68 +23,74 @@ permissions:
   contents: read
 
 env:
+  NODE_USE_SYSTEM_CA: "1"
   PYTHONUTF8: "1"
   PYTHONIOENCODING: "utf-8"
 
 jobs:
   enrich-missing-directors:
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: cmd
+        working-directory: processes/company_director_enrichment
 
     steps:
       - name: Получить код репозитория
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
 
-      - name: Python 3.12
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
-        with:
-          python-version: "3.12"
+      - name: Найти Python и создать локальное окружение
+        run: call ..\..\scripts\prepare-python.cmd
 
       - name: Установить зависимости
-        working-directory: processes/company_director_enrichment
         env:
           CUSTOM_PIP_INDEX_URL: ${{ vars.PIP_INDEX_URL }}
         run: |
-          if [ -n "$CUSTOM_PIP_INDEX_URL" ]; then export PIP_INDEX_URL="$CUSTOM_PIP_INDEX_URL"; fi
-          python -m pip install --disable-pip-version-check -r requirements.txt
+          if not "%CUSTOM_PIP_INDEX_URL%"=="" set "PIP_INDEX_URL=%CUSTOM_PIP_INDEX_URL%"
+          ".venv\Scripts\python.exe" -m pip install -r requirements.txt
 
       - name: Проверить код
-        working-directory: processes/company_director_enrichment
         env:
-          PYTHONPATH: ${{ github.workspace }}/processes/company_director_enrichment:${{ github.workspace }}/processes/eqazyna_leads
+          PYTHONPATH: ${{ github.workspace }}\processes\company_director_enrichment;${{ github.workspace }}\processes\eqazyna_leads
         run: |
-          python -m pytest -q tests
-          python -m py_compile enrich_missing_directors_v6.py director_frozen_plan_hotfix.py director_frozen_plan.py
-          python enrich_missing_directors_v6.py --help >/dev/null
+          chcp 65001 >nul
+          ".venv\Scripts\python.exe" -m pytest -q tests
+          if errorlevel 1 exit /b 1
+          ".venv\Scripts\python.exe" -m py_compile enrich_missing_directors_v6.py director_frozen_plan_hotfix.py director_frozen_plan.py
+          if errorlevel 1 exit /b 1
+          ".venv\Scripts\python.exe" enrich_missing_directors_v6.py --help >nul
 
       - name: Проверить подтверждение apply
         if: ${{ inputs.mode == 'apply' }}
         run: |
-          if [ "${{ inputs.confirm }}" != "APPLY_DIRECTOR_CHANGES" ]; then
-            echo "Для apply введите APPLY_DIRECTOR_CHANGES"
-            exit 1
-          fi
+          if not "${{ inputs.confirm }}"=="APPLY_DIRECTOR_CHANGES" (
+            echo Для apply введите APPLY_DIRECTOR_CHANGES
+            exit /b 1
+          )
 
       - name: Выполнить поток 35
-        working-directory: processes/company_director_enrichment
         env:
-          PYTHONPATH: ${{ github.workspace }}/processes/company_director_enrichment:${{ github.workspace }}/processes/eqazyna_leads
+          PYTHONPATH: ${{ github.workspace }}\processes\company_director_enrichment;${{ github.workspace }}\processes\eqazyna_leads
           TARGET_BITRIX_WEBHOOK_URL: ${{ secrets.TARGET_BITRIX_WEBHOOK_URL }}
           BITRIX_VERIFY_SSL: ${{ vars.BITRIX_VERIFY_SSL || 'true' }}
+          BITRIX_CA_BUNDLE: ${{ vars.BITRIX_CA_BUNDLE }}
           BITRIX_REQUEST_TIMEOUT: ${{ vars.BITRIX_REQUEST_TIMEOUT || '45' }}
           DIRECTOR_ENRICH_WORKERS: ${{ vars.DIRECTOR_ENRICH_WORKERS || '6' }}
           DIRECTOR_HTTP_TIMEOUT: ${{ vars.DIRECTOR_HTTP_TIMEOUT || '12' }}
         run: |
-          if [ -z "$TARGET_BITRIX_WEBHOOK_URL" ]; then
-            echo "Не задан secret TARGET_BITRIX_WEBHOOK_URL"
-            exit 1
-          fi
-          rm -rf output
-          mkdir -p output
-          python -u enrich_missing_directors_v6.py --mode "${{ inputs.mode }}" --output-dir output
-          echo "--- summary ---"
-          if [ -f output/company_director_run_summary.json ]; then cat output/company_director_run_summary.json; fi
-          if [ -f output/company_director_enrichment_summary.json ]; then cat output/company_director_enrichment_summary.json; fi
+          chcp 65001 >nul
+          if "%TARGET_BITRIX_WEBHOOK_URL%"=="" (
+            echo Не задан secret TARGET_BITRIX_WEBHOOK_URL
+            exit /b 1
+          )
+          if exist output rmdir /s /q output
+          mkdir output
+          ".venv\Scripts\python.exe" -u enrich_missing_directors_v6.py --mode "${{ inputs.mode }}" --output-dir output
+          set EXITCODE=%ERRORLEVEL%
+          if exist output\company_director_run_summary.json type output\company_director_run_summary.json
+          if exist output\company_director_enrichment_summary.json type output\company_director_enrichment_summary.json
+          exit /b %EXITCODE%
 
       - name: Загрузить отчет
         if: ${{ always() }}
