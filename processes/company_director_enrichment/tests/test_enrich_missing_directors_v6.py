@@ -117,7 +117,7 @@ def test_unmanaged_contact_only_is_not_touched(monkeypatch):
     assert rows == []
 
 
-def test_internal_conflict_is_never_sent_to_external(monkeypatch):
+def test_internal_historical_conflict_is_excluded_not_executed(monkeypatch):
     monkeypatch.setattr(v6, "_secondary_directors_for_missing", lambda *a, **k: {})
     snapshot = {
         "companies": [_company(1)],
@@ -127,23 +127,26 @@ def test_internal_conflict_is_never_sent_to_external(monkeypatch):
     rows, handled, conflicts = v6.build_internal_repair_rows(object(), snapshot, 2)
     assert handled == {1}
     assert conflicts == {1}
-    assert rows[0]["status"] == "source_conflict"
-    assert "ИВАНОВ" in rows[0]["evidence"]
-    assert "ПЕТРОВ" in rows[0]["evidence"]
+    assert rows == []
 
 
-def test_apply_continues_after_independent_group_error(monkeypatch):
+def _two_groups(monkeypatch):
     rows = [
         {"company_id": 1, "plan_status": "READY", "director": "A A"},
         {"company_id": 2, "plan_status": "READY", "director": "B B"},
     ]
-    plan = {"plan_id": "LIVE-1", "rows": rows}
-    monkeypatch.setattr(v6.frozen, "preflight_plan", lambda client, plan: (True, [], {}))
     monkeypatch.setattr(
         v6.frozen,
         "_group_rows",
         lambda ready: {"a a": [ready[0]], "b b": [ready[1]]},
     )
+    return rows
+
+
+def test_apply_continues_after_independent_group_error(monkeypatch):
+    rows = _two_groups(monkeypatch)
+    plan = {"plan_id": "LIVE-1", "rows": rows}
+    monkeypatch.setattr(v6.frozen, "preflight_plan", lambda client, plan: (True, [], {}))
 
     def fake_apply(client, group_rows, plan_id):
         if group_rows[0]["company_id"] == 1:
@@ -153,7 +156,36 @@ def test_apply_continues_after_independent_group_error(monkeypatch):
         return [result]
 
     monkeypatch.setattr(v6.reliable, "_apply_group_reliable", fake_apply)
-    final_rows, errors, preflight_ok = v6.apply_live_plan_resilient(object(), plan)
-    assert preflight_ok is True
+    final_rows, errors, execution_ok = v6.apply_live_plan_resilient(object(), plan)
+    assert execution_ok is True
     assert len(errors) == 1
+    assert final_rows[1]["verification_status"] == "VERIFIED"
+
+
+def test_preflight_failure_skips_only_one_group(monkeypatch):
+    rows = _two_groups(monkeypatch)
+    plan = {"plan_id": "LIVE-1", "rows": rows}
+
+    def fake_preflight(client, group_plan):
+        company_id = group_plan["rows"][0]["company_id"]
+        if company_id == 1:
+            return False, ["changed"], {}
+        return True, [], {}
+
+    applied: list[int] = []
+
+    def fake_apply(client, group_rows, plan_id):
+        applied.append(group_rows[0]["company_id"])
+        result = dict(group_rows[0])
+        result["verification_status"] = "VERIFIED"
+        return [result]
+
+    monkeypatch.setattr(v6.frozen, "preflight_plan", fake_preflight)
+    monkeypatch.setattr(v6.reliable, "_apply_group_reliable", fake_apply)
+    final_rows, errors, execution_ok = v6.apply_live_plan_resilient(object(), plan)
+
+    assert execution_ok is True
+    assert applied == [2]
+    assert any("preflight" in error for error in errors)
+    assert final_rows[0]["verification_status"] == "PREFLIGHT_FAILED"
     assert final_rows[1]["verification_status"] == "VERIFIED"
