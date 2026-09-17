@@ -7,47 +7,52 @@ on:
 permissions:
   contents: read
 
+env:
+  NODE_USE_SYSTEM_CA: "1"
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: "utf-8"
+
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Windows, X64]
     timeout-minutes: 30
+    defaults:
+      run:
+        shell: cmd
+        working-directory: processes/company_director_enrichment
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
+      - uses: actions/checkout@v5
+      - name: Prepare Python
+        run: call ..\..\scripts\prepare-python.cmd
       - name: Install dependencies
-        working-directory: processes/company_director_enrichment
-        run: python -m pip install --disable-pip-version-check -r requirements.txt
+        run: ".venv\Scripts\python.exe" -m pip install -r requirements.txt
       - name: Run tests
-        working-directory: processes/company_director_enrichment
         env:
-          PYTHONPATH: ${{ github.workspace }}/processes/company_director_enrichment:${{ github.workspace }}/processes/eqazyna_leads
-        run: python -m pytest -q tests
+          PYTHONPATH: ${{ github.workspace }}\processes\company_director_enrichment;${{ github.workspace }}\processes\eqazyna_leads
+        run: ".venv\Scripts\python.exe" -m pytest -q tests
       - name: Compile v6
-        working-directory: processes/company_director_enrichment
         env:
-          PYTHONPATH: ${{ github.workspace }}/processes/company_director_enrichment:${{ github.workspace }}/processes/eqazyna_leads
+          PYTHONPATH: ${{ github.workspace }}\processes\company_director_enrichment;${{ github.workspace }}\processes\eqazyna_leads
         run: |
-          python -m py_compile enrich_missing_directors_v6.py director_frozen_plan.py director_frozen_plan_hotfix.py
-          python enrich_missing_directors_v6.py --help >/dev/null
+          ".venv\Scripts\python.exe" -m py_compile enrich_missing_directors_v6.py director_frozen_plan.py director_frozen_plan_hotfix.py
+          ".venv\Scripts\python.exe" enrich_missing_directors_v6.py --help >nul
       - name: Live read-only dry_run
-        working-directory: processes/company_director_enrichment
         env:
-          PYTHONPATH: ${{ github.workspace }}/processes/company_director_enrichment:${{ github.workspace }}/processes/eqazyna_leads
+          PYTHONPATH: ${{ github.workspace }}\processes\company_director_enrichment;${{ github.workspace }}\processes\eqazyna_leads
           TARGET_BITRIX_WEBHOOK_URL: ${{ secrets.TARGET_BITRIX_WEBHOOK_URL }}
           BITRIX_VERIFY_SSL: ${{ vars.BITRIX_VERIFY_SSL || 'true' }}
+          BITRIX_CA_BUNDLE: ${{ vars.BITRIX_CA_BUNDLE }}
           BITRIX_REQUEST_TIMEOUT: ${{ vars.BITRIX_REQUEST_TIMEOUT || '45' }}
           DIRECTOR_ENRICH_WORKERS: ${{ vars.DIRECTOR_ENRICH_WORKERS || '6' }}
           DIRECTOR_HTTP_TIMEOUT: ${{ vars.DIRECTOR_HTTP_TIMEOUT || '12' }}
         run: |
-          test -n "$TARGET_BITRIX_WEBHOOK_URL"
-          rm -rf output
-          python -u enrich_missing_directors_v6.py --mode dry_run --output-dir output
-          cat output/company_director_enrichment_summary.json
+          if exist output rmdir /s /q output
+          mkdir output
+          ".venv\Scripts\python.exe" -u enrich_missing_directors_v6.py --mode dry_run --output-dir output
+          type output\company_director_enrichment_summary.json
       - name: Upload dry_run proof
         if: ${{ always() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: director-v6-live-dry-run
           path: processes/company_director_enrichment/output/
