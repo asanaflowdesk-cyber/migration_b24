@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "dry_run — только отчет; apply — заполнить руководителя и создать/пометить контакт"
+        description: "dry_run — только отчет; apply — создать/переиспользовать единого руководителя и связать компании/лиды"
         required: true
         default: dry_run
         type: choice
@@ -62,7 +62,7 @@ jobs:
           chcp 65001 >nul
           ".venv\Scripts\python.exe" -m pytest -q tests
           if errorlevel 1 exit /b 1
-          ".venv\Scripts\python.exe" enrich_missing_directors.py --help >nul
+          ".venv\Scripts\python.exe" enrich_missing_directors_v2.py --help >nul
 
       - name: Проверить подтверждение боевого запуска
         if: ${{ inputs.mode == 'apply' && inputs.confirm != 'ENRICH_MISSING_DIRECTORS' }}
@@ -88,9 +88,9 @@ jobs:
           )
           if not exist output mkdir output
           if "${{ inputs.mode }}"=="apply" (
-            ".venv\Scripts\python.exe" -u enrich_missing_directors.py --apply --max-companies "${{ inputs.max_companies }}" --output-dir output
+            ".venv\Scripts\python.exe" -u enrich_missing_directors_v2.py --apply --max-companies "${{ inputs.max_companies }}" --output-dir output
           ) else (
-            ".venv\Scripts\python.exe" -u enrich_missing_directors.py --max-companies "${{ inputs.max_companies }}" --output-dir output
+            ".venv\Scripts\python.exe" -u enrich_missing_directors_v2.py --max-companies "${{ inputs.max_companies }}" --output-dir output
           )
           if errorlevel 1 exit /b 1
           type output\company_director_enrichment_summary.json
