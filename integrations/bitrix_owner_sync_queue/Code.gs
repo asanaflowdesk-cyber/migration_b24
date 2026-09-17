@@ -19,6 +19,7 @@ const RETRY_MS = 2 * 60 * 1000;
 const MAX_ATTEMPTS = 5;
 const ACTIVE_STATES = new Set(['CLAIMED', 'PROCESSING']);
 const SUPPRESS_TTL_MS = 5 * 60 * 1000;
+const DISPATCH_LEASE_MS = 2 * 60 * 1000;
 
 function json_(value) {
   return ContentService.createTextOutput(JSON.stringify(value)).setMimeType(ContentService.MimeType.JSON);
@@ -60,6 +61,17 @@ function iso_() { return new Date().toISOString(); }
 function active_(state) { return ACTIVE_STATES.has(String(state || '')); }
 function ownerKey_(contactId) { return 'OWNER_SYNC_LAST_' + String(contactId); }
 function suppressKey_(contactId) { return 'OWNER_SYNC_SUPPRESS_' + String(contactId); }
+
+function dispatchPending_(props) {
+  const raw = String(props.getProperty('DISPATCH_PENDING') || '');
+  if (!raw) return false;
+  const startedAt = Number(raw);
+  if (!Number.isFinite(startedAt) || startedAt <= 0 || Date.now() - startedAt >= DISPATCH_LEASE_MS) {
+    props.deleteProperty('DISPATCH_PENDING');
+    return false;
+  }
+  return true;
+}
 
 function expired_(value, ageMs) {
   const time = new Date(value || 0).getTime();
@@ -155,9 +167,9 @@ function enqueue_(body) {
   }
   writeRows_(sheet, rows);
   const active = rows.some(row => active_(row[2]));
-  const dispatchPending = props.getProperty('DISPATCH_PENDING') === '1';
+  const dispatchPending = dispatchPending_(props);
   const dispatch = !active && !dispatchPending;
-  if (dispatch) props.setProperty('DISPATCH_PENDING', '1');
+  if (dispatch) props.setProperty('DISPATCH_PENDING', String(Date.now()));
   return {ok: true, queued: true, dispatch: dispatch, contact_id: contactId, version: rows[index][1]};
 }
 
