@@ -4,28 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "dry_run — создать утверждаемый план; apply — выполнить ранее созданный plan_id"
+        description: "dry_run — только отчет; apply — сразу применить свежий план"
         required: true
         default: dry_run
         type: choice
         options: [dry_run, apply]
-      max_companies:
-        description: "Только dry_run: сколько компаний проверить; 0 = все"
-        required: true
-        default: "0"
-        type: string
-      plan_run_id:
-        description: "Только apply: GitHub Run ID утвержденного dry_run"
-        required: false
-        default: ""
-        type: string
-      plan_id:
-        description: "Только apply: PLAN_ID из утвержденного dry_run"
-        required: false
-        default: ""
-        type: string
       confirm:
-        description: "Только apply: введите APPLY_DIRECTOR_PLAN"
+        description: "Только apply: введите APPLY_DIRECTOR_CHANGES"
         required: false
         default: ""
         type: string
@@ -36,7 +21,6 @@ concurrency:
 
 permissions:
   contents: read
-  actions: read
 
 env:
   NODE_USE_SYSTEM_CA: "1"
@@ -73,38 +57,19 @@ jobs:
           chcp 65001 >nul
           ".venv\Scripts\python.exe" -m pytest -q tests
           if errorlevel 1 exit /b 1
-          ".venv\Scripts\python.exe" -m py_compile director_frozen_plan.py director_frozen_plan_hotfix.py enrich_missing_directors_v4.py enrich_missing_directors_v5.py
+          ".venv\Scripts\python.exe" -m py_compile enrich_missing_directors_v6.py director_frozen_plan_hotfix.py director_frozen_plan.py
           if errorlevel 1 exit /b 1
-          ".venv\Scripts\python.exe" enrich_missing_directors_v5.py --help >nul
+          ".venv\Scripts\python.exe" enrich_missing_directors_v6.py --help >nul
 
-      - name: Проверить параметры apply
+      - name: Проверить подтверждение apply
         if: ${{ inputs.mode == 'apply' }}
         run: |
-          if not "${{ inputs.confirm }}"=="APPLY_DIRECTOR_PLAN" (
-            echo Для apply введите APPLY_DIRECTOR_PLAN
-            exit /b 1
-          )
-          if "${{ inputs.plan_run_id }}"=="" (
-            echo Не задан plan_run_id из утвержденного dry_run
-            exit /b 1
-          )
-          if "${{ inputs.plan_id }}"=="" (
-            echo Не задан plan_id из утвержденного dry_run
+          if not "${{ inputs.confirm }}"=="APPLY_DIRECTOR_CHANGES" (
+            echo Для apply введите APPLY_DIRECTOR_CHANGES
             exit /b 1
           )
 
-      - name: Скачать утвержденный план из dry_run
-        if: ${{ inputs.mode == 'apply' }}
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          run-id: ${{ inputs.plan_run_id }}
-          github-token: ${{ github.token }}
-          repository: ${{ github.repository }}
-          pattern: 35-company-director-enrichment-*
-          merge-multiple: true
-          path: processes/company_director_enrichment/approved_plan
-
-      - name: Выполнить dry_run или утвержденный план
+      - name: Выполнить поток 35
         env:
           PYTHONPATH: ${{ github.workspace }}\processes\company_director_enrichment;${{ github.workspace }}\processes\eqazyna_leads
           TARGET_BITRIX_WEBHOOK_URL: ${{ secrets.TARGET_BITRIX_WEBHOOK_URL }}
@@ -121,28 +86,13 @@ jobs:
           )
           if exist output rmdir /s /q output
           mkdir output
-          if "${{ inputs.mode }}"=="apply" (
-            if not exist approved_plan\company_director_plan.json (
-              echo В артефакте dry_run нет company_director_plan.json
-              exit /b 1
-            )
-            ".venv\Scripts\python.exe" -u enrich_missing_directors_v5.py ^
-              --apply-plan approved_plan\company_director_plan.json ^
-              --expected-plan-id "${{ inputs.plan_id }}" ^
-              --current-sha "${{ github.sha }}" ^
-              --output-dir output
-          ) else (
-            ".venv\Scripts\python.exe" -u enrich_missing_directors_v5.py ^
-              --max-companies "${{ inputs.max_companies }}" ^
-              --output-dir output
-          )
+          ".venv\Scripts\python.exe" -u enrich_missing_directors_v6.py --mode "${{ inputs.mode }}" --output-dir output
           set EXITCODE=%ERRORLEVEL%
-          if exist output\PLAN_ID.txt type output\PLAN_ID.txt
+          if exist output\company_director_run_summary.json type output\company_director_run_summary.json
           if exist output\company_director_enrichment_summary.json type output\company_director_enrichment_summary.json
-          dir output
           exit /b %EXITCODE%
 
-      - name: Загрузить отчет и неизменяемый план
+      - name: Загрузить отчет
         if: ${{ always() }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
