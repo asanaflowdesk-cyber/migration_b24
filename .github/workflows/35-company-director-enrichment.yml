@@ -1,0 +1,106 @@
+name: 35 | Обогащение компаний без руководителя
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "dry_run — только отчет; apply — заполнить руководителя и создать/пометить контакт"
+        required: true
+        default: dry_run
+        type: choice
+        options: [dry_run, apply]
+      max_companies:
+        description: "Сколько компаний проверить; 0 = все"
+        required: true
+        default: "0"
+        type: string
+      confirm:
+        description: "Для apply введите ENRICH_MISSING_DIRECTORS"
+        required: false
+        default: ""
+        type: string
+
+concurrency:
+  group: company-director-enrichment
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  NODE_USE_SYSTEM_CA: "1"
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: "utf-8"
+
+jobs:
+  enrich-missing-directors:
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: cmd
+        working-directory: processes/company_director_enrichment
+
+    steps:
+      - name: Получить код репозитория
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - name: Найти Python и создать локальное окружение
+        run: call ..\..\scripts\prepare-python.cmd
+
+      - name: Установить зависимости
+        env:
+          CUSTOM_PIP_INDEX_URL: ${{ vars.PIP_INDEX_URL }}
+        run: |
+          if not "%CUSTOM_PIP_INDEX_URL%"=="" set "PIP_INDEX_URL=%CUSTOM_PIP_INDEX_URL%"
+          ".venv\Scripts\python.exe" -m pip install -r requirements.txt
+
+      - name: Проверить код
+        env:
+          PYTHONPATH: ${{ github.workspace }}\processes\company_director_enrichment;${{ github.workspace }}\processes\eqazyna_leads
+        run: |
+          chcp 65001 >nul
+          ".venv\Scripts\python.exe" -m pytest -q tests
+          if errorlevel 1 exit /b 1
+          ".venv\Scripts\python.exe" enrich_missing_directors.py --help >nul
+
+      - name: Проверить подтверждение боевого запуска
+        if: ${{ inputs.mode == 'apply' && inputs.confirm != 'ENRICH_MISSING_DIRECTORS' }}
+        run: |
+          echo Для записи в Bitrix введите ENRICH_MISSING_DIRECTORS
+          exit /b 1
+
+      - name: Найти и обогатить компании без руководителя
+        env:
+          PYTHONPATH: ${{ github.workspace }}\processes\company_director_enrichment;${{ github.workspace }}\processes\eqazyna_leads
+          TARGET_BITRIX_WEBHOOK_URL: ${{ secrets.TARGET_BITRIX_WEBHOOK_URL }}
+          BITRIX_VERIFY_SSL: ${{ vars.BITRIX_VERIFY_SSL || 'true' }}
+          BITRIX_CA_BUNDLE: ${{ vars.BITRIX_CA_BUNDLE }}
+          BITRIX_REQUEST_TIMEOUT: ${{ vars.BITRIX_REQUEST_TIMEOUT || '45' }}
+          DIRECTOR_ENRICH_WORKERS: ${{ vars.DIRECTOR_ENRICH_WORKERS || '6' }}
+          DIRECTOR_HTTP_TIMEOUT: ${{ vars.DIRECTOR_HTTP_TIMEOUT || '12' }}
+          BA_SITEMAP_DOC_LIMIT: ${{ vars.BA_SITEMAP_DOC_LIMIT || '80' }}
+        run: |
+          chcp 65001 >nul
+          if "%TARGET_BITRIX_WEBHOOK_URL%"=="" (
+            echo Не задан secret TARGET_BITRIX_WEBHOOK_URL
+            exit /b 1
+          )
+          if not exist output mkdir output
+          if "${{ inputs.mode }}"=="apply" (
+            ".venv\Scripts\python.exe" -u enrich_missing_directors.py --apply --max-companies "${{ inputs.max_companies }}" --output-dir output
+          ) else (
+            ".venv\Scripts\python.exe" -u enrich_missing_directors.py --max-companies "${{ inputs.max_companies }}" --output-dir output
+          )
+          if errorlevel 1 exit /b 1
+          type output\company_director_enrichment_summary.json
+          dir output
+
+      - name: Загрузить отчет
+        if: ${{ always() }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: 35-company-director-enrichment-${{ github.run_number }}
+          path: processes/company_director_enrichment/output/
+          if-no-files-found: warn
+          retention-days: 7
