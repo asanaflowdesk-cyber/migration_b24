@@ -1,5 +1,10 @@
 import crypto from "node:crypto";
 
+const GITHUB_DISPATCH_ATTEMPTS = 3;
+const GITHUB_DISPATCH_TIMEOUT_MS = 3000;
+const GITHUB_RETRYABLE_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);
+const GITHUB_RETRY_DELAYS_MS = [250, 750];
+
 function secureEqual(left, right) {
   const leftBuffer = Buffer.from(String(left || ""));
   const rightBuffer = Buffer.from(String(right || ""));
@@ -33,6 +38,10 @@ function isFounderContact(contact) {
   return post.includes("руковод") || post.includes("учред") || comments.includes("EQAZYNA_DIRECTOR:");
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function fetchChangedContact(body, contactId) {
   const endpoint = String(valueAt(body, ["auth", "client_endpoint"], "auth[client_endpoint]") || "").trim();
   const token = String(valueAt(body, ["auth", "access_token"], "auth[access_token]") || "").trim();
@@ -63,6 +72,71 @@ async function queueRequest(action, payload = {}) {
   const data = await result.json().catch(() => ({}));
   if (!result.ok || !data.ok) throw new Error(`google_queue_${action}_failed`);
   return data;
+}
+
+async function recordDispatchError({contactId, version, error, status = 0, attempts = 0}) {
+  const payload = {
+    contact_id: contactId,
+    version: Number(version || 0),
+    error: String(error || "github_dispatch_failed").slice(0, 120),
+    status: Number(status || 0),
+    attempts: Number(attempts || 0),
+  };
+  try {
+    await queueRequest("dispatch_error", payload);
+    return;
+  } catch (queueError) {
+    console.error("Queue dispatch_error failed", queueError instanceof Error ? queueError.message : "unknown");
+  }
+  await queueRequest("release_dispatch").catch(() => {});
+}
+
+async function dispatchGithub({repository, token, actualDomain, queueVersion}) {
+  let lastStatus = 0;
+  let lastError = "github_dispatch_failed";
+
+  for (let attempt = 1; attempt <= GITHUB_DISPATCH_ATTEMPTS; attempt += 1) {
+    try {
+      const githubResponse = await fetch(`https://api.github.com/repos/${repository}/dispatches`, {
+        method: "POST",
+        headers: {
+          Accept: "application/vnd.github+json",
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+          "X-GitHub-Api-Version": "2022-11-28",
+          "User-Agent": "bitrix-owner-sync-webhook",
+        },
+        body: JSON.stringify({
+          event_type: "founder_batch_ready",
+          client_payload: {bitrix_domain: actualDomain, queue_version: String(queueVersion || "")},
+        }),
+        signal: AbortSignal.timeout(GITHUB_DISPATCH_TIMEOUT_MS),
+      });
+
+      lastStatus = githubResponse.status;
+      if (githubResponse.ok) {
+        return {ok: true, status: githubResponse.status, attempts: attempt, error: ""};
+      }
+
+      const body = (await githubResponse.text()).replace(/\s+/g, " ").trim().slice(0, 300);
+      lastError = body ? `github_http_${githubResponse.status}:${body}` : `github_http_${githubResponse.status}`;
+      console.error("GitHub dispatch failed", githubResponse.status, `attempt=${attempt}/${GITHUB_DISPATCH_ATTEMPTS}`, body);
+
+      if (!GITHUB_RETRYABLE_STATUSES.has(githubResponse.status)) {
+        return {ok: false, status: githubResponse.status, attempts: attempt, error: lastError};
+      }
+    } catch (error) {
+      lastStatus = 0;
+      lastError = error instanceof Error ? `github_network_${error.name}` : "github_network_error";
+      console.error("GitHub dispatch request failed", `attempt=${attempt}/${GITHUB_DISPATCH_ATTEMPTS}`, lastError);
+    }
+
+    if (attempt < GITHUB_DISPATCH_ATTEMPTS) {
+      await sleep(GITHUB_RETRY_DELAYS_MS[Math.min(attempt - 1, GITHUB_RETRY_DELAYS_MS.length - 1)]);
+    }
+  }
+
+  return {ok: false, status: lastStatus, attempts: GITHUB_DISPATCH_ATTEMPTS, error: lastError};
 }
 
 export default async function handler(request, response) {
@@ -114,29 +188,43 @@ export default async function handler(request, response) {
 
   const githubToken = String(process.env.GITHUB_DISPATCH_TOKEN || "").trim();
   const githubRepository = String(process.env.GITHUB_REPOSITORY || "").trim();
-  if (!githubToken || !/^[^/\s]+\/[^/\s]+$/.test(githubRepository)) return response.status(500).json({error: "github_dispatch_not_configured"});
-
-  const githubResponse = await fetch(`https://api.github.com/repos/${githubRepository}/dispatches`, {
-    method: "POST",
-    headers: {
-      Accept: "application/vnd.github+json",
-      Authorization: `Bearer ${githubToken}`,
-      "Content-Type": "application/json",
-      "X-GitHub-Api-Version": "2022-11-28",
-      "User-Agent": "bitrix-owner-sync-webhook",
-    },
-    body: JSON.stringify({
-      event_type: "founder_batch_ready",
-      client_payload: {bitrix_domain: actualDomain, queue_version: String(queued.version || "")},
-    }),
-  });
-
-  if (!githubResponse.ok) {
-    const githubError = (await githubResponse.text()).slice(0, 500);
-    console.error("GitHub dispatch failed", githubResponse.status, githubError);
-    await queueRequest("release_dispatch").catch(() => {});
-    return response.status(502).json({error: "github_dispatch_failed", status: githubResponse.status});
+  if (!githubToken || !/^[^/\s]+\/[^/\s]+$/.test(githubRepository)) {
+    await recordDispatchError({
+      contactId,
+      version: queued.version,
+      error: "github_dispatch_not_configured",
+      attempts: 0,
+    });
+    return response.status(500).json({error: "github_dispatch_not_configured"});
   }
 
-  return response.status(202).json({accepted: true, queued: true, dispatched: true, contact_id: contactId});
+  const dispatched = await dispatchGithub({
+    repository: githubRepository,
+    token: githubToken,
+    actualDomain,
+    queueVersion: queued.version,
+  });
+
+  if (!dispatched.ok) {
+    await recordDispatchError({
+      contactId,
+      version: queued.version,
+      error: dispatched.error,
+      status: dispatched.status,
+      attempts: dispatched.attempts,
+    });
+    return response.status(502).json({
+      error: "github_dispatch_failed",
+      status: dispatched.status,
+      attempts: dispatched.attempts,
+    });
+  }
+
+  return response.status(202).json({
+    accepted: true,
+    queued: true,
+    dispatched: true,
+    contact_id: contactId,
+    dispatch_attempts: dispatched.attempts,
+  });
 }

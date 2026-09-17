@@ -96,6 +96,7 @@ function doPost(e) {
       if (body.action === 'progress') return json_(progress_(body));
       if (body.action === 'complete') return json_(complete_(body));
       if (body.action === 'release_dispatch') return json_(releaseDispatch_());
+      if (body.action === 'dispatch_error') return json_(dispatchError_(body));
       if (body.action === 'remember_owners') return json_(rememberOwners_(body));
       if (body.action === 'log_operation') return json_(logOperation_(body));
       if (body.action === 'log_operations') return json_(logOperations_(body));
@@ -349,6 +350,34 @@ function logOperations_(body) {
     itemSheet.getRange(itemSheet.getLastRow() + 1, 1, itemRows.length, ITEM_HEADERS.length).setValues(itemRows);
   }
   return {ok: true, operations: operationRows.length, items: itemRows.length};
+}
+
+function dispatchError_(body) {
+  const contactId = Number(body.contact_id);
+  if (!Number.isSafeInteger(contactId) || contactId <= 0) return {ok: false, error: 'invalid_contact_id'};
+  const version = Number(body.version || 0);
+  const error = String(body.error || 'github_dispatch_failed').replace(/\s+/g, ' ').trim().slice(0, 140);
+  const status = Number(body.status || 0);
+  const attempts = Number(body.attempts || 0);
+  const sheet = sheet_();
+  const rows = rows_(sheet);
+  let touched = 0;
+  rows.forEach(row => {
+    if (Number(row[0]) !== contactId) return;
+    if (version > 0 && Number(row[1]) !== version) return;
+    if (active_(row[2])) return;
+    row[8] = ('DISPATCH_ERROR ' + error + '; status=' + status + '; attempts=' + attempts).slice(0, 250);
+    touched += 1;
+  });
+  writeRows_(sheet, rows);
+  PropertiesService.getScriptProperties().deleteProperty('DISPATCH_PENDING');
+  return {
+    ok: true,
+    touched: touched,
+    contact_id: contactId,
+    version: version,
+    pending: rows.filter(row => row[2] === 'PENDING').length
+  };
 }
 
 function releaseDispatch_() {
