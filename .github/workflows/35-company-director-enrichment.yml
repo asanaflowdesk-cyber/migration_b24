@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "dry_run — только отчет; apply — создать/переиспользовать единого руководителя и связать компании/лиды"
+        description: "dry_run — полный план без записи; apply — выполнить только безопасные строки плана"
         required: true
         default: dry_run
         type: choice
@@ -62,7 +62,7 @@ jobs:
           chcp 65001 >nul
           ".venv\Scripts\python.exe" -m pytest -q tests
           if errorlevel 1 exit /b 1
-          ".venv\Scripts\python.exe" enrich_missing_directors_v3.py --help >nul
+          ".venv\Scripts\python.exe" enrich_missing_directors_v4.py --help >nul
 
       - name: Проверить подтверждение боевого запуска
         if: ${{ inputs.mode == 'apply' && inputs.confirm != 'ENRICH_MISSING_DIRECTORS' }}
@@ -70,7 +70,7 @@ jobs:
           echo Для записи в Bitrix введите ENRICH_MISSING_DIRECTORS
           exit /b 1
 
-      - name: Найти и обогатить компании без руководителя
+      - name: Найти, построить план и обогатить компании без руководителя
         env:
           PYTHONPATH: ${{ github.workspace }}\processes\company_director_enrichment;${{ github.workspace }}\processes\eqazyna_leads
           TARGET_BITRIX_WEBHOOK_URL: ${{ secrets.TARGET_BITRIX_WEBHOOK_URL }}
@@ -87,9 +87,9 @@ jobs:
           )
           if not exist output mkdir output
           if "${{ inputs.mode }}"=="apply" (
-            ".venv\Scripts\python.exe" -u enrich_missing_directors_v3.py --apply --max-companies "${{ inputs.max_companies }}" --output-dir output
+            ".venv\Scripts\python.exe" -u enrich_missing_directors_v4.py --apply --max-companies "${{ inputs.max_companies }}" --output-dir output
           ) else (
-            ".venv\Scripts\python.exe" -u enrich_missing_directors_v3.py --max-companies "${{ inputs.max_companies }}" --output-dir output
+            ".venv\Scripts\python.exe" -u enrich_missing_directors_v4.py --max-companies "${{ inputs.max_companies }}" --output-dir output
           )
           if errorlevel 1 exit /b 1
           type output\company_director_enrichment_summary.json
