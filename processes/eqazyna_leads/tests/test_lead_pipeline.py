@@ -1218,6 +1218,55 @@ def test_owner_absent_from_user_list_goes_to_astana_head():
     assert result.assignment_reason == "missing_owner_to_department_head"
 
 
+def test_existing_bin_keeps_factual_owner_absent_from_user_list():
+    users = [
+        AssignmentUser(11, "Manager", 46, "УП г. Астана"),
+        AssignmentUser(99, "Head", 46, "УП г. Астана", "РОП"),
+    ]
+    departments = {46: {"ID": "46", "NAME": "УП г. Астана", "UF_HEAD": "99"}}
+    company = {
+        "ID": "601",
+        "TITLE": "ТОО Тест Недра",
+        "ORIGINATOR_ID": "EQAZYNA",
+        "ORIGIN_ID": "123456789012",
+        "ASSIGNED_BY_ID": "13",
+    }
+    contact = {
+        "ID": "801",
+        "LAST_NAME": "Иванов",
+        "NAME": "Иван",
+        "SECOND_NAME": "Иванович",
+        "COMPANY_ID": "601",
+        "ASSIGNED_BY_ID": "13",
+    }
+    client = sheet_client(
+        users,
+        departments,
+        company=company,
+        contact=contact,
+    )
+    subject = LeadPipeline(
+        client,
+        LeadPipelineConfig(distribution=sheet_distribution(users)),
+    )
+    subject.validate()
+
+    result = subject.process(application(), enrichment())
+
+    assert result.action == "created_lead"
+    assert result.assigned_by_id == 13
+    assert result.assignment_reason == "existing_bin_current_owner"
+    assert client.created_lead_fields["ASSIGNED_BY_ID"] == 13
+    assert (
+        not client.updated_company_fields
+        or "ASSIGNED_BY_ID" not in client.updated_company_fields
+    )
+    assert (
+        not client.updated_contact_fields
+        or "ASSIGNED_BY_ID" not in client.updated_contact_fields
+    )
+
+
 def test_single_user_in_branch_receives_all_new_founders_without_limit():
     users = [AssignmentUser(11, "Only manager", 10, "Алматинский филиал")]
     departments = {10: {"ID": "10", "NAME": "Алматинский филиал", "UF_HEAD": ""}}

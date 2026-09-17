@@ -577,6 +577,10 @@ class LeadPipeline:
                 assignment_contact,
                 app,
                 enrichment,
+                existing_bin_owner_id=self._existing_bin_owner_id(
+                    existing_company,
+                    existing_contact,
+                ),
             )
             reserved_manager_id = inherited_assigned_by_id
 
@@ -586,10 +590,17 @@ class LeadPipeline:
                     company_reference_lead,
                 )
             )
-            force_entity_assignment = assignment_reason not in {
-                "director_contact_owner",
-                "active_director_owner",
-            }
+            preserve_existing_package_owner = (
+                self._distribution is not None and existing_company is not None
+            )
+            force_entity_assignment = (
+                not preserve_existing_package_owner
+                and assignment_reason not in {
+                    "director_contact_owner",
+                    "active_director_owner",
+                    "existing_bin_current_owner",
+                }
+            )
 
             try:
                 company = self._ensure_company(
@@ -613,7 +624,18 @@ class LeadPipeline:
                     enrichment,
                     company.entity_id,
                     existing_contact=existing_contact,
-                    preferred_assigned_by_id=inherited_assigned_by_id,
+                    # For an existing contact the parser may use its factual
+                    # owner for the new lead, but must not rewrite the contact
+                    # itself. A newly created contact still receives the same
+                    # owner as its lead.
+                    preferred_assigned_by_id=(
+                        None
+                        if (
+                            preserve_existing_package_owner
+                            and existing_contact is not None
+                        )
+                        else inherited_assigned_by_id
+                    ),
                     force_assigned_by=force_entity_assignment,
                 )
                 contact_key = self._director_cache_key(app, enrichment)
@@ -759,12 +781,15 @@ class LeadPipeline:
         is preferred when it already has an approved owner. Otherwise we look
         for the same director FIO globally and inherit that historical owner.
         The global card is not re-linked or edited; it is only an assignment
-        reference for the new company/contact/lead bundle.
+        reference for the new company/contact/lead bundle. In sheet-driven
+        mode an existing BIN is handled separately and keeps its factual owner
+        without requiring that owner to be present in user_list.
         """
         if self._distribution is not None:
-            # In sheet-driven mode an owner absent from user_list is meaningful:
-            # it triggers routing to that branch's ROP, so it must not be erased
-            # by the old hard-coded approved-manager filter.
+            # For a new BIN an owner absent from user_list is meaningful: it
+            # triggers routing to that branch's ROP, so it must not be erased
+            # by the old hard-coded approved-manager filter. Existing BINs are
+            # resolved before that fallback and keep the factual owner.
             if self._record_assigned_by_id(existing_contact or {}) is not None:
                 return existing_contact
             person = self._split_director_name(enrichment.director)
@@ -832,20 +857,25 @@ class LeadPipeline:
         contact: dict[str, Any] | None,
         app: Application | None = None,
         enrichment: CompanyEnrichment | None = None,
+        *,
+        existing_bin_owner_id: int | None = None,
     ) -> tuple[int | None, str | None]:
         """Resolve the lead owner from one unambiguous source.
 
-        If the director contact already exists, its ``ASSIGNED_BY_ID`` is the
-        only historical assignment considered. Lead history and company owner
-        are deliberately ignored, so conflicting owners cannot compete. When
-        the contact has no approved owner (or is being created now), the lead
-        bundle is distributed randomly among the least-loaded approved
-        managers.
+        In sheet-driven mode an existing BIN keeps its factual contact owner,
+        or its company owner when the contact has none. New BINs continue to
+        use the configured distribution rules. In legacy mode the approved
+        director-contact owner remains the only historical assignment source.
         """
         if self._distribution is not None:
             if app is None or enrichment is None:
                 raise DistributionError("Для нового распределения не переданы данные заявки")
-            return self._resolve_sheet_assignment(contact, app, enrichment)
+            return self._resolve_sheet_assignment(
+                contact,
+                app,
+                enrichment,
+                existing_bin_owner_id=existing_bin_owner_id,
+            )
 
         manager_id = self._approved_record_assigned_by_id(contact or {})
         if manager_id is not None:
@@ -865,6 +895,8 @@ class LeadPipeline:
         contact: dict[str, Any] | None,
         app: Application,
         enrichment: CompanyEnrichment,
+        *,
+        existing_bin_owner_id: int | None = None,
     ) -> tuple[int, str]:
         fixed = self._distribution.company_assignments.get(normalise_bin(app.bin))
         if fixed is not None:
@@ -872,6 +904,14 @@ class LeadPipeline:
             # historical ownership and the one-new-founder capacity.
             self._founder_assignments.setdefault(self._founder_key(app, enrichment), fixed)
             return fixed, "company_fix"
+
+        # An existing BIN is not redistributed. Its factual owner is valid for
+        # the new lead even when that employee is absent from user_list. The
+        # sheet pool and ROP fallbacks are exclusively for newly encountered
+        # BINs. Do not bind this historical ID to other, new BINs of the same
+        # founder within the run.
+        if existing_bin_owner_id is not None:
+            return existing_bin_owner_id, "existing_bin_current_owner"
 
         owner_id = self._record_assigned_by_id(contact or {})
         founder_key = self._founder_key(app, enrichment)
@@ -976,6 +1016,25 @@ class LeadPipeline:
         self._founder_assignments[founder_key] = selected
         return selected, (
             "astana_overflow_to_rop" if is_astana else "overflow_to_rop"
+        )
+
+    def _existing_bin_owner_id(
+        self,
+        company: dict[str, Any] | None,
+        contact: dict[str, Any] | None,
+    ) -> int | None:
+        """Return the factual owner for an already known BIN.
+
+        The company-specific director contact is the strongest binding. If it
+        has no owner, preserve the current company owner for the new lead.
+        This helper deliberately ignores global same-FIO contacts: they may
+        belong to another BIN and therefore remain subject to normal routing.
+        """
+        if company is None:
+            return None
+        return (
+            self._record_assigned_by_id(contact or {})
+            or self._record_assigned_by_id(company)
         )
 
     def _owner_department_ids(self, owner_id: int) -> list[int]:
