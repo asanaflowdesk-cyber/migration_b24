@@ -1,16 +1,16 @@
-name: 31 | Пакеты учредителей — единый ответственный
+name: 31 | Синхронизация ответственных — руководитель → компании и лиды
 
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "dry_run — только отчет; apply — синхронизировать контакты, компании и лиды"
+        description: "dry_run — только отчет; apply — выровнять компании и лиды по текущему ответственному контакта руководителя"
         required: true
         default: dry_run
         type: choice
         options: [dry_run, apply]
       confirm:
-        description: "Для apply введите SYNC_COMPANY_OWNERS"
+        description: "Для apply введите SYNC_TO_DIRECTOR_OWNER"
         required: false
         default: ""
         type: string
@@ -29,7 +29,7 @@ env:
   PYTHONIOENCODING: "utf-8"
 
 jobs:
-  sync-company-owners:
+  reconcile-company-lead-owners:
     runs-on: [self-hosted, Windows, X64]
     timeout-minutes: 60
     defaults:
@@ -58,21 +58,22 @@ jobs:
           chcp 65001 >nul
           ".venv\Scripts\python.exe" -m pytest -q tests
           if errorlevel 1 exit /b 1
-          ".venv\Scripts\python.exe" sync_founder_packages.py --help >nul
+          ".venv\Scripts\python.exe" reconcile_company_lead_owners.py --help >nul
 
       - name: Проверить подтверждение боевого запуска
-        if: ${{ inputs.mode == 'apply' && inputs.confirm != 'SYNC_COMPANY_OWNERS' }}
+        if: ${{ inputs.mode == 'apply' && inputs.confirm != 'SYNC_TO_DIRECTOR_OWNER' }}
         run: |
-          echo Для записи в коробку введите SYNC_COMPANY_OWNERS
+          echo Для записи в коробку введите SYNC_TO_DIRECTOR_OWNER
           exit /b 1
 
-      - name: Сверить ответственных пакетов учредителей
+      - name: Выровнять компании и лиды по контакту руководителя
         env:
           PYTHONPATH: ${{ github.workspace }}\processes\company_owner_sync;${{ github.workspace }}\processes\eqazyna_leads
           TARGET_BITRIX_WEBHOOK_URL: ${{ secrets.TARGET_BITRIX_WEBHOOK_URL }}
           BITRIX_VERIFY_SSL: ${{ vars.BITRIX_VERIFY_SSL || 'true' }}
           BITRIX_CA_BUNDLE: ${{ vars.BITRIX_CA_BUNDLE }}
           BITRIX_REQUEST_TIMEOUT: ${{ vars.BITRIX_REQUEST_TIMEOUT || '45' }}
+          OWNER_SYNC_WORKERS: ${{ vars.OWNER_SYNC_WORKERS || '8' }}
         run: |
           chcp 65001 >nul
           if "%TARGET_BITRIX_WEBHOOK_URL%"=="" (
@@ -81,9 +82,9 @@ jobs:
           )
           if not exist output mkdir output
           if "${{ inputs.mode }}"=="apply" (
-            ".venv\Scripts\python.exe" -u sync_founder_packages.py --apply --output-dir output
+            ".venv\Scripts\python.exe" -u reconcile_company_lead_owners.py --apply --output-dir output
           ) else (
-            ".venv\Scripts\python.exe" -u sync_founder_packages.py --output-dir output
+            ".venv\Scripts\python.exe" -u reconcile_company_lead_owners.py --output-dir output
           )
           if errorlevel 1 exit /b 1
           type output\company_owner_sync_summary.json
@@ -93,7 +94,7 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
-          name: 31-company-owner-sync-${{ github.run_number }}
+          name: 31-company-lead-owner-reconcile-${{ github.run_number }}
           path: processes/company_owner_sync/output/
           if-no-files-found: warn
           retention-days: 7
