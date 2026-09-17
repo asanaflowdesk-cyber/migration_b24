@@ -25,11 +25,13 @@ jobs:
       - name: Prepare Python
         run: call ..\..\scripts\prepare-python.cmd
       - name: Install dependencies
-        run: ".venv\Scripts\python.exe" -m pip install -r requirements.txt
+        run: |
+          ".venv\Scripts\python.exe" -m pip install -r requirements.txt
       - name: Run tests
         env:
           PYTHONPATH: ${{ github.workspace }}\processes\company_director_enrichment;${{ github.workspace }}\processes\eqazyna_leads
-        run: ".venv\Scripts\python.exe" -m pytest -q tests
+        run: |
+          ".venv\Scripts\python.exe" -m pytest -q tests
       - name: Compile v6
         env:
           PYTHONPATH: ${{ github.workspace }}\processes\company_director_enrichment;${{ github.workspace }}\processes\eqazyna_leads
