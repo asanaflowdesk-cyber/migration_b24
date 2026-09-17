@@ -10,7 +10,7 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -31,3 +31,24 @@ jobs:
         run: |
           python -m py_compile enrich_missing_directors_v6.py director_frozen_plan.py director_frozen_plan_hotfix.py
           python enrich_missing_directors_v6.py --help >/dev/null
+      - name: Live read-only dry_run
+        working-directory: processes/company_director_enrichment
+        env:
+          PYTHONPATH: ${{ github.workspace }}/processes/company_director_enrichment:${{ github.workspace }}/processes/eqazyna_leads
+          TARGET_BITRIX_WEBHOOK_URL: ${{ secrets.TARGET_BITRIX_WEBHOOK_URL }}
+          BITRIX_VERIFY_SSL: ${{ vars.BITRIX_VERIFY_SSL || 'true' }}
+          BITRIX_REQUEST_TIMEOUT: ${{ vars.BITRIX_REQUEST_TIMEOUT || '45' }}
+          DIRECTOR_ENRICH_WORKERS: ${{ vars.DIRECTOR_ENRICH_WORKERS || '6' }}
+          DIRECTOR_HTTP_TIMEOUT: ${{ vars.DIRECTOR_HTTP_TIMEOUT || '12' }}
+        run: |
+          test -n "$TARGET_BITRIX_WEBHOOK_URL"
+          rm -rf output
+          python -u enrich_missing_directors_v6.py --mode dry_run --output-dir output
+          cat output/company_director_enrichment_summary.json
+      - name: Upload dry_run proof
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: director-v6-live-dry-run
+          path: processes/company_director_enrichment/output/
+          if-no-files-found: warn
