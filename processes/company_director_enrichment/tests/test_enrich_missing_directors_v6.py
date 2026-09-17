@@ -37,7 +37,7 @@ def _contact(company_id: int, contact_id: int, fio: str, comments: str = "") -> 
     }
 
 
-def test_internal_req_only_becomes_repair_row(monkeypatch):
+def test_existing_req_only_is_known_but_not_expanded(monkeypatch):
     monkeypatch.setattr(v6, "_secondary_directors_for_missing", lambda *a, **k: {})
     snapshot = {
         "companies": [_company(1)],
@@ -47,10 +47,7 @@ def test_internal_req_only_becomes_repair_row(monkeypatch):
     rows, handled, conflicts = v6.build_internal_repair_rows(object(), snapshot, 2)
     assert handled == {1}
     assert conflicts == set()
-    assert len(rows) == 1
-    assert rows[0]["status"] == "accepted"
-    assert rows[0]["source"] == "bitrix"
-    assert rows[0]["director"] == "ИВАНОВ ИВАН ИВАНОВИЧ"
+    assert rows == []
 
 
 def test_partial_managed_contact_is_repaired(monkeypatch):
@@ -71,7 +68,27 @@ def test_partial_managed_contact_is_repaired(monkeypatch):
     assert handled == {1}
     assert conflicts == set()
     assert len(rows) == 1
-    assert rows[0]["confidence"] == "internal"
+    assert rows[0]["confidence"] == "internal_repair"
+
+
+def test_complete_managed_record_may_be_rechecked_for_missing_links(monkeypatch):
+    monkeypatch.setattr(v6, "_secondary_directors_for_missing", lambda *a, **k: {})
+    snapshot = {
+        "companies": [_company(1)],
+        "requisites": [_req(1, 10, "ИВАНОВ ИВАН ИВАНОВИЧ")],
+        "contacts": [
+            _contact(
+                1,
+                100,
+                "ИВАНОВ ИВАН ИВАНОВИЧ",
+                "EQAZYNA_DIRECTOR: adata",
+            )
+        ],
+    }
+    rows, handled, conflicts = v6.build_internal_repair_rows(object(), snapshot, 2)
+    assert handled == {1}
+    assert conflicts == set()
+    assert len(rows) == 1
 
 
 def test_complete_manual_record_is_not_touched(monkeypatch):
@@ -79,6 +96,19 @@ def test_complete_manual_record_is_not_touched(monkeypatch):
     snapshot = {
         "companies": [_company(1)],
         "requisites": [_req(1, 10, "ИВАНОВ ИВАН ИВАНОВИЧ")],
+        "contacts": [_contact(1, 100, "ИВАНОВ ИВАН ИВАНОВИЧ")],
+    }
+    rows, handled, conflicts = v6.build_internal_repair_rows(object(), snapshot, 2)
+    assert handled == {1}
+    assert conflicts == set()
+    assert rows == []
+
+
+def test_unmanaged_contact_only_is_not_touched(monkeypatch):
+    monkeypatch.setattr(v6, "_secondary_directors_for_missing", lambda *a, **k: {})
+    snapshot = {
+        "companies": [_company(1)],
+        "requisites": [_req(1, 10, "")],
         "contacts": [_contact(1, 100, "ИВАНОВ ИВАН ИВАНОВИЧ")],
     }
     rows, handled, conflicts = v6.build_internal_repair_rows(object(), snapshot, 2)
