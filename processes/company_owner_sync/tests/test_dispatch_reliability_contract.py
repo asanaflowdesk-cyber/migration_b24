@@ -26,3 +26,13 @@ def test_queue_keeps_failed_dispatch_pending_and_visible():
     assert "deleteProperty('DISPATCH_PENDING')" in block
     assert "row[2] = 'DISPATCH_ERROR'" not in block
     assert "row[2] = 'MANUAL_REVIEW'" not in block
+
+
+def test_dispatch_lock_expires_instead_of_blocking_queue_forever():
+    source = QUEUE_GS.read_text(encoding="utf-8")
+    assert "const DISPATCH_LEASE_MS = 30 * 1000" in source
+    assert "function dispatchPending_(props)" in source
+    assert "Date.now() - startedAt >= DISPATCH_LEASE_MS" in source
+    assert "props.deleteProperty('DISPATCH_PENDING')" in source
+    assert "setProperty('DISPATCH_PENDING', String(Date.now()))" in source
+    assert "setProperty('DISPATCH_PENDING', '1')" not in source
