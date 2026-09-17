@@ -122,9 +122,10 @@ def test_fio_requires_last_and_first_name():
     assert person_from_text("Иванов") is None
 
 
-def test_workflow_runs_founder_package_module_only():
+def test_workflow_31_uses_only_canonical_company_lead_reconciler():
     workflow = (
         Path(__file__).resolve().parents[3] / ".github" / "workflows" / "31-company-owner-sync.yml"
     ).read_text(encoding="utf-8")
-    assert "sync_founder_packages.py" in workflow
-    assert "sync_company_owners.py" not in workflow
+    assert "reconcile_company_lead_owners.py" in workflow
+    assert "sync_founder_packages.py" not in workflow
+    assert "SYNC_TO_DIRECTOR_OWNER" in workflow
