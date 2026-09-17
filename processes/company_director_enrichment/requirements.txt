@@ -1,0 +1,4 @@
+requests==2.33.0
+truststore==0.10.4
+XlsxWriter==3.2.5
+pytest==9.0.3
