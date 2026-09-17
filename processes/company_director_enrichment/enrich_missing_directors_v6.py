@@ -56,12 +56,7 @@ def _secondary_directors_for_missing(
     company_ids: list[int],
     workers: int,
 ) -> dict[int, list[dict[str, Any]]]:
-    """Read secondary company-contact links only where snapshot has no director.
-
-    This avoids hundreds of unnecessary REST calls while still recovering a
-    partially completed previous run where the director was attached as a
-    secondary contact.
-    """
+    """Read secondary links only for companies with no known director."""
     result: dict[int, list[dict[str, Any]]] = {}
 
     def read(company_id: int) -> tuple[int, list[dict[str, Any]]]:
@@ -94,9 +89,9 @@ def build_internal_repair_rows(
 ) -> tuple[list[dict[str, Any]], set[int], set[int]]:
     """Recover only partial work previously created by workflow 35.
 
-    Existing historical/manual director data is treated as already managed and
-    is never expanded into new contacts merely because RQ_DIRECTOR exists.
-    Public sources are used only when Bitrix has no director at all.
+    Historical/manual director data is left untouched. Any company that already
+    has director information in Bitrix is excluded from public lookup. Only
+    records carrying a workflow-35 marker are repaired automatically.
     """
     requisites_by_company: dict[int, list[dict[str, Any]]] = defaultdict(list)
     contacts_by_company: dict[int, list[dict[str, Any]]] = defaultdict(list)
@@ -156,37 +151,16 @@ def build_internal_repair_rows(
         if not values:
             continue
 
-        # Any existing director in Bitrix means the company is not an external
-        # enrichment candidate. This preserves the original scope of workflow 35.
+        # Existing director data means this company is outside enrichment scope.
         handled.add(company_id)
-        bin_number = base.current_bin(company, reqs)
-        title = str(company.get("TITLE") or "")
-
         if len(values) != 1:
+            # Existing historical conflict is not workflow 35's job. Exclude it
+            # from public lookup and from the execution plan; do not block others.
             conflicts.add(company_id)
-            rows.append(
-                {
-                    "company_id": company_id,
-                    "title": title,
-                    "bin": bin_number,
-                    "director": "",
-                    "source": "bitrix",
-                    "confidence": "internal_conflict",
-                    "status": "source_conflict",
-                    "evidence": "Bitrix=" + " | ".join(sorted(values)),
-                    "url": "",
-                    "adata_status": "not_checked",
-                    "adata_director": "",
-                    "adata_url": "",
-                    "kompra_status": "not_checked",
-                    "kompra_director": "",
-                    "kompra_url": "",
-                }
-            )
             continue
 
-        # Repair only records that workflow 35 itself created earlier. Without
-        # our marker, existing RQ_DIRECTOR/contact data is left untouched.
+        # Repair only workflow-owned contacts. RQ-only and ordinary/manual
+        # contacts are deliberately not expanded or rewritten.
         if not _managed_director_contact(contacts):
             continue
 
@@ -194,8 +168,8 @@ def build_internal_repair_rows(
         rows.append(
             {
                 "company_id": company_id,
-                "title": title,
-                "bin": bin_number,
+                "title": str(company.get("TITLE") or ""),
+                "bin": base.current_bin(company, reqs),
                 "director": director,
                 "source": "bitrix",
                 "confidence": "internal_repair",
@@ -268,8 +242,7 @@ def build_live_plan(
         http_timeout,
     )
 
-    seed_rows = internal_rows + external_rows
-    seed_rows = v2._annotate_director_groups(seed_rows)
+    seed_rows = v2._annotate_director_groups(internal_rows + external_rows)
     print(
         f"[DIRECTOR] building live plan rows={len(seed_rows)} "
         f"repair={len(internal_rows)} external={len(external_rows)}",
@@ -279,10 +252,9 @@ def build_live_plan(
 
     run_id = str(os.getenv("GITHUB_RUN_ID") or "LOCAL")
     sha = str(os.getenv("GITHUB_SHA") or "LOCAL")
-    execution_id = f"LIVE-{run_id}"
     plan = {
         "schema_version": 0,
-        "plan_id": execution_id,
+        "plan_id": f"LIVE-{run_id}",
         "source_run_id": run_id,
         "source_sha": sha,
         "created_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -293,20 +265,27 @@ def build_live_plan(
     return plan, rows, skipped
 
 
+def _mark_group_preflight_failed(
+    applied_by_company: dict[int, dict[str, Any]],
+    group_rows: list[dict[str, Any]],
+) -> None:
+    for row in group_rows:
+        item = dict(row)
+        item["apply_status"] = "SKIPPED"
+        item["verification_status"] = "PREFLIGHT_FAILED"
+        applied_by_company[int(item["company_id"])] = item
+
+
 def apply_live_plan_resilient(
     client: BitrixClient,
     plan: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], list[str], bool]:
-    """Apply all independent groups; one bad company no longer aborts the rest."""
-    ok, preflight_errors, _ = frozen.preflight_plan(client, plan)
-    rows = [dict(row) for row in plan.get("rows") or []]
-    if not ok:
-        for row in rows:
-            if row.get("plan_status") == frozen.PLAN_READY:
-                row["apply_status"] = "NOT_STARTED"
-                row["verification_status"] = "PREFLIGHT_FAILED"
-        return rows, preflight_errors, False
+    """Preflight and apply each independent director group separately.
 
+    One changed/broken group is skipped and reported, while all unrelated groups
+    continue. There is no cross-run or all-or-nothing plan dependency.
+    """
+    rows = [dict(row) for row in plan.get("rows") or []]
     groups = frozen._group_rows(
         [row for row in rows if row.get("plan_status") == frozen.PLAN_READY]
     )
@@ -314,10 +293,28 @@ def apply_live_plan_resilient(
     row_errors: list[str] = []
 
     for key in sorted(groups):
+        group_rows = groups[key]
+        group_plan = dict(plan)
+        group_plan["rows"] = group_rows
+
+        try:
+            ok, preflight_errors, _ = frozen.preflight_plan(client, group_plan)
+        except Exception as exc:  # noqa: BLE001
+            ok = False
+            preflight_errors = [f"{type(exc).__name__}:{exc}"]
+
+        if not ok:
+            _mark_group_preflight_failed(applied_by_company, group_rows)
+            for error in preflight_errors:
+                message = f"{key}:preflight:{error}"
+                row_errors.append(message)
+                print(f"::warning::{message}", flush=True)
+            continue
+
         try:
             results = reliable._apply_group_reliable(
                 client,
-                groups[key],
+                group_rows,
                 str(plan["plan_id"]),
             )
             for result in results:
@@ -347,8 +344,7 @@ def run(mode: str, output_dir: Path) -> int:
     )
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Persist the exact same-run plan for audit only. The workflow never needs a
-    # previous artifact, run id, plan id or code SHA in order to execute.
+    # Audit copy only. Execution never depends on a previous artifact/run/plan.
     (output_dir / "company_director_live_plan.json").write_text(
         json.dumps(plan, ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -373,7 +369,7 @@ def run(mode: str, output_dir: Path) -> int:
         apply=False,
     )
 
-    final_rows, row_errors, preflight_ok = apply_live_plan_resilient(client, plan)
+    final_rows, row_errors, execution_ok = apply_live_plan_resilient(client, plan)
     summary = report.write_report_v4(
         output_dir,
         final_rows,
@@ -384,25 +380,24 @@ def run(mode: str, output_dir: Path) -> int:
     )
     summary["execution_mode"] = "self_contained"
     summary["row_errors_nonfatal"] = len(row_errors)
-    summary["preflight_ok"] = preflight_ok
+    summary["preflight_ok"] = execution_ok
     (output_dir / "company_director_run_summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
     print(json.dumps(summary, ensure_ascii=False), flush=True)
 
-    # A global preflight failure means nothing was written and is a real run
-    # failure. Per-group errors are reported and retried from live Bitrix state
-    # on the next apply; unrelated groups are not thrown away.
-    return 0 if preflight_ok else 1
+    # Row/group failures are visible in the report but never discard unrelated
+    # successful work. Fatal infrastructure/Bitrix snapshot errors still raise.
+    return 0
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Self-contained director enrichment. Every run reads fresh Bitrix "
-            "state, repairs only workflow-35 partial work, uses Adata/Kompra "
-            "only for truly unknown directors, and applies its same-run plan."
+            "state, repairs workflow-35 partial work, uses Adata/Kompra only "
+            "for truly unknown directors and applies the same-run plan."
         )
     )
     parser.add_argument(
