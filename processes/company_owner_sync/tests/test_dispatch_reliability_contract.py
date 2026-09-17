@@ -30,7 +30,7 @@ def test_queue_keeps_failed_dispatch_pending_and_visible():
 
 def test_dispatch_lock_expires_instead_of_blocking_queue_forever():
     source = QUEUE_GS.read_text(encoding="utf-8")
-    assert "const DISPATCH_LEASE_MS = 2 * 60 * 1000" in source
+    assert "const DISPATCH_LEASE_MS = 30 * 1000" in source
     assert "function dispatchPending_(props)" in source
     assert "Date.now() - startedAt >= DISPATCH_LEASE_MS" in source
     assert "props.deleteProperty('DISPATCH_PENDING')" in source
