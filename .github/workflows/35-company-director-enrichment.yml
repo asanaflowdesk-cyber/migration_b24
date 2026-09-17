@@ -73,9 +73,9 @@ jobs:
           chcp 65001 >nul
           ".venv\Scripts\python.exe" -m pytest -q tests
           if errorlevel 1 exit /b 1
-          ".venv\Scripts\python.exe" -m py_compile director_frozen_plan.py enrich_missing_directors_v4.py
+          ".venv\Scripts\python.exe" -m py_compile director_frozen_plan.py director_frozen_plan_hotfix.py enrich_missing_directors_v4.py enrich_missing_directors_v5.py
           if errorlevel 1 exit /b 1
-          ".venv\Scripts\python.exe" enrich_missing_directors_v4.py --help >nul
+          ".venv\Scripts\python.exe" enrich_missing_directors_v5.py --help >nul
 
       - name: Проверить параметры apply
         if: ${{ inputs.mode == 'apply' }}
@@ -126,13 +126,13 @@ jobs:
               echo В артефакте dry_run нет company_director_plan.json
               exit /b 1
             )
-            ".venv\Scripts\python.exe" -u enrich_missing_directors_v4.py ^
+            ".venv\Scripts\python.exe" -u enrich_missing_directors_v5.py ^
               --apply-plan approved_plan\company_director_plan.json ^
               --expected-plan-id "${{ inputs.plan_id }}" ^
               --current-sha "${{ github.sha }}" ^
               --output-dir output
           ) else (
-            ".venv\Scripts\python.exe" -u enrich_missing_directors_v4.py ^
+            ".venv\Scripts\python.exe" -u enrich_missing_directors_v5.py ^
               --max-companies "${{ inputs.max_companies }}" ^
               --output-dir output
           )
