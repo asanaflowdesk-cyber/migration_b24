@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 TEST_SUITES = [
     ("company_owner_sync", ROOT / "processes" / "company_owner_sync"),
+    ("company_data_update", ROOT / "processes" / "company_data_update"),
     ("eqazyna_leads", ROOT / "processes" / "eqazyna_leads"),
     ("eqazyna_status_sync", ROOT / "processes" / "eqazyna_status_sync"),
     ("excluded_user_reassignment", ROOT / "processes" / "excluded_user_reassignment"),
