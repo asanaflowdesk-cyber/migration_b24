@@ -54,14 +54,14 @@ jobs:
 
       - name: Установить зависимости
         env:
-          CUSTOM_PIP_INDEX_URL: \${{ vars.PIP_INDEX_URL }}
+          CUSTOM_PIP_INDEX_URL: ${{ vars.PIP_INDEX_URL }}
         run: |
           if not "%CUSTOM_PIP_INDEX_URL%"=="" set "PIP_INDEX_URL=%CUSTOM_PIP_INDEX_URL%"
           ".venv\Scripts\python.exe" -m pip install -r requirements.txt
 
       - name: Проверить код
         env:
-          PYTHONPATH: \${{ github.workspace }};\${{ github.workspace }}\processes\company_data_update
+          PYTHONPATH: ${{ github.workspace }};${{ github.workspace }}\processes\company_data_update
         run: |
           chcp 65001 >nul
           ".venv\Scripts\python.exe" -m pytest -q tests
@@ -71,19 +71,19 @@ jobs:
           ".venv\Scripts\python.exe" company_data_update.py --help >nul
 
       - name: Проверить подтверждение apply
-        if: \${{ inputs.mode == 'apply' }}
+        if: ${{ inputs.mode == 'apply' }}
         run: |
-          if not "\${{ inputs.confirm }}"=="APPLY_COMPANY_UPDATES" (
+          if not "${{ inputs.confirm }}"=="APPLY_COMPANY_UPDATES" (
             echo Для apply введите APPLY_COMPANY_UPDATES
             exit /b 1
           )
 
       - name: Выполнить поток 36
         env:
-          PYTHONPATH: \${{ github.workspace }};\${{ github.workspace }}\processes\company_data_update
-          TARGET_BITRIX_WEBHOOK_URL: \${{ secrets.TARGET_BITRIX_WEBHOOK_URL }}
-          GOOGLE_SERVICE_ACCOUNT_JSON: \${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          HTTP_TIMEOUT_SECONDS: \${{ vars.BITRIX_REQUEST_TIMEOUT || '45' }}
+          PYTHONPATH: ${{ github.workspace }};${{ github.workspace }}\processes\company_data_update
+          TARGET_BITRIX_WEBHOOK_URL: ${{ secrets.TARGET_BITRIX_WEBHOOK_URL }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          HTTP_TIMEOUT_SECONDS: ${{ vars.BITRIX_REQUEST_TIMEOUT || '45' }}
         run: |
           chcp 65001 >nul
           if "%TARGET_BITRIX_WEBHOOK_URL%"=="" (
@@ -96,16 +96,16 @@ jobs:
           )
           if exist output rmdir /s /q output
           mkdir output
-          ".venv\Scripts\python.exe" -u company_data_update.py --spreadsheet "\${{ inputs.spreadsheet }}" --sheet "\${{ inputs.sheet }}" --mode "\${{ inputs.mode }}"
+          ".venv\Scripts\python.exe" -u company_data_update.py --spreadsheet "${{ inputs.spreadsheet }}" --sheet "${{ inputs.sheet }}" --mode "${{ inputs.mode }}"
           set EXITCODE=%ERRORLEVEL%
           if exist output\summary.json type output\summary.json
           exit /b %EXITCODE%
 
       - name: Загрузить отчет
-        if: \${{ always() }}
+        if: ${{ always() }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
-          name: 36-company-data-update-\${{ github.run_number }}
+          name: 36-company-data-update-${{ github.run_number }}
           path: processes/company_data_update/output/
           if-no-files-found: warn
           retention-days: 30
