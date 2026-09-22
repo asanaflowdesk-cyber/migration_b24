@@ -87,11 +87,11 @@ jobs:
           HTTP_TIMEOUT_SECONDS: ${{ vars.BITRIX_REQUEST_TIMEOUT || '45' }}
         run: |
           chcp 65001 >nul
-          if "%TARGET_BITRIX_WEBHOOK_URL%"=="" (
+          if not defined TARGET_BITRIX_WEBHOOK_URL (
             echo Не задан secret TARGET_BITRIX_WEBHOOK_URL
             exit /b 1
           )
-          if "%GOOGLE_SERVICE_ACCOUNT_JSON%"=="" (
+          if not defined GOOGLE_SERVICE_ACCOUNT_JSON (
             echo Не задан secret GOOGLE_SERVICE_ACCOUNT_JSON
             exit /b 1
           )
