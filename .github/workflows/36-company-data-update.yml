@@ -6,11 +6,12 @@ on:
       spreadsheet:
         description: "ID или полная ссылка Google Sheets"
         required: true
+        default: "1WuRHHyQm5lHxDlW81m4P0oZJ6X_SDYj1bN-NOx8aM2k"
         type: string
       sheet:
         description: "Имя листа"
         required: true
-        default: "company_update"
+        default: "update_contact"
         type: string
       mode:
         description: "dry_run — проверить; apply — обновить Bitrix24"

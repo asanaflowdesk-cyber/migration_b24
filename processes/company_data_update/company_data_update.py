@@ -24,12 +24,12 @@ IDENTITY_ALIASES = {
     "name": {"name", "company_name", "company name", "название", "наименование", "title"},
     "phone": {"phone", "телефон", "телефоны"},
     "email": {"email", "e-mail", "почта", "электронная почта"},
-    "web": {"web", "website", "site", "сайт"},
+    "web": {"website", "site", "сайт", "website_url", "site_url"},
     "phone_type": {"phone_type", "phone type", "тип телефона"},
     "email_type": {"email_type", "email type", "тип email", "тип почты"},
     "web_type": {"web_type", "web type", "тип сайта"},
 }
-IGNORED_HEADERS = {header.casefold() for header in RESULT_COLUMNS} | {"address", "адрес"}
+IGNORED_HEADERS = {header.casefold() for header in RESULT_COLUMNS} | {"address", "адрес", "web"}
 
 
 @dataclass
@@ -78,6 +78,11 @@ def normalize_spreadsheet_id(value: str) -> str:
 
 def normalize_bin(value: Any) -> str:
     digits = re.sub(r"\D", "", clean(value))
+    # Google Sheets хранит ORIGIN_ID в текущем листе как число, поэтому БИН,
+    # начинающийся с 0, отображается как 11 цифр. Восстанавливаем ровно один
+    # потерянный ведущий ноль; остальные длины считаем некорректными.
+    if len(digits) == 11:
+        digits = "0" + digits
     return digits if len(digits) == 12 else ""
 
 
@@ -267,7 +272,7 @@ def resolve_company(
 ) -> tuple[dict[str, Any] | None, str]:
     expected_bin = normalize_bin(row.origin_id)
     if row.origin_id and not expected_bin:
-        return None, "ORIGIN_ID/БИН должен содержать ровно 12 цифр"
+        return None, "ORIGIN_ID/БИН должен содержать 12 цифр (11 допустимы только как БИН с потерянным ведущим нулём)"
 
     if row.company_id:
         if not row.company_id.isdigit() or int(row.company_id) <= 0:
@@ -328,6 +333,12 @@ def plan_multifields(
             current_keys.add(normalized)
             changes.append(f"{field} + {value}")
     return additions, changes, errors
+
+
+def build_fm_payload(items: list[dict[str, str]]) -> dict[str, dict[str, str]]:
+    # crm.item.update различает операции по ключу мультиполя. Новые значения
+    # должны идти как n0, n1, ...; список без этих ключей не используем.
+    return {f"n{index}": item for index, item in enumerate(items)}
 
 
 def values_equal(current: Any, desired: str) -> bool:
@@ -441,7 +452,7 @@ def main() -> int:
         description="Безопасное обновление компаний Bitrix24 из Google Sheets"
     )
     parser.add_argument("--spreadsheet", required=True, help="ID или ссылка Google Sheets")
-    parser.add_argument("--sheet", default="company_update")
+    parser.add_argument("--sheet", default="update_contact")
     parser.add_argument("--mode", choices=("dry_run", "apply"), default="dry_run")
     args = parser.parse_args()
 
@@ -520,7 +531,7 @@ def main() -> int:
             else:
                 fields: dict[str, Any] = dict(custom_updates)
                 if fm:
-                    fields["fm"] = fm
+                    fields["fm"] = build_fm_payload(fm)
                 client.call(
                     "crm.item.update",
                     {
