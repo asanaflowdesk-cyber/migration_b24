@@ -11,9 +11,10 @@ def test_split_values_semicolon_and_lines() -> None:
     assert app.split_values("+7 111; +7 222\n+7 111") == ["+7 111", "+7 222"]
 
 
-def test_normalize_bin_requires_12_digits() -> None:
+def test_normalize_bin_restores_one_lost_leading_zero() -> None:
     assert app.normalize_bin("250740900736") == "250740900736"
     assert app.normalize_bin("25 0740 900 736") == "250740900736"
+    assert app.normalize_bin("10540005723") == "010540005723"
     assert app.normalize_bin("123") == ""
 
 
@@ -53,3 +54,25 @@ def test_parse_rows_understands_russian_headers_and_custom_field() -> None:
     assert parsed[0].company_id == "96"
     assert parsed[0].origin_id == "250740900736"
     assert parsed[0].custom_fields == {"UF_CRM_123": "42"}
+
+
+def test_parse_rows_ignores_web_search_status_column() -> None:
+    rows = [
+        ["COMPANY_ID", "ORIGIN_ID", "NAME", "PHONE", "EMAIL", "WEB"],
+        ["96", "250740900736", "A", "+77001112233", "a@b.kz", "Найдено"],
+        ["108", "231040024610", "B", "—", "—", "Не найдено"],
+    ]
+    parsed, errors = app.parse_rows(rows, {})
+    assert not errors
+    assert [row.web for row in parsed] == ["", ""]
+
+
+def test_build_fm_payload_uses_bitrix_new_value_keys() -> None:
+    items = [
+        {"typeId": "PHONE", "valueType": "WORK", "value": "+77001112233"},
+        {"typeId": "EMAIL", "valueType": "WORK", "value": "a@b.kz"},
+    ]
+    assert app.build_fm_payload(items) == {
+        "n0": items[0],
+        "n1": items[1],
+    }
