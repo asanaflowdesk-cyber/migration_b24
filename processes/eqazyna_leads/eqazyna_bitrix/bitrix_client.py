@@ -556,6 +556,24 @@ class BitrixClient:
         origin_id: str,
         originator_id: str = "EQAZYNA",
     ) -> dict[str, Any] | None:
+        select = [
+            "ID",
+            "TITLE",
+            "ASSIGNED_BY_ID",
+            "COMMENTS",
+            "PHONE",
+            "ADDRESS",
+            "ADDRESS_CITY",
+            "ADDRESS_REGION",
+            "ADDRESS_PROVINCE",
+            "ADDRESS_COUNTRY",
+            "ORIGINATOR_ID",
+            "ORIGIN_ID",
+        ]
+        # New e-Qazyna companies carry both ORIGINATOR_ID and ORIGIN_ID.
+        # Migrated master companies can legitimately have the BIN in ORIGIN_ID
+        # without the EQAZYNA originator marker, so strict-only lookup would
+        # miss the existing master and create a duplicate.
         result = self.call(
             "crm.company.list",
             {
@@ -564,23 +582,21 @@ class BitrixClient:
                     "ORIGINATOR_ID": originator_id,
                     "ORIGIN_ID": origin_id,
                 },
-                "select": [
-                    "ID",
-                    "TITLE",
-                    "ASSIGNED_BY_ID",
-                    "COMMENTS",
-                    "PHONE",
-                    "ADDRESS",
-                    "ADDRESS_CITY",
-                    "ADDRESS_REGION",
-                    "ADDRESS_PROVINCE",
-                    "ADDRESS_COUNTRY",
-                    "ORIGINATOR_ID",
-                    "ORIGIN_ID",
-                ],
+                "select": select,
             },
         )
-        return result[0] if isinstance(result, list) and result else None
+        if isinstance(result, list) and result:
+            return result[0]
+
+        migrated = self.call(
+            "crm.company.list",
+            {
+                "order": {"ID": "ASC"},
+                "filter": {"=ORIGIN_ID": origin_id},
+                "select": select,
+            },
+        )
+        return migrated[0] if isinstance(migrated, list) and migrated else None
 
     def find_company_by_bin(
         self,
@@ -716,6 +732,61 @@ class BitrixClient:
             if raw_owner.isdigit() and int(raw_owner) > 0:
                 return row
         return directors[0]
+
+    def ensure_contact_company_link(
+        self,
+        contact_id: str | int,
+        company_id: str | int,
+    ) -> bool:
+        """Ensure an existing contact is linked to the company.
+
+        The primary company is left untouched. This is used when one director
+        controls several companies and the canonical director contact is
+        reused instead of creating one contact card per company.
+        """
+        contact_id_int = int(contact_id)
+        company_id_int = int(company_id)
+        bindings = self.call(
+            "crm.contact.company.items.get",
+            {"id": contact_id_int},
+        )
+        rows = bindings if isinstance(bindings, list) else []
+        linked_ids = {
+            int(str(row.get("COMPANY_ID")))
+            for row in rows
+            if isinstance(row, dict)
+            and str(row.get("COMPANY_ID") or "").strip().isdigit()
+        }
+        if company_id_int in linked_ids:
+            return False
+
+        self.call(
+            "crm.contact.company.add",
+            {
+                "id": contact_id_int,
+                "fields": {
+                    "COMPANY_ID": company_id_int,
+                    "IS_PRIMARY": "Y" if not rows else "N",
+                },
+            },
+        )
+        verify = self.call(
+            "crm.contact.company.items.get",
+            {"id": contact_id_int},
+        )
+        verify_rows = verify if isinstance(verify, list) else []
+        verify_ids = {
+            int(str(row.get("COMPANY_ID")))
+            for row in verify_rows
+            if isinstance(row, dict)
+            and str(row.get("COMPANY_ID") or "").strip().isdigit()
+        }
+        if company_id_int not in verify_ids:
+            raise BitrixError(
+                "crm.contact.company.add did not persist link "
+                f"contact={contact_id_int} company={company_id_int}"
+            )
+        return True
 
     def create_contact(self, fields: dict[str, Any]) -> str:
         result = self.call(

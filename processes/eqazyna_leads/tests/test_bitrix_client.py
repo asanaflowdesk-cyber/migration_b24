@@ -132,3 +132,66 @@ def test_find_lead_by_application_falls_back_to_legacy_comment():
     assert session.calls[-1][1]["filter"] == {
         "%COMMENTS": "Номер заявки: 47408-NEA",
     }
+
+
+
+def test_find_company_by_origin_falls_back_to_migrated_origin_without_originator():
+    session = FakeSession(
+        [
+            [],
+            [
+                {
+                    "ID": "120",
+                    "TITLE": "ТОО Тест Недра",
+                    "ORIGIN_ID": "123456789012",
+                    "ORIGINATOR_ID": "",
+                }
+            ],
+        ]
+    )
+    client = BitrixClient(
+        "https://box.example.invalid/rest/1/token",
+        polite_delay_seconds=0,
+        session=session,
+    )
+
+    company = client.find_company_by_origin("123456789012")
+
+    assert company["ID"] == "120"
+    assert len(session.calls) == 2
+    assert session.calls[0][1]["filter"] == {
+        "ORIGINATOR_ID": "EQAZYNA",
+        "ORIGIN_ID": "123456789012",
+    }
+    assert session.calls[1][1]["filter"] == {
+        "=ORIGIN_ID": "123456789012",
+    }
+
+
+def test_ensure_contact_company_link_keeps_existing_primary_and_adds_secondary():
+    session = FakeSession(
+        [
+            [{"COMPANY_ID": "555", "IS_PRIMARY": "Y"}],
+            True,
+            [
+                {"COMPANY_ID": "555", "IS_PRIMARY": "Y"},
+                {"COMPANY_ID": "601", "IS_PRIMARY": "N"},
+            ],
+        ]
+    )
+    client = BitrixClient(
+        "https://box.example.invalid/rest/1/token",
+        polite_delay_seconds=0,
+        session=session,
+    )
+
+    changed = client.ensure_contact_company_link("801", "601")
+
+    assert changed is True
+    assert session.calls[1][1] == {
+        "id": 801,
+        "fields": {
+            "COMPANY_ID": 601,
+            "IS_PRIMARY": "N",
+        },
+    }
