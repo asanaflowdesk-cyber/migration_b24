@@ -719,10 +719,23 @@ class LeadPipeline:
             originator_id=self.config.company_originator_id,
         )
         if company is None:
-            company = self.client.find_company_by_bin(
-                app.bin,
-                bin_field=self._requisite_bin_field,
-            )
+            # The migrated box stores company BINs mainly in RQ_INN, while
+            # newer e-Qazyna requisites can use RQ_BIN. Search every BIN field
+            # that the box actually exposes before deciding the company is new.
+            bin_fields = [self._requisite_bin_field]
+            for candidate in ("RQ_INN", "RQ_BIN"):
+                if (
+                    candidate in self._available_requisite_fields
+                    and candidate not in bin_fields
+                ):
+                    bin_fields.append(candidate)
+            for bin_field in bin_fields:
+                company = self.client.find_company_by_bin(
+                    app.bin,
+                    bin_field=bin_field,
+                )
+                if company is not None:
+                    break
         if company is not None:
             return company
 
@@ -1518,6 +1531,13 @@ class LeadPipeline:
             name,
             second_name,
         )
+        if contact is None:
+            # Flow 35 keeps one canonical director contact even when the same
+            # person controls several companies. Reuse that contact instead of
+            # creating a second card for the next BIN.
+            finder = getattr(self.client, "find_director_contact_global", None)
+            if callable(finder):
+                contact = finder(last_name, name, second_name)
         desired = self._contact_fields(app, enrichment, company_id, person, contact)
         current_owner = self._record_assigned_by_id(contact or {})
         if preferred_assigned_by_id and (
@@ -1540,10 +1560,32 @@ class LeadPipeline:
                     "dry_run_update_contact" if changed else "contact_unchanged",
                     contact,
                 )
+
+            link_warning: str | None = None
+            linker = getattr(self.client, "ensure_contact_company_link", None)
+            if callable(linker):
+                try:
+                    linker(contact_id, company_id)
+                except Exception as exc:  # noqa: BLE001 - lead/contact reuse must continue
+                    link_warning = (
+                        f"Контакт {contact_id} найден, но не удалось добавить связь "
+                        f"с компанией {company_id}: {exc}"
+                    )
+
             if changed:
                 self.client.update_contact(contact_id, changed)
-                return EntityOutcome(contact_id, "updated_contact", {**contact, **changed})
-            return EntityOutcome(contact_id, "contact_unchanged", contact)
+                return EntityOutcome(
+                    contact_id,
+                    "updated_contact",
+                    {**contact, **changed},
+                    warning=link_warning,
+                )
+            return EntityOutcome(
+                contact_id,
+                "contact_unchanged",
+                contact,
+                warning=link_warning,
+            )
 
         if self.config.dry_run:
             contact_key = self._director_cache_key(app, enrichment) or app.bin
@@ -1576,11 +1618,20 @@ class LeadPipeline:
             f"EQAZYNA_DIRECTOR:{app.bin}",
             contact_comment,
         )
+        current_primary_company_id = str((current or {}).get("COMPANY_ID") or "").strip()
+        primary_company_id = (
+            int(current_primary_company_id)
+            if current_primary_company_id.isdigit()
+            else int(company_id)
+        )
         fields: dict[str, object] = {
             "LAST_NAME": last_name,
             "NAME": name,
             "POST": "Руководитель",
-            "COMPANY_ID": int(company_id),
+            # Never move an existing canonical director contact away from its
+            # primary company. Additional companies are attached through
+            # crm.contact.company.add.
+            "COMPANY_ID": primary_company_id,
             "OPENED": "Y",
             "COMMENTS": comments,
         }
