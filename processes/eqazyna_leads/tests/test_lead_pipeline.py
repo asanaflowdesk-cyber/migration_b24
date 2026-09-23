@@ -193,7 +193,7 @@ class FakeClient:
         return self.company
 
     def find_company_by_bin(self, bin_number, bin_field="RQ_BIN"):
-        assert bin_field == "RQ_BIN"
+        assert bin_field in {"RQ_BIN", "RQ_INN"}
         return self.company
 
     def get_company(self, company_id):
@@ -299,7 +299,7 @@ def test_create_complete_crm_bundle_and_use_compact_title():
 
 def test_existing_migrated_company_is_found_via_rq_inn_before_creation():
     company = {
-        "ID": "120",
+        "ID": "601",
         "TITLE": "ТОО Тест Недра",
         "ORIGIN_ID": "",
         "ORIGINATOR_ID": "",
@@ -318,7 +318,7 @@ def test_existing_migrated_company_is_found_via_rq_inn_before_creation():
 
     result = pipeline(client).process(application(), enrichment())
 
-    assert result.company_id == "120"
+    assert result.company_id == "601"
     assert client.created_company_fields is None
     assert looked_up_fields == ["RQ_BIN", "RQ_INN"]
 
@@ -1023,7 +1023,9 @@ def test_same_director_on_another_company_has_priority_for_new_bundle_assignment
     assert result.assigned_by_id == 17
     assert result.assignment_reason == "director_contact_owner"
     assert client.created_lead_fields["ASSIGNED_BY_ID"] == 17
-    assert client.created_contact_fields["ASSIGNED_BY_ID"] == 17
+    assert result.contact_id == "700"
+    assert client.created_contact_fields is None
+    assert ("700", "601") in client.contact_company_links
     # Existing company ownership remains protected from parser-side rewrites.
     assert not client.updated_company_fields or "ASSIGNED_BY_ID" not in client.updated_company_fields
 
