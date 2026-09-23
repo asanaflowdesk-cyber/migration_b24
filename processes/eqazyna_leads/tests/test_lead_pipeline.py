@@ -100,6 +100,7 @@ class FakeClient:
         self.updated_company_fields = None
         self.created_contact_fields = None
         self.updated_contact_fields = None
+        self.contact_company_links = []
         self.created_requisite_fields = None
         self.updated_requisite_fields = None
         self.created_address_fields = None
@@ -126,6 +127,7 @@ class FakeClient:
     def get_requisite_fields(self):
         return {
             "RQ_BIN": {},
+            "RQ_INN": {},
             "RQ_COMPANY_NAME": {},
             "RQ_COMPANY_FULL_NAME": {},
             "RQ_DIRECTOR": {},
@@ -242,6 +244,13 @@ class FakeClient:
     def update_contact(self, contact_id, fields):
         self.updated_contact_fields = fields
 
+    def ensure_contact_company_link(self, contact_id, company_id):
+        link = (str(contact_id), str(company_id))
+        if link in self.contact_company_links:
+            return False
+        self.contact_company_links.append(link)
+        return True
+
     def add_timeline_comment(self, entity_type, entity_id, comment):
         self.timeline.append((entity_type, entity_id, comment))
         return "900"
@@ -286,6 +295,61 @@ def test_create_complete_crm_bundle_and_use_compact_title():
     assert result.assignment_reason == "least_loaded_random"
     assert "—" not in fields["TITLE"]
     assert len(client.timeline) == 1
+
+
+def test_existing_migrated_company_is_found_via_rq_inn_before_creation():
+    company = {
+        "ID": "120",
+        "TITLE": "ТОО Тест Недра",
+        "ORIGIN_ID": "",
+        "ORIGINATOR_ID": "",
+        "ASSIGNED_BY_ID": "22",
+    }
+    client = FakeClient(company=company, contact=None)
+    looked_up_fields = []
+
+    client.find_company_by_origin = lambda *args, **kwargs: None
+
+    def find_company_by_bin(bin_number, bin_field="RQ_BIN"):
+        looked_up_fields.append(bin_field)
+        return company if bin_field == "RQ_INN" else None
+
+    client.find_company_by_bin = find_company_by_bin
+
+    result = pipeline(client).process(application(), enrichment())
+
+    assert result.company_id == "120"
+    assert client.created_company_fields is None
+    assert looked_up_fields == ["RQ_BIN", "RQ_INN"]
+
+
+def test_global_director_contact_is_reused_without_moving_primary_company():
+    company = {
+        "ID": "601",
+        "TITLE": "ТОО Тест Недра",
+        "ORIGINATOR_ID": "EQAZYNA",
+        "ORIGIN_ID": "123456789012",
+        "ASSIGNED_BY_ID": "22",
+    }
+    global_contact = {
+        "ID": "801",
+        "LAST_NAME": "Иванов",
+        "NAME": "Иван",
+        "SECOND_NAME": "Иванович",
+        "POST": "Руководитель",
+        "COMPANY_ID": "555",
+        "ASSIGNED_BY_ID": "22",
+        "OPENED": "Y",
+        "COMMENTS": "[[EQAZYNA_DIRECTOR:999999999999]]",
+    }
+    client = FakeClient(company=company, contact=None, global_contact=global_contact)
+
+    result = pipeline(client).process(application(), enrichment())
+
+    assert result.contact_id == "801"
+    assert client.created_contact_fields is None
+    assert ("801", "601") in client.contact_company_links
+    assert not client.updated_contact_fields or client.updated_contact_fields.get("COMPANY_ID") != 601
 
 
 def test_existing_migrated_company_requisite_and_contact_are_reused():
