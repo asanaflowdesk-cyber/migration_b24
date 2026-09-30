@@ -1,4 +1,5 @@
 from reconcile_company_lead_owners import (
+    add_direct_contact_leads,
     company_lead_items,
     is_director_authority_contact,
     reconcile_package,
@@ -110,6 +111,28 @@ def test_company_lead_plan_never_contains_contact_updates():
     assert {(item["entity"], item["id"]) for item in items} == {
         ("company", 10),
         ("lead", 20),
+    }
+
+
+def test_direct_contact_lead_without_company_is_reconciled_once():
+    source = package()
+    source["authority_contact_ids"] = [100]
+    enriched = add_direct_contact_leads(
+        [source],
+        [
+            {"ID": "20", "CONTACT_ID": "100", "TITLE": "Already in company", "ASSIGNED_BY_ID": "8"},
+            {"ID": "21", "CONTACT_ID": "100", "TITLE": "Only contact relation", "ASSIGNED_BY_ID": "9"},
+            {"ID": "22", "CONTACT_ID": "200", "TITLE": "Another contact", "ASSIGNED_BY_ID": "9"},
+        ],
+    )
+
+    assert enriched[0]["direct_contact_leads"] == [
+        {"id": 21, "title": "Only contact relation", "owner_id": 9},
+    ]
+    assert {(item["entity"], item["id"]) for item in company_lead_items(enriched[0])} == {
+        ("company", 10),
+        ("lead", 20),
+        ("lead", 21),
     }
 
 
