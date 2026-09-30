@@ -1,4 +1,4 @@
-from package_reconciler import process_package
+from package_reconciler import package_items, process_package
 
 
 class Client:
@@ -101,3 +101,19 @@ def test_third_party_owner_change_becomes_manual_review(tmp_path):
     company = next(item for item in result["items"] if item["entity"] == "company")
     assert company["status"] == "CONFLICT"
     assert company["actual_owner_id"] == 33
+
+
+def test_direct_contact_lead_is_part_of_package_once():
+    source = package()
+    source["direct_contact_leads"] = [
+        {"id": 21, "title": "Заявка только по контакту", "owner_id": 9},
+        {"id": 20, "title": "Повтор лида компании", "owner_id": 9},
+    ]
+
+    items = package_items(source, source_contact_id=100)
+
+    assert {(item["entity"], item["id"]) for item in items} == {
+        ("company", 10),
+        ("lead", 20),
+        ("lead", 21),
+    }
