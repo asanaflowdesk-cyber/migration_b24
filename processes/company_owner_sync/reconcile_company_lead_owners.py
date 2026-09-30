@@ -205,10 +205,14 @@ def add_direct_contact_leads(
     """
     result: list[dict[str, Any]] = []
     for package in packages:
-        authority_ids = {
+        # Authority decides the target manager, but every contact card in that
+        # resolved person package can own a direct lead. Limiting this to the
+        # authority card left leads attached to another card of the same
+        # director/founder out of workflow 31.
+        contact_ids = {
             int(contact_id)
-            for contact_id in package.get("authority_contact_ids", [])
-            if normalized_id(contact_id)
+            for contact in package.get("contacts", [])
+            if (contact_id := normalized_id(contact.get("id"))) is not None
         }
         company_lead_ids = {
             normalized_id(lead.get("id"))
@@ -224,7 +228,7 @@ def add_direct_contact_leads(
             }
             for lead in leads
             if (lead_id := normalized_id(lead.get("ID")))
-            and normalized_id(lead.get("CONTACT_ID")) in authority_ids
+            and normalized_id(lead.get("CONTACT_ID")) in contact_ids
             and lead_id not in company_lead_ids
         ]
         item = copy.deepcopy(package)
