@@ -38,6 +38,16 @@ def user_name(client: Any, user_id: int | None, cache: dict[int, str]) -> str:
 
 def package_items(package: dict[str, Any], source_contact_id: int) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
+    seen: set[tuple[str, int]] = set()
+
+    def add_lead(lead: dict[str, Any]) -> None:
+        lead_id = normalized_id(lead.get("id"))
+        key = ("lead", lead_id or 0)
+        if not lead_id or key in seen:
+            return
+        seen.add(key)
+        rows.append({"entity": "lead", "id": lead_id, "title": str(lead.get("title") or "").strip(), "initial_owner_id": normalized_id(lead.get("owner_id"))})
+
     for contact in package.get("contacts", []):
         item_id = normalized_id(contact.get("id"))
         if item_id and item_id != source_contact_id:
@@ -47,9 +57,9 @@ def package_items(package: dict[str, Any], source_contact_id: int) -> list[dict[
         if company_id:
             rows.append({"entity": "company", "id": company_id, "title": str(company.get("title") or "").strip(), "initial_owner_id": normalized_id(company.get("owner_id"))})
         for lead in company.get("leads", []):
-            lead_id = normalized_id(lead.get("id"))
-            if lead_id:
-                rows.append({"entity": "lead", "id": lead_id, "title": str(lead.get("title") or "").strip(), "initial_owner_id": normalized_id(lead.get("owner_id"))})
+            add_lead(lead)
+    for lead in package.get("direct_contact_leads", []):
+        add_lead(lead)
     return rows
 
 
@@ -160,7 +170,7 @@ def process_package(
         "attempt": attempt,
         "package_contacts": max(len(package.get("contacts", [])) - 1, 0),
         "package_companies": len(package.get("companies", [])),
-        "package_leads": sum(len(company.get("leads", [])) for company in package.get("companies", [])),
+        "package_leads": sum(len(company.get("leads", [])) for company in package.get("companies", [])) + len(package.get("direct_contact_leads", [])),
         "planned": sum(item.get("initial_owner_id") != target_owner_id for item in items),
         "updated": 0,
         "already_correct": sum(item.get("initial_owner_id") == target_owner_id for item in items),
