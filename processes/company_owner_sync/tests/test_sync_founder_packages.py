@@ -40,6 +40,20 @@ def test_two_companies_of_same_founder_form_one_package():
     assert {row["target"] for row in build_update_rows(packages)} == {17}
 
 
+def test_direct_contact_relation_wins_over_stale_requisite_director():
+    packages, skipped = build_packages(
+        [company(10, 9)],
+        [lead(1, 10, 9, 100)],
+        [contact(100, "Иванов Иван Иванович", 17, 10)],
+        [requisite(10, "Петров Петр Петрович")],
+    )
+
+    assert skipped == []
+    assert len(packages) == 1
+    assert packages[0]["fio"] == "Иванов Иван Иванович"
+    assert [item["id"] for item in packages[0]["companies"]] == [10]
+
+
 def test_patronymic_optional_when_base_is_unambiguous():
     packages, _ = build_packages([company(10, 9)], [], [contact(100, "Иванов Иван Иванович", 17)], [requisite(10, "Иванов Иван")])
     assert len(packages) == 1
