@@ -1,4 +1,4 @@
-from queue_founder_packages import _coalesce_and_partition, process_claim
+from queue_founder_packages import _coalesce_and_partition, add_direct_contact_leads, process_claim
 
 
 class Client:
@@ -71,6 +71,20 @@ def test_overlap_partition_assigns_each_entity_to_only_one_job():
     assert owned[0].isdisjoint(owned[1])
     assert ("company", 20) in owned[1]
     assert ("lead", 30) in owned[1]
+
+
+def test_direct_contact_lead_without_company_is_kept_in_event_package():
+    packages = [{
+        "contacts": [{"id": 1}],
+        "companies": [{"id": 10, "leads": [{"id": 20, "title": "company lead"}]}],
+    }]
+    enriched = add_direct_contact_leads(packages, [
+        {"ID": "20", "CONTACT_ID": "1", "TITLE": "company lead", "ASSIGNED_BY_ID": "11"},
+        {"ID": "21", "CONTACT_ID": "1", "TITLE": "contact lead", "ASSIGNED_BY_ID": "12"},
+    ])
+    assert enriched[0]["direct_contact_leads"] == [
+        {"id": 21, "title": "contact lead", "owner_id": 12},
+    ]
 
 
 def test_ordinary_contact_is_ignored_without_failing_claim(tmp_path):
