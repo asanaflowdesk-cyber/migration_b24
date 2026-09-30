@@ -161,6 +161,20 @@ def resolve_authority_packages(
 
 def company_lead_items(package: dict[str, Any]) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
+    seen: set[tuple[str, int]] = set()
+
+    def add_lead(lead: dict[str, Any]) -> None:
+        lead_id = normalized_id(lead.get("id"))
+        key = ("lead", lead_id or 0)
+        if not lead_id or key in seen:
+            return
+        seen.add(key)
+        items.append({
+            "entity": "lead",
+            "id": lead_id,
+            "title": str(lead.get("title") or ""),
+        })
+
     for company in package.get("companies", []):
         company_id = normalized_id(company.get("id"))
         if company_id:
@@ -170,14 +184,53 @@ def company_lead_items(package: dict[str, Any]) -> list[dict[str, Any]]:
                 "title": str(company.get("title") or ""),
             })
         for lead in company.get("leads", []):
-            lead_id = normalized_id(lead.get("id"))
-            if lead_id:
-                items.append({
-                    "entity": "lead",
-                    "id": lead_id,
-                    "title": str(lead.get("title") or ""),
-                })
+            add_lead(lead)
+    # A lead can be related only to the director contact, without COMPANY_ID.
+    # It is still part of the manual reconciliation scope of workflow 31.
+    for lead in package.get("direct_contact_leads", []):
+        add_lead(lead)
     return items
+
+
+def add_direct_contact_leads(
+    packages: list[dict[str, Any]],
+    leads: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Attach leads linked directly to authority contacts, even without a company.
+
+    ``build_packages`` groups companies and their leads. Workflow 31 also has to
+    reconcile leads whose only reliable relation is ``CONTACT_ID`` of the
+    director contact. Keep this enrichment local to workflow 31: 31A owns a
+    separate full-package contract.
+    """
+    result: list[dict[str, Any]] = []
+    for package in packages:
+        authority_ids = {
+            int(contact_id)
+            for contact_id in package.get("authority_contact_ids", [])
+            if normalized_id(contact_id)
+        }
+        company_lead_ids = {
+            normalized_id(lead.get("id"))
+            for company in package.get("companies", [])
+            for lead in company.get("leads", [])
+            if normalized_id(lead.get("id"))
+        }
+        direct_leads = [
+            {
+                "id": lead_id,
+                "title": str(lead.get("TITLE") or "").strip(),
+                "owner_id": normalized_id(lead.get("ASSIGNED_BY_ID")),
+            }
+            for lead in leads
+            if (lead_id := normalized_id(lead.get("ID")))
+            and normalized_id(lead.get("CONTACT_ID")) in authority_ids
+            and lead_id not in company_lead_ids
+        ]
+        item = copy.deepcopy(package)
+        item["direct_contact_leads"] = direct_leads
+        result.append(item)
+    return result
 
 
 def live_authority_owner(
@@ -324,6 +377,7 @@ def run(client: BitrixClient, output_dir: Path, apply: bool) -> dict[str, Any]:
         snapshot["requisites"],
     )
     packages, authority_skipped = resolve_authority_packages(raw_packages, snapshot["contacts"])
+    packages = add_direct_contact_leads(packages, snapshot["leads"])
     skipped = raw_skipped + authority_skipped
 
     print(
@@ -367,7 +421,11 @@ def run(client: BitrixClient, output_dir: Path, apply: bool) -> dict[str, Any]:
         "mode": "apply" if apply else "dry_run",
         "packages": len(packages),
         "companies": sum(len(package.get("companies", [])) for package in packages),
-        "leads": sum(len(company.get("leads", [])) for package in packages for company in package.get("companies", [])),
+        "leads": sum(
+            len(company.get("leads", []))
+            for package in packages
+            for company in package.get("companies", [])
+        ) + sum(len(package.get("direct_contact_leads", [])) for package in packages),
         "checked": len(rows),
         "planned": sum(row.get("status") == "planned" for row in rows),
         "updated": sum(row.get("status") == "updated" for row in rows),
