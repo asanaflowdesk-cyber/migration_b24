@@ -114,25 +114,27 @@ def test_company_lead_plan_never_contains_contact_updates():
     }
 
 
-def test_direct_contact_lead_without_company_is_reconciled_once():
-    source = package()
+def test_direct_contact_lead_from_any_package_card_is_reconciled_once():
+    source = package((100, 200))
     source["authority_contact_ids"] = [100]
     enriched = add_direct_contact_leads(
         [source],
         [
             {"ID": "20", "CONTACT_ID": "100", "TITLE": "Already in company", "ASSIGNED_BY_ID": "8"},
             {"ID": "21", "CONTACT_ID": "100", "TITLE": "Only contact relation", "ASSIGNED_BY_ID": "9"},
-            {"ID": "22", "CONTACT_ID": "200", "TITLE": "Another contact", "ASSIGNED_BY_ID": "9"},
+            {"ID": "22", "CONTACT_ID": "200", "TITLE": "Another package contact", "ASSIGNED_BY_ID": "9"},
         ],
     )
 
     assert enriched[0]["direct_contact_leads"] == [
         {"id": 21, "title": "Only contact relation", "owner_id": 9},
+        {"id": 22, "title": "Another package contact", "owner_id": 9},
     ]
     assert {(item["entity"], item["id"]) for item in company_lead_items(enriched[0])} == {
         ("company", 10),
         ("lead", 20),
         ("lead", 21),
+        ("lead", 22),
     }
 
 
