@@ -151,7 +151,50 @@ def _package_entity_keys(package: dict[str, Any]) -> set[tuple[str, int]]:
         for lead in company.get("leads", []):
             if (lead_id := normalized_id(lead.get("id"))) is not None:
                 keys.add(("lead", lead_id))
+    for lead in package.get("direct_contact_leads", []):
+        if (lead_id := normalized_id(lead.get("id"))) is not None:
+            keys.add(("lead", lead_id))
     return keys
+
+
+def add_direct_contact_leads(
+    packages: list[dict[str, Any]],
+    leads: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Add leads whose only reliable package relation is CONTACT_ID.
+
+    The full package builder nests leads below companies. A lead without a
+    company must still move when the responsible person of its director contact
+    changes. This enrichment is used only by the event queue.
+    """
+    enriched: list[dict[str, Any]] = []
+    for package in packages:
+        contact_ids = {
+            normalized_id(contact.get("id"))
+            for contact in package.get("contacts", [])
+            if normalized_id(contact.get("id"))
+        }
+        nested_lead_ids = {
+            normalized_id(lead.get("id"))
+            for company in package.get("companies", [])
+            for lead in company.get("leads", [])
+            if normalized_id(lead.get("id"))
+        }
+        direct_leads = [
+            {
+                "id": lead_id,
+                "title": str(lead.get("TITLE") or "").strip(),
+                "owner_id": normalized_id(lead.get("ASSIGNED_BY_ID")),
+            }
+            for lead in leads
+            if (lead_id := normalized_id(lead.get("ID")))
+            and normalized_id(lead.get("CONTACT_ID")) in contact_ids
+            and lead_id not in nested_lead_ids
+        ]
+        item = dict(package)
+        item["direct_contact_leads"] = direct_leads
+        enriched.append(item)
+    return enriched
 
 
 def _job_rank(job: dict[str, Any]) -> tuple[str, int, int]:
@@ -230,6 +273,7 @@ def process_claim(
         snapshot["contacts"],
         snapshot["requisites"],
     )
+    packages = add_direct_contact_leads(packages, snapshot["leads"])
     print(
         "[PROCESSING] snapshot: ready; "
         f"companies={len(snapshot['companies'])}; leads={len(snapshot['leads'])}; "
