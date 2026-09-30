@@ -124,24 +124,32 @@ def build_packages(
         if contact_id in contact_keys:
             contacts_by_key[contact_keys[contact_id]].append(contact)
 
-    company_candidate_keys: dict[int, set[tuple[str, str, str]]] = defaultdict(set)
-    for company_id, key in requisite_keys.items():
-        company_candidate_keys[company_id].add(key)
+    # A direct CRM link from the company (or a lead of that company) to a
+    # founder contact is stronger than an old director value in requisites.
+    # Requisites are often historical/imported data and can legitimately name
+    # a different person. Treating both sources as equal used to drop the
+    # entire company and all of its leads as a "conflict".
+    company_direct_keys: dict[int, set[tuple[str, str, str]]] = defaultdict(set)
     for contact in contacts:
         contact_id = normalized_id(contact.get("ID"))
         company_id = normalized_id(contact.get("COMPANY_ID"))
         if contact_id in contact_keys and company_id:
-            company_candidate_keys[company_id].add(contact_keys[contact_id])
+            company_direct_keys[company_id].add(contact_keys[contact_id])
     for lead in leads:
         contact_id = normalized_id(lead.get("CONTACT_ID"))
         company_id = normalized_id(lead.get("COMPANY_ID"))
         if contact_id in contact_keys and company_id:
-            company_candidate_keys[company_id].add(contact_keys[contact_id])
+            company_direct_keys[company_id].add(contact_keys[contact_id])
 
     company_key: dict[int, tuple[str, str, str]] = {}
     skipped: list[dict[str, Any]] = []
     company_by_id = {normalized_id(item.get("ID")): item for item in companies}
-    for company_id, keys in company_candidate_keys.items():
+    for company_id in sorted(set(requisite_keys) | set(company_direct_keys)):
+        direct_keys = company_direct_keys.get(company_id, set())
+        # Prefer exactly one explicit CRM relation. Only competing explicit
+        # relations are a real ambiguity; a requisite never overrides a live
+        # contact/company association.
+        keys = direct_keys or ({requisite_keys[company_id]} if company_id in requisite_keys else set())
         if len(keys) == 1:
             company_key[company_id] = next(iter(keys))
         elif len(keys) > 1:
