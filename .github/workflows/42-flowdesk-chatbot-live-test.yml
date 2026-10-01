@@ -27,11 +27,6 @@ jobs:
     runs-on: [self-hosted, Windows, X64]
     timeout-minutes: 10
 
-    defaults:
-      run:
-        shell: cmd
-        working-directory: processes/flowdesk_chatbot
-
     steps:
       - name: Получить код репозитория
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
@@ -39,23 +34,16 @@ jobs:
           clean: false
           fetch-depth: 1
 
-      - name: Найти Python и создать локальное окружение
-        run: call ..\..\scripts\prepare-python.cmd
-
-      - name: Установить зависимости
-        if: ${{ inputs.action == 'start' || inputs.action == 'restart' }}
-        env:
-          CUSTOM_PIP_INDEX_URL: ${{ vars.PIP_INDEX_URL }}
-        run: |
-          if not "%CUSTOM_PIP_INDEX_URL%"=="" set "PIP_INDEX_URL=%CUSTOM_PIP_INDEX_URL%"
-          ".venv\Scripts\python.exe" -m pip install -r ..\flowdesk\requirements.txt
-
       - name: Управлять DeskFlow worker
+        shell: cmd
         env:
           PYTHONUNBUFFERED: "1"
           PYTHONPATH: ${{ github.workspace }}
           TARGET_BITRIX_WEBHOOK_URL: ${{ secrets.TARGET_BITRIX_WEBHOOK_URL }}
           FLOWDESK_PROJECT_ID: "2"
           FLOWDESK_BOT_NAME: "DeskFlow Test"
+          CUSTOM_PIP_INDEX_URL: ${{ vars.PIP_INDEX_URL }}
         run: |
-          ".venv\Scripts\python.exe" -u worker_control.py "${{ inputs.action }}"
+          set "PYTHON_EXE=C:\Users\Alyona.Sachyova\AppData\Local\Programs\Python\Python312\python.exe"
+          if not "%CUSTOM_PIP_INDEX_URL%"=="" set "PIP_INDEX_URL=%CUSTOM_PIP_INDEX_URL%"
+          "%PYTHON_EXE%" -u processes\flowdesk_chatbot\worker_control.py "${{ inputs.action }}"
