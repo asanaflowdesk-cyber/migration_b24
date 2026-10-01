@@ -32,6 +32,7 @@ def new_session(user_id: int, dialog_id: str) -> dict[str, Any]:
         "detail_index": 0,
         "instruction_path": None,
         "task_id": None,
+        "active_message_id": None,
         "data": {
             "request_type": None,
             "target": None,
