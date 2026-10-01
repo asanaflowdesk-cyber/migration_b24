@@ -361,8 +361,15 @@ class Runtime:
         current = view(session)
         text = text_override if text_override is not None else current["text"]
 
-        # Button-only screens lock free text; text-entry and finished screens unlock it.
-        text_enabled = bool(current["accepts_text"] or current["terminal"])
+        # Keep the first screen writable as a recovery point. In this box version,
+        # disabling the field on the very first screen can make the newly created
+        # service chat look completely locked before the first interaction.
+        # After the first button click, button-only screens are locked as intended.
+        text_enabled = bool(
+            current["accepts_text"]
+            or current["terminal"]
+            or current["screen"] == "type"
+        )
         self.set_text_field(session["dialog_id"], text_enabled)
 
         message_id = session.get("active_message_id")
