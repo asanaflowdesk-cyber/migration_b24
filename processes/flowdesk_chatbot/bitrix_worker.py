@@ -232,15 +232,67 @@ class Runtime:
         if not isinstance(result, dict) or result.get("result") is not True:
             raise RuntimeError(f"Command.answer вернул неожиданный ответ: {result!r}")
 
-    def send_current(self, session: dict[str, Any]) -> None:
+    def update_message(
+        self,
+        message_id: int,
+        text: str,
+        *,
+        session: dict[str, Any] | None = None,
+        link_button: dict[str, str] | None = None,
+    ) -> None:
+        fields = self.message_fields(
+            text,
+            session=session,
+            link_button=link_button,
+        )
+
+        result = self.call(
+            "imbot.v2.Chat.Message.update",
+            {
+                "botId": self.bot_id,
+                "botToken": self.bot_token,
+                "messageId": int(message_id),
+                "fields": fields,
+            },
+        )
+
+        if not isinstance(result, dict):
+            raise RuntimeError(f"Message.update вернул неожиданный ответ: {result!r}")
+
+    def render_current(
+        self,
+        session: dict[str, Any],
+        *,
+        link_button: dict[str, str] | None = None,
+        text_override: str | None = None,
+    ) -> None:
         current = view(session)
-        self.send(session["dialog_id"], current["text"], session=session)
+        text = text_override if text_override is not None else current["text"]
+
+        message_id = session.get("active_message_id")
+        if message_id:
+            self.update_message(
+                int(message_id),
+                text,
+                session=None if link_button else session,
+                link_button=link_button,
+            )
+        else:
+            message_id = self.send(
+                session["dialog_id"],
+                text,
+                session=None if link_button else session,
+                link_button=link_button,
+            )
+            session["active_message_id"] = int(message_id)
+
+        key = self.session_key(session["dialog_id"], int(session["user_id"]))
+        self.store.put_session(key, session)
 
         if current["terminal"] and current["screen"] == "instruction":
             session["current_screen"] = "done"
             session["history"] = []
             session["revision"] = int(session["revision"]) + 1
-            key = self.session_key(session["dialog_id"], int(session["user_id"]))
             self.store.put_session(key, session)
 
     def find_existing_task(self, xml_id: str) -> str:
@@ -302,8 +354,13 @@ class Runtime:
         return f"/company/personal/user/{user_id}/tasks/task/view/{task_id}/"
 
     def restart_session(self, dialog_id: str, user_id: int) -> dict[str, Any]:
+        key = self.session_key(dialog_id, user_id)
+        previous = self.store.get_session(key)
+        active_message_id = previous.get("active_message_id") if previous else None
+
         session = new_session(user_id=user_id, dialog_id=dialog_id)
-        self.store.put_session(self.session_key(dialog_id, user_id), session)
+        session["active_message_id"] = active_message_id
+        self.store.put_session(key, session)
         return session
 
     def handle_message(self, data: dict[str, Any]) -> None:
@@ -326,8 +383,8 @@ class Runtime:
         if text.casefold() in TRIGGERS:
             LOG.info("Trigger received from user=%s dialog=%s text=%r", user_id, dialog_id, text)
             session = self.restart_session(dialog_id, user_id)
-            self.send_current(session)
-            LOG.info("First screen sent to user=%s dialog=%s", user_id, dialog_id)
+            self.render_current(session)
+            LOG.info("First screen rendered for user=%s dialog=%s", user_id, dialog_id)
             return
 
         if session is None or session.get("current_screen") == "done":
@@ -353,7 +410,7 @@ class Runtime:
             return
 
         self.store.put_session(key, session)
-        self.send_current(session)
+        self.render_current(session)
 
     def handle_command(self, data: dict[str, Any]) -> None:
         command = data.get("command") or {}
@@ -371,8 +428,7 @@ class Runtime:
         session = self.store.get_session(key)
         if session is None:
             session = self.restart_session(dialog_id, user_id)
-            current = view(session)
-            self.answer_command(data, current["text"], session=session)
+            self.render_current(session)
             return
 
         raw_params = str(command.get("params") or "")
@@ -381,9 +437,9 @@ class Runtime:
             revision = int(revision_text)
             index = int(index_text)
         except (ValueError, TypeError):
-            self.answer_command(
-                data,
-                "Кнопка повреждена. Напишите «SOS» и начните заново.",
+            self.render_current(
+                session,
+                text_override="Кнопка повреждена. Напишите «SOS» и начните заново.",
             )
             return
 
@@ -391,18 +447,16 @@ class Runtime:
 
         if revision != int(session["revision"]):
             # Old keyboards stay visible in chat history, but can never mutate state.
-            self.answer_command(
-                data,
-                "Эта кнопка уже неактуальна. Используйте последний экран.",
-                session=session,
+            self.render_current(
+                session,
+                text_override="Эта кнопка уже неактуальна. Используйте последний экран.",
             )
             return
 
         if index < 0 or index >= len(current["buttons"]):
-            self.answer_command(
-                data,
-                "Эта кнопка уже неактуальна.",
-                session=session,
+            self.render_current(
+                session,
+                text_override="Эта кнопка уже неактуальна.",
             )
             return
 
@@ -413,9 +467,9 @@ class Runtime:
             task_id = self.create_task(session)
             mark_task_created(session, task_id)
             self.store.put_session(key, session)
-            self.answer_command(
-                data,
-                f"Задача создана: #{task_id}",
+            self.render_current(
+                session,
+                text_override=f"Задача создана: #{task_id}",
                 link_button={
                     "text": "Открыть задачу",
                     "link": self.task_link(user_id, task_id),
@@ -424,27 +478,37 @@ class Runtime:
             return
 
         self.store.put_session(key, session)
-
-        current = view(session)
-        self.answer_command(
-            data,
-            current["text"],
-            session=session,
-        )
-
-        if current["terminal"] and current["screen"] == "instruction":
-            session["current_screen"] = "done"
-            session["history"] = []
-            session["revision"] = int(session["revision"]) + 1
-            self.store.put_session(key, session)
+        self.render_current(session)
 
     def handle_join(self, data: dict[str, Any]) -> None:
         user = data.get("user") or {}
         chat = data.get("chat") or {}
         user_id = int(user.get("id") or 0)
         dialog_id = str(data.get("dialogId") or chat.get("dialogId") or user_id)
-        if dialog_id:
-            self.send(dialog_id, "Я DeskFlow. Напишите «SOS», чтобы создать обращение.")
+
+        if not user_id or not dialog_id:
+            return
+
+        key = self.session_key(dialog_id, user_id)
+        session = self.store.get_session(key)
+
+        if session is None:
+            session = new_session(user_id=user_id, dialog_id=dialog_id)
+
+        message_id = session.get("active_message_id")
+        if message_id:
+            self.update_message(
+                int(message_id),
+                "Я DeskFlow. Напишите «SOS», чтобы создать обращение.",
+            )
+        else:
+            message_id = self.send(
+                dialog_id,
+                "Я DeskFlow. Напишите «SOS», чтобы создать обращение.",
+            )
+            session["active_message_id"] = int(message_id)
+
+        self.store.put_session(key, session)
 
     def handle_event(self, event: dict[str, Any]) -> None:
         event_type = str(event.get("type") or "")
