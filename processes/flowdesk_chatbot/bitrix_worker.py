@@ -35,9 +35,11 @@ class Runtime:
             "processes/flowdesk_chatbot/flowdesk_state.sqlite3",
         )
         self.store = SessionStore(self.db_path)
-        self.bot_code = os.getenv("FLOWDESK_BOT_CODE", "flowdesk_chatbot")
         self.bot_name = os.getenv("FLOWDESK_BOT_NAME", "DeskFlow")
         self.bot_token = self._load_or_create_bot_token()
+        suffix = self.bot_token[:8].lower().replace("-", "_")
+        self.bot_code = os.getenv("FLOWDESK_BOT_CODE", f"flowdesk_chatbot_{suffix}")
+        self.command_name = os.getenv("FLOWDESK_COMMAND_NAME", f"flowdesk_{suffix}")
         self.bot_id = 0
         self._last_api_call = 0.0
 
@@ -97,7 +99,7 @@ class Runtime:
                 "botId": self.bot_id,
                 "botToken": self.bot_token,
                 "fields": {
-                    "command": COMMAND_NAME,
+                    "command": self.command_name,
                     "common": False,
                     "hidden": True,
                     "extranetSupport": False,
@@ -119,7 +121,7 @@ class Runtime:
             buttons.append(
                 {
                     "TEXT": item["label"],
-                    "COMMAND": f"/{COMMAND_NAME}",
+                    "COMMAND": f"/{self.command_name}",
                     "COMMAND_PARAMS": f"{current['revision']}:{index}",
                     "BLOCK": "Y",
                     "DISPLAY": "LINE",
@@ -295,7 +297,7 @@ class Runtime:
 
     def handle_command(self, data: dict[str, Any]) -> None:
         command = data.get("command") or {}
-        if str(command.get("command") or "").lstrip("/") != COMMAND_NAME:
+        if str(command.get("command") or "").lstrip("/") != self.command_name:
             return
 
         user = data.get("user") or {}
