@@ -133,14 +133,13 @@ class Runtime:
             "BUTTONS": buttons,
         }
 
-    def send(
+    def message_fields(
         self,
-        dialog_id: str,
         text: str,
         *,
         session: dict[str, Any] | None = None,
         link_button: dict[str, str] | None = None,
-    ) -> int:
+    ) -> dict[str, Any]:
         fields: dict[str, Any] = {"message": text}
 
         if session is not None:
@@ -160,6 +159,22 @@ class Runtime:
                 ],
             }
 
+        return fields
+
+    def send(
+        self,
+        dialog_id: str,
+        text: str,
+        *,
+        session: dict[str, Any] | None = None,
+        link_button: dict[str, str] | None = None,
+    ) -> int:
+        fields = self.message_fields(
+            text,
+            session=session,
+            link_button=link_button,
+        )
+
         result = self.call(
             "imbot.v2.Chat.Message.send",
             {
@@ -173,6 +188,49 @@ class Runtime:
         if not isinstance(result, dict) or not result.get("id"):
             raise RuntimeError(f"Message.send не вернул id: {result!r}")
         return int(result["id"])
+
+    def answer_command(
+        self,
+        data: dict[str, Any],
+        text: str,
+        *,
+        session: dict[str, Any] | None = None,
+        link_button: dict[str, str] | None = None,
+    ) -> None:
+        command = data.get("command") or {}
+        message = data.get("message") or {}
+        chat = data.get("chat") or {}
+
+        command_id = int(command.get("id") or 0)
+        message_id = int(message.get("id") or 0)
+        dialog_id = str(chat.get("dialogId") or "")
+
+        if not command_id or not message_id or not dialog_id:
+            raise ValueError(
+                f"Неполные данные ONIMBOTV2COMMANDADD: "
+                f"command_id={command_id}, message_id={message_id}, dialog_id={dialog_id!r}"
+            )
+
+        fields = self.message_fields(
+            text,
+            session=session,
+            link_button=link_button,
+        )
+
+        result = self.call(
+            "imbot.v2.Command.answer",
+            {
+                "botId": self.bot_id,
+                "botToken": self.bot_token,
+                "commandId": command_id,
+                "messageId": message_id,
+                "dialogId": dialog_id,
+                "fields": fields,
+            },
+        )
+
+        if not isinstance(result, dict) or result.get("result") is not True:
+            raise RuntimeError(f"Command.answer вернул неожиданный ответ: {result!r}")
 
     def send_current(self, session: dict[str, Any]) -> None:
         current = view(session)
@@ -313,7 +371,8 @@ class Runtime:
         session = self.store.get_session(key)
         if session is None:
             session = self.restart_session(dialog_id, user_id)
-            self.send_current(session)
+            current = view(session)
+            self.answer_command(data, current["text"], session=session)
             return
 
         raw_params = str(command.get("params") or "")
@@ -322,22 +381,29 @@ class Runtime:
             revision = int(revision_text)
             index = int(index_text)
         except (ValueError, TypeError):
-            self.send(dialog_id, "Кнопка повреждена. Напишите «SOS» и начните заново.")
+            self.answer_command(
+                data,
+                "Кнопка повреждена. Напишите «SOS» и начните заново.",
+            )
             return
 
         current = view(session)
 
         if revision != int(session["revision"]):
             # Old keyboards stay visible in chat history, but can never mutate state.
-            self.send(
-                dialog_id,
+            self.answer_command(
+                data,
                 "Эта кнопка уже неактуальна. Используйте последний экран.",
                 session=session,
             )
             return
 
         if index < 0 or index >= len(current["buttons"]):
-            self.send(dialog_id, "Эта кнопка уже неактуальна.", session=session)
+            self.answer_command(
+                data,
+                "Эта кнопка уже неактуальна.",
+                session=session,
+            )
             return
 
         action = current["buttons"][index]["action"]
@@ -347,8 +413,8 @@ class Runtime:
             task_id = self.create_task(session)
             mark_task_created(session, task_id)
             self.store.put_session(key, session)
-            self.send(
-                dialog_id,
+            self.answer_command(
+                data,
                 f"Задача создана: #{task_id}",
                 link_button={
                     "text": "Открыть задачу",
@@ -358,7 +424,19 @@ class Runtime:
             return
 
         self.store.put_session(key, session)
-        self.send_current(session)
+
+        current = view(session)
+        self.answer_command(
+            data,
+            current["text"],
+            session=session,
+        )
+
+        if current["terminal"] and current["screen"] == "instruction":
+            session["current_screen"] = "done"
+            session["history"] = []
+            session["revision"] = int(session["revision"]) + 1
+            self.store.put_session(key, session)
 
     def handle_join(self, data: dict[str, Any]) -> None:
         user = data.get("user") or {}
