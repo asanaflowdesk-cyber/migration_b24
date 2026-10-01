@@ -111,6 +111,79 @@ class Runtime:
     def session_key(dialog_id: str, user_id: int) -> str:
         return f"{dialog_id}:{user_id}"
 
+    @staticmethod
+    def service_chat_meta_key(user_id: int) -> str:
+        return f"service_chat:{int(user_id)}"
+
+    def get_service_chat(self, user_id: int) -> str:
+        return self.store.get_meta(self.service_chat_meta_key(user_id)).strip()
+
+    def ensure_service_chat(self, user_id: int, user_name: str = "") -> str:
+        existing = self.get_service_chat(user_id)
+
+        if existing:
+            try:
+                result = self.call(
+                    "imbot.v2.Chat.get",
+                    {
+                        "botId": self.bot_id,
+                        "botToken": self.bot_token,
+                        "dialogId": existing,
+                    },
+                )
+                chat = result.get("chat") if isinstance(result, dict) else None
+                if isinstance(chat, dict) and str(chat.get("dialogId") or "") == existing:
+                    return existing
+            except Exception as exc:
+                LOG.warning(
+                    "Saved service chat %s is unavailable for user=%s: %s",
+                    existing,
+                    user_id,
+                    sanitize_error(exc),
+                )
+
+        title_name = (user_name or "").strip() or f"ID {user_id}"
+        result = self.call(
+            "imbot.v2.Chat.add",
+            {
+                "botId": self.bot_id,
+                "botToken": self.bot_token,
+                "fields": {
+                    "title": f"DeskFlow — {title_name}",
+                    "description": "Служебный чат для внутренних обращений DeskFlow",
+                    "userIds": [int(user_id)],
+                },
+            },
+        )
+
+        chat = result.get("chat") if isinstance(result, dict) else None
+        dialog_id = str(chat.get("dialogId") or "") if isinstance(chat, dict) else ""
+        if not dialog_id.startswith("chat"):
+            raise RuntimeError(f"Chat.add не вернул dialogId группового чата: {result!r}")
+
+        self.store.set_meta(self.service_chat_meta_key(user_id), dialog_id)
+        LOG.info("Service chat created for user=%s: %s", user_id, dialog_id)
+        return dialog_id
+
+    def delete_chat_message(self, message_id: int) -> None:
+        if not message_id:
+            return
+
+        result = self.call(
+            "imbot.v2.Chat.Message.delete",
+            {
+                "botId": self.bot_id,
+                "botToken": self.bot_token,
+                "messageId": int(message_id),
+                "complete": True,
+            },
+        )
+
+        if result is not True:
+            raise RuntimeError(
+                f"Chat.Message.delete вернул неожиданный ответ: {result!r}"
+            )
+
     def keyboard(self, session: dict[str, Any]) -> dict[str, Any] | None:
         current = view(session)
         if not current["buttons"]:
@@ -395,27 +468,59 @@ class Runtime:
             return
 
         user_id = int(user.get("id") or message.get("authorId") or 0)
-        dialog_id = str(chat.get("dialogId") or user_id)
+        source_dialog_id = str(chat.get("dialogId") or user_id)
+        message_id = int(message.get("id") or 0)
         text = str(message.get("text") or "").strip()
-        if not user_id or not dialog_id:
+        user_name = str(user.get("name") or "").strip()
+
+        if not user_id or not source_dialog_id:
             return
 
-        key = self.session_key(dialog_id, user_id)
-        session = self.store.get_session(key)
+        service_dialog_id = self.get_service_chat(user_id)
+        is_service_chat = bool(
+            service_dialog_id
+            and source_dialog_id == service_dialog_id
+            and source_dialog_id.startswith("chat")
+        )
 
         if text.casefold() in TRIGGERS:
-            LOG.info("Trigger received from user=%s dialog=%s text=%r", user_id, dialog_id, text)
-            session = self.restart_session(dialog_id, user_id)
+            # A trigger may arrive in the old personal dialog. The actual UI
+            # always lives in a bot-owned service chat where DeskFlow is owner.
+            if not is_service_chat:
+                service_dialog_id = self.ensure_service_chat(user_id, user_name)
+            else:
+                service_dialog_id = source_dialog_id
+                # In the managed chat the trigger itself must disappear too.
+                self.delete_chat_message(message_id)
+
+            LOG.info(
+                "Trigger received from user=%s source=%s service=%s text=%r",
+                user_id,
+                source_dialog_id,
+                service_dialog_id,
+                text,
+            )
+
+            session = self.restart_session(service_dialog_id, user_id)
             self.render_current(session)
-            LOG.info("First screen rendered for user=%s dialog=%s", user_id, dialog_id)
             return
 
+        # Free-form flow input is accepted only inside the managed service chat.
+        if not is_service_chat:
+            return
+
+        key = self.session_key(service_dialog_id, user_id)
+        session = self.store.get_session(key)
+
         if session is None:
-            session = self.restart_session(dialog_id, user_id)
+            # Remove stray user text and show a clean first screen.
+            self.delete_chat_message(message_id)
+            session = self.restart_session(service_dialog_id, user_id)
             self.render_current(session)
             return
 
         if session.get("current_screen") == "done":
+            self.delete_chat_message(message_id)
             self.render_current(
                 session,
                 text_override="Обращение завершено. Нажмите «Создать новое обращение» или напишите «SOS».",
@@ -425,16 +530,16 @@ class Runtime:
         result = submit_text(session, text)
         status = result["status"]
 
+        # The bot owns this group chat, so user input is removed immediately
+        # after being consumed. The only visible item is the live DeskFlow screen.
+        self.delete_chat_message(message_id)
+
         if status == "buttons_expected":
-            self.send(
-                dialog_id,
-                "Сейчас нужно выбрать один из вариантов кнопкой.",
-                session=session,
-            )
+            self.render_current(session)
             return
 
         if status == "empty":
-            self.send(dialog_id, "Сообщение не должно быть пустым.", session=session)
+            self.render_current(session)
             return
 
         self.store.put_session(key, session)
@@ -450,6 +555,16 @@ class Runtime:
         user_id = int(user.get("id") or 0)
         dialog_id = str(chat.get("dialogId") or user_id)
         if not user_id or not dialog_id:
+            return
+
+        service_dialog_id = self.get_service_chat(user_id)
+        if not service_dialog_id or dialog_id != service_dialog_id:
+            service_dialog_id = self.ensure_service_chat(
+                user_id,
+                str(user.get("name") or ""),
+            )
+            session = self.restart_session(service_dialog_id, user_id)
+            self.render_current(session)
             return
 
         key = self.session_key(dialog_id, user_id)
@@ -522,26 +637,16 @@ class Runtime:
         if not user_id or not dialog_id:
             return
 
-        key = self.session_key(dialog_id, user_id)
-        session = self.store.get_session(key)
+        # Group service chats are rendered explicitly by ensure/restart logic.
+        # Do not create a second greeting message there.
+        if dialog_id.startswith("chat"):
+            return
 
-        if session is None:
-            session = new_session(user_id=user_id, dialog_id=dialog_id)
-
-        message_id = session.get("active_message_id")
-        if message_id:
-            self.update_message(
-                int(message_id),
-                "Я DeskFlow. Напишите «SOS», чтобы создать обращение.",
-            )
-        else:
-            message_id = self.send(
-                dialog_id,
-                "Я DeskFlow. Напишите «SOS», чтобы создать обращение.",
-            )
-            session["active_message_id"] = int(message_id)
-
-        self.store.put_session(key, session)
+        # The personal bot dialog is only a launcher.
+        self.send(
+            dialog_id,
+            "Напишите «SOS». DeskFlow откроет ваш служебный чат обращения.",
+        )
 
     def handle_event(self, event: dict[str, Any]) -> None:
         event_type = str(event.get("type") or "")
