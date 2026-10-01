@@ -164,7 +164,7 @@ def view(session: dict[str, Any]) -> dict[str, Any]:
 
     elif screen == "insurance_type":
         text = "Выберите вид страхования:"
-        buttons = _buttons(list(PRODUCT_TREE.keys()))
+        buttons = _buttons(list(PRODUCT_TREE.keys()) + ["Не применимо"])
 
     elif screen == "product":
         insurance_type = data["insurance_type"]
@@ -271,7 +271,12 @@ def submit_action(session: dict[str, Any], action: str) -> dict[str, Any]:
 
     elif screen == "insurance_type":
         session["data"]["insurance_type"] = action
-        session["current_screen"] = "product"
+        if action == "Не применимо":
+            session["data"]["product"] = None
+            session["data"]["subproduct"] = None
+            session["current_screen"] = "document"
+        else:
+            session["current_screen"] = "product"
 
     elif screen == "product":
         session["data"]["product"] = action
