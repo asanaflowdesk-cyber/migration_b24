@@ -142,24 +142,43 @@ class Runtime:
     ) -> dict[str, Any]:
         fields: dict[str, Any] = {"message": text}
 
-        if session is not None:
-            keyboard = self.keyboard(session)
-            if keyboard:
-                fields["keyboard"] = keyboard
+        keyboard = self.keyboard(session) if session is not None else None
 
         if link_button:
-            fields["keyboard"] = {
-                "BOT_ID": self.bot_id,
-                "BUTTONS": [
-                    {
-                        "TEXT": link_button["text"],
-                        "LINK": link_button["link"],
-                        "BG_COLOR_TOKEN": "primary",
-                    }
-                ],
+            link = {
+                "TEXT": link_button["text"],
+                "LINK": link_button["link"],
+                "BG_COLOR_TOKEN": "primary",
+                "BLOCK": "Y",
+                "DISPLAY": "LINE",
             }
+            if keyboard:
+                keyboard["BUTTONS"].append(link)
+            else:
+                keyboard = {
+                    "BOT_ID": self.bot_id,
+                    "BUTTONS": [link],
+                }
+
+        if keyboard:
+            fields["keyboard"] = keyboard
 
         return fields
+
+    def set_text_field(self, dialog_id: str, enabled: bool) -> None:
+        result = self.call(
+            "imbot.v2.Chat.TextField.enabled",
+            {
+                "botId": self.bot_id,
+                "botToken": self.bot_token,
+                "dialogId": dialog_id,
+                "enabled": bool(enabled),
+            },
+        )
+        if result is not True:
+            raise RuntimeError(
+                f"Chat.TextField.enabled вернул неожиданный ответ: {result!r}"
+            )
 
     def send(
         self,
@@ -269,19 +288,23 @@ class Runtime:
         current = view(session)
         text = text_override if text_override is not None else current["text"]
 
+        # Button-only screens lock free text; text-entry and finished screens unlock it.
+        text_enabled = bool(current["accepts_text"] or current["terminal"])
+        self.set_text_field(session["dialog_id"], text_enabled)
+
         message_id = session.get("active_message_id")
         if message_id:
             self.update_message(
                 int(message_id),
                 text,
-                session=None if link_button else session,
+                session=session,
                 link_button=link_button,
             )
         else:
             message_id = self.send(
                 session["dialog_id"],
                 text,
-                session=None if link_button else session,
+                session=session,
                 link_button=link_button,
             )
             session["active_message_id"] = int(message_id)
@@ -387,10 +410,15 @@ class Runtime:
             LOG.info("First screen rendered for user=%s dialog=%s", user_id, dialog_id)
             return
 
-        if session is None or session.get("current_screen") == "done":
-            self.send(
-                dialog_id,
-                "Напишите «SOS», чтобы начать новое обращение.",
+        if session is None:
+            session = self.restart_session(dialog_id, user_id)
+            self.render_current(session)
+            return
+
+        if session.get("current_screen") == "done":
+            self.render_current(
+                session,
+                text_override="Обращение завершено. Нажмите «Создать новое обращение» или напишите «SOS».",
             )
             return
 
@@ -475,6 +503,11 @@ class Runtime:
                     "link": self.task_link(user_id, task_id),
                 },
             )
+            return
+
+        if transition["status"] == "restart_requested":
+            session = self.restart_session(dialog_id, user_id)
+            self.render_current(session)
             return
 
         self.store.put_session(key, session)
