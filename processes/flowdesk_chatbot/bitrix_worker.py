@@ -266,8 +266,10 @@ class Runtime:
         session = self.store.get_session(key)
 
         if text.casefold() in TRIGGERS:
+            LOG.info("Trigger received from user=%s dialog=%s text=%r", user_id, dialog_id, text)
             session = self.restart_session(dialog_id, user_id)
             self.send_current(session)
+            LOG.info("First screen sent to user=%s dialog=%s", user_id, dialog_id)
             return
 
         if session is None or session.get("current_screen") == "done":
@@ -368,7 +370,9 @@ class Runtime:
 
     def handle_event(self, event: dict[str, Any]) -> None:
         event_type = str(event.get("type") or "")
+        event_id = event.get("eventId")
         data = event.get("data") or {}
+        LOG.info("Event received: id=%s type=%s", event_id, event_type)
 
         if event_type == "ONIMBOTV2MESSAGEADD":
             self.handle_message(data)
