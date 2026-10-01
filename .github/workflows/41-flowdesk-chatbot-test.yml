@@ -1,0 +1,18 @@
+name: 41 | FlowDesk ChatBot Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-chatbot:
+    runs-on: [self-hosted, Windows, X64]
+
+    steps:
+      - name: Получить код
+        uses: actions/checkout@v5
+
+      - name: Проверить доступ к webhook
+        env:
+          TARGET_BITRIX_WEBHOOK_URL: ${{ secrets.TARGET_BITRIX_WEBHOOK_URL }}
+          PYTHONPATH: ${{ github.workspace }}
+        run: python -m processes.flowdesk_chatbot.bot
