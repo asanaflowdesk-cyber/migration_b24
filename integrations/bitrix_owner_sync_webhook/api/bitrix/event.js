@@ -176,55 +176,13 @@ export default async function handler(request, response) {
     return response.status(502).json({error: "queue_enqueue_failed"});
   }
 
-  if (!queued.dispatch) {
-    return response.status(202).json({
-      accepted: true,
-      queued: queued.queued !== false,
-      dispatched: false,
-      reason: String(queued.reason || "queued_without_dispatch"),
-      contact_id: contactId,
-    });
-  }
-
-  const githubToken = String(process.env.GITHUB_DISPATCH_TOKEN || "").trim();
-  const githubRepository = String(process.env.GITHUB_REPOSITORY || "").trim();
-  if (!githubToken || !/^[^/\s]+\/[^/\s]+$/.test(githubRepository)) {
-    await recordDispatchError({
-      contactId,
-      version: queued.version,
-      error: "github_dispatch_not_configured",
-      attempts: 0,
-    });
-    return response.status(500).json({error: "github_dispatch_not_configured"});
-  }
-
-  const dispatched = await dispatchGithub({
-    repository: githubRepository,
-    token: githubToken,
-    actualDomain,
-    queueVersion: queued.version,
-  });
-
-  if (!dispatched.ok) {
-    await recordDispatchError({
-      contactId,
-      version: queued.version,
-      error: dispatched.error,
-      status: dispatched.status,
-      attempts: dispatched.attempts,
-    });
-    return response.status(502).json({
-      error: "github_dispatch_failed",
-      status: dispatched.status,
-      attempts: dispatched.attempts,
-    });
-  }
-
   return response.status(202).json({
     accepted: true,
-    queued: true,
-    dispatched: true,
+    queued: queued.queued !== false,
+    dispatched: false,
+    processing: "persistent_worker",
+    reason: String(queued.reason || "queued"),
     contact_id: contactId,
-    dispatch_attempts: dispatched.attempts,
+    queue_version: Number(queued.version || 0),
   });
 }
