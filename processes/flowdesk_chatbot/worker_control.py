@@ -83,6 +83,9 @@ def start_worker() -> int:
     if os.name == "nt":
         creationflags |= getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
         creationflags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+        # Break out of the GitHub Runner Windows Job Object. Without this,
+        # the worker can start successfully and then be killed when the Action ends.
+        creationflags |= getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
 
     with stdout_path.open("ab") as out, stderr_path.open("ab") as err:
         proc = subprocess.Popen(
@@ -128,10 +131,45 @@ def start_worker() -> int:
     return 0
 
 
+def status_worker() -> int:
+    base = base_dir()
+    pid = read_pid()
+
+    print(f"PID file: {pid if pid else 'нет'}")
+
+    if pid:
+        result = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        output = (result.stdout or "").strip()
+        alive = bool(output and "No tasks are running" not in output and "INFO:" not in output)
+        print(f"Worker process: {'RUNNING' if alive else 'NOT RUNNING'}")
+        if output:
+            print(output)
+
+    for name in ("worker.log", "worker.err.log"):
+        path = base / name
+        print(f"\n--- {name} ---")
+        if not path.exists():
+            print("(файл отсутствует)")
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        print(text[-8000:] if text else "(пусто)")
+
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("action", choices=["start", "stop", "restart"])
+    parser.add_argument("action", choices=["start", "stop", "restart", "status"])
     args = parser.parse_args()
+
+    if args.action == "status":
+        return status_worker()
 
     if args.action in {"stop", "restart"}:
         code = stop_worker()
