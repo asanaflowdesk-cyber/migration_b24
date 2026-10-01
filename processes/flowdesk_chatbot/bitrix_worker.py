@@ -42,6 +42,9 @@ class Runtime:
         self.command_name = os.getenv("FLOWDESK_COMMAND_NAME", f"flowdesk_{suffix}")
         self.bot_id = 0
         self._last_api_call = 0.0
+        self.event_poll_seconds = float(
+            os.getenv("FLOWDESK_EVENT_POLL_SECONDS", "3.0")
+        )
 
     def _load_or_create_bot_token(self) -> str:
         configured = os.getenv("FLOWDESK_BOT_TOKEN", "").strip()
@@ -787,7 +790,7 @@ class Runtime:
                     self.store.set_meta("event_offset", offset)
 
                 if not events:
-                    time.sleep(0.55)
+                    time.sleep(self.event_poll_seconds)
 
             except KeyboardInterrupt:
                 print("\nWorker stopped.")
