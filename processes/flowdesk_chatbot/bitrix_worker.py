@@ -165,24 +165,39 @@ class Runtime:
         LOG.info("Service chat created for user=%s: %s", user_id, dialog_id)
         return dialog_id
 
-    def delete_chat_message(self, message_id: int) -> None:
+    def delete_chat_message(self, message_id: int) -> bool:
         if not message_id:
-            return
+            return False
 
-        result = self.call(
-            "imbot.v2.Chat.Message.delete",
-            {
-                "botId": self.bot_id,
-                "botToken": self.bot_token,
-                "messageId": int(message_id),
-                "complete": True,
-            },
-        )
+        # Message cleanup must never wedge the event queue. If this particular
+        # Bitrix build refuses deletion, continue the scenario and log it.
+        try:
+            result = self.call(
+                "imbot.v2.Chat.Message.delete",
+                {
+                    "botId": self.bot_id,
+                    "botToken": self.bot_token,
+                    "messageId": int(message_id),
+                    "complete": True,
+                },
+            )
+        except Exception as exc:
+            LOG.warning(
+                "Message cleanup skipped for message=%s: %s",
+                message_id,
+                sanitize_error(exc),
+            )
+            return False
 
         if result is not True:
-            raise RuntimeError(
-                f"Chat.Message.delete вернул неожиданный ответ: {result!r}"
+            LOG.warning(
+                "Message cleanup returned unexpected result for message=%s: %r",
+                message_id,
+                result,
             )
+            return False
+
+        return True
 
     def keyboard(self, session: dict[str, Any]) -> dict[str, Any] | None:
         current = view(session)
@@ -238,20 +253,37 @@ class Runtime:
 
         return fields
 
-    def set_text_field(self, dialog_id: str, enabled: bool) -> None:
-        result = self.call(
-            "imbot.v2.Chat.TextField.enabled",
-            {
-                "botId": self.bot_id,
-                "botToken": self.bot_token,
-                "dialogId": dialog_id,
-                "enabled": bool(enabled),
-            },
-        )
-        if result is not True:
-            raise RuntimeError(
-                f"Chat.TextField.enabled вернул неожиданный ответ: {result!r}"
+    def set_text_field(self, dialog_id: str, enabled: bool) -> bool:
+        # Some on-premise Bitrix24 builds may not expose this newer UI method.
+        # Text-field control is cosmetic; it must never block the business flow.
+        try:
+            result = self.call(
+                "imbot.v2.Chat.TextField.enabled",
+                {
+                    "botId": self.bot_id,
+                    "botToken": self.bot_token,
+                    "dialogId": dialog_id,
+                    "enabled": bool(enabled),
+                },
             )
+        except Exception as exc:
+            LOG.warning(
+                "Text-field toggle skipped for dialog=%s enabled=%s: %s",
+                dialog_id,
+                enabled,
+                sanitize_error(exc),
+            )
+            return False
+
+        if result is not True:
+            LOG.warning(
+                "Text-field toggle returned unexpected result for dialog=%s: %r",
+                dialog_id,
+                result,
+            )
+            return False
+
+        return True
 
     def send(
         self,
