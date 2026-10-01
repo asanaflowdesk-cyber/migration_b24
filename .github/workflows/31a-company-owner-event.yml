@@ -1,94 +1,56 @@
-name: 31A | Автоперенос очереди пакетов учредителей
+name: 31A | Founder package worker control
 
 on:
   workflow_dispatch:
-  repository_dispatch:
-    types: [founder_batch_ready]
-  schedule:
-    - cron: "*/5 * * * *"
+    inputs:
+      action:
+        description: "Что сделать с 31A worker"
+        required: true
+        default: "restart"
+        type: choice
+        options:
+          - restart
+          - start
+          - stop
+          - status
 
 permissions:
   contents: read
-
-concurrency:
-  group: founder-package-owner-writes
-  queue: max
-  cancel-in-progress: false
 
 env:
   NODE_USE_SYSTEM_CA: "1"
   NODE_OPTIONS: --use-system-ca
   PYTHONUTF8: "1"
   PYTHONIOENCODING: utf-8
-  PYTHON_EXE: C:\Users\Alyona.Sachyova\AppData\Local\Programs\Python\Python312\python.exe
 
 jobs:
-  sync:
+  control:
     runs-on: [self-hosted, Windows, X64]
-    timeout-minutes: 90
-    defaults:
-      run:
-        shell: cmd
-        working-directory: processes/company_owner_sync
+    timeout-minutes: 10
 
     steps:
-      - name: Получить код репозитория
+      - name: Получить код 31A отдельно
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          clean: false
+          fetch-depth: 1
+          path: _owner_sync_control
 
-      - name: Подготовить постоянное окружение Python
-        run: |
-          if not exist "%PYTHON_EXE%" (
-            echo Python не найден: %PYTHON_EXE%
-            exit /b 1
-          )
-          if not exist "%GITHUB_WORKSPACE%\..\_venvs\company_owner_sync-%RUNNER_NAME%\Scripts\python.exe" (
-            "%PYTHON_EXE%" -m venv "%GITHUB_WORKSPACE%\..\_venvs\company_owner_sync-%RUNNER_NAME%"
-            if errorlevel 1 exit /b 1
-          )
-          "%GITHUB_WORKSPACE%\..\_venvs\company_owner_sync-%RUNNER_NAME%\Scripts\python.exe" --version
-
-      - name: Установить зависимости
+      - name: Управлять 31A worker
+        shell: cmd
         env:
-          CUSTOM_PIP_INDEX_URL: ${{ vars.PIP_INDEX_URL }}
-        run: |
-          if not "%CUSTOM_PIP_INDEX_URL%"=="" set "PIP_INDEX_URL=%CUSTOM_PIP_INDEX_URL%"
-          "%GITHUB_WORKSPACE%\..\_venvs\company_owner_sync-%RUNNER_NAME%\Scripts\python.exe" -m pip install --disable-pip-version-check -r requirements.txt
-
-      - name: Проверить код
-        env:
-          PYTHONPATH: ${{ github.workspace }}\processes\company_owner_sync;${{ github.workspace }}\processes\eqazyna_leads
-        run: |
-          chcp 65001 >nul
-          "%GITHUB_WORKSPACE%\..\_venvs\company_owner_sync-%RUNNER_NAME%\Scripts\python.exe" -m pytest -q tests
-          if errorlevel 1 exit /b 1
-          "%GITHUB_WORKSPACE%\..\_venvs\company_owner_sync-%RUNNER_NAME%\Scripts\python.exe" queue_founder_packages.py --help >nul
-          if errorlevel 1 exit /b 1
-
-      - name: Обработать накопленные пакеты одним потоком
-        env:
-          PYTHONPATH: ${{ github.workspace }}\processes\company_owner_sync;${{ github.workspace }}\processes\eqazyna_leads
+          OWNER_SYNC_SOURCE_ROOT: ${{ github.workspace }}\_owner_sync_control
           TARGET_BITRIX_WEBHOOK_URL: ${{ secrets.TARGET_BITRIX_WEBHOOK_URL }}
           GOOGLE_QUEUE_URL: ${{ secrets.GOOGLE_QUEUE_URL }}
           GOOGLE_QUEUE_KEY: ${{ secrets.GOOGLE_QUEUE_KEY }}
           BITRIX_VERIFY_SSL: ${{ vars.BITRIX_VERIFY_SSL || 'true' }}
           BITRIX_CA_BUNDLE: ${{ vars.BITRIX_CA_BUNDLE }}
           BITRIX_REQUEST_TIMEOUT: ${{ vars.BITRIX_REQUEST_TIMEOUT || '45' }}
+          OWNER_SYNC_WORKERS: "8"
+          OWNER_SYNC_CLAIM_LIMIT: "100"
+          OWNER_SYNC_POLL_SECONDS: "5"
+          CUSTOM_PIP_INDEX_URL: ${{ vars.PIP_INDEX_URL }}
         run: |
-          chcp 65001 >nul
-          if "%TARGET_BITRIX_WEBHOOK_URL%"=="" exit /b 1
-          if "%GOOGLE_QUEUE_URL%"=="" exit /b 1
-          if "%GOOGLE_QUEUE_KEY%"=="" exit /b 1
-          if not exist output_event mkdir output_event
-          "%GITHUB_WORKSPACE%\..\_venvs\company_owner_sync-%RUNNER_NAME%\Scripts\python.exe" -u queue_founder_packages.py --output-dir output_event
-          set "SYNC_EXIT=%ERRORLEVEL%"
-          if exist output_event\queue_summary.json type output_event\queue_summary.json
-          exit /b %SYNC_EXIT%
-
-      - name: Загрузить отчет
-        if: ${{ always() }}
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        with:
-          name: 31A-founder-queue-${{ github.run_id }}
-          path: processes/company_owner_sync/output_event/
-          if-no-files-found: warn
-          retention-days: 30
+          set "PYTHON_EXE=C:\Users\Alyona.Sachyova\AppData\Local\Programs\Python\Python312\python.exe"
+          if not "%CUSTOM_PIP_INDEX_URL%"=="" set "PIP_INDEX_URL=%CUSTOM_PIP_INDEX_URL%"
+          "%PYTHON_EXE%" -u "_owner_sync_control\processes\company_owner_sync\worker_control.py" "${{ inputs.action }}"
