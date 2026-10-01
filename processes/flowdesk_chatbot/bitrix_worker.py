@@ -68,20 +68,21 @@ class Runtime:
         return result
 
     def register(self) -> None:
+        desired_type = "personal"
+        fields = {
+            "code": self.bot_code,
+            "botToken": self.bot_token,
+            "properties": {
+                "name": self.bot_name,
+                "workPosition": "Внутренние обращения",
+            },
+            "type": desired_type,
+            "eventMode": "fetch",
+        }
+
         result = self.call(
             "imbot.v2.Bot.register",
-            {
-                "fields": {
-                    "code": self.bot_code,
-                    "botToken": self.bot_token,
-                    "properties": {
-                        "name": self.bot_name,
-                        "workPosition": "Внутренние обращения",
-                    },
-                    "type": "personal",
-                    "eventMode": "fetch",
-                }
-            },
+            {"fields": fields},
         )
         if not isinstance(result, dict):
             raise RuntimeError(f"Bot.register вернул неожиданный ответ: {result!r}")
@@ -89,6 +90,40 @@ class Runtime:
         bot = result.get("bot")
         if not isinstance(bot, dict) or not bot.get("id"):
             raise RuntimeError(f"Bot.register не вернул bot.id: {result!r}")
+
+        # Re-registering the same code returns the existing bot and does not
+        # change its immutable type. Migrate old test bot once so it can see
+        # every ordinary message in its per-user service chat.
+        current_type = str(bot.get("type") or "")
+        if current_type and current_type != desired_type:
+            old_bot_id = int(bot["id"])
+            LOG.warning(
+                "Migrating DeskFlow bot type %s -> %s (old botId=%s)",
+                current_type,
+                desired_type,
+                old_bot_id,
+            )
+            self.call(
+                "imbot.v2.Bot.unregister",
+                {
+                    "botId": old_bot_id,
+                    "botToken": self.bot_token,
+                },
+            )
+            result = self.call(
+                "imbot.v2.Bot.register",
+                {"fields": fields},
+            )
+            if not isinstance(result, dict):
+                raise RuntimeError(
+                    f"Bot.register после миграции вернул неожиданный ответ: {result!r}"
+                )
+            bot = result.get("bot")
+            if not isinstance(bot, dict) or not bot.get("id"):
+                raise RuntimeError(
+                    f"Bot.register после миграции не вернул bot.id: {result!r}"
+                )
+            self.store.set_meta("event_offset", "0")
 
         self.bot_id = int(bot["id"])
         self.store.set_meta("bot_id", self.bot_id)
