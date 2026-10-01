@@ -12,6 +12,7 @@ on:
           - restart
           - start
           - stop
+          - status
 
 permissions:
   contents: read
@@ -39,7 +40,7 @@ jobs:
         run: call ..\..\scripts\prepare-python.cmd
 
       - name: Установить зависимости
-        if: ${{ inputs.action != 'stop' }}
+        if: ${{ inputs.action == 'start' || inputs.action == 'restart' }}
         env:
           CUSTOM_PIP_INDEX_URL: ${{ vars.PIP_INDEX_URL }}
         run: |
