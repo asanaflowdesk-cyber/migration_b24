@@ -59,7 +59,10 @@ def start_worker() -> int:
         return 2
 
     root = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
-    python = root / "processes" / "flowdesk_chatbot" / ".venv" / "Scripts" / "python.exe"
+    scripts_dir = root / "processes" / "flowdesk_chatbot" / ".venv" / "Scripts"
+    python = scripts_dir / "pythonw.exe"
+    if not python.exists():
+        python = scripts_dir / "python.exe"
 
     if not python.exists():
         print(f"ERROR: Python не найден: {python}", file=sys.stderr)
@@ -78,6 +81,10 @@ def start_worker() -> int:
     # GitHub Runner uses this marker to clean up child processes after a job.
     # Empty value prevents the detached worker from being treated as a job child.
     env["RUNNER_TRACKING_ID"] = ""
+
+    # pythonw.exe runs the background worker without opening a visible
+    # console window on the self-hosted Windows machine. Logs still go
+    # to worker.log / worker.err.log below.
 
     creationflags = 0
     if os.name == "nt":
