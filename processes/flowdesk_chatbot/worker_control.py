@@ -129,7 +129,10 @@ def start_worker() -> int:
         print("ERROR: не задан TARGET_BITRIX_WEBHOOK_URL", file=sys.stderr)
         return 2
 
-    source_root = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+    source_root = Path(
+        os.environ.get("FLOWDESK_SOURCE_ROOT")
+        or os.environ["GITHUB_WORKSPACE"]
+    ).resolve()
 
     # Critical: the live worker must not execute from actions-runner\_work.
     # Other workflows legitimately clean that folder during checkout.
