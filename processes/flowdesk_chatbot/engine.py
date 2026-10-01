@@ -17,6 +17,7 @@ META_KEYS = {"__prompt__", "route", "fields"}
 ACTION_BACK = "__back__"
 ACTION_SKIP = "__skip__"
 ACTION_CONFIRM = "__confirm__"
+ACTION_NEW_REQUEST = "__new_request__"
 
 
 def new_session(user_id: int, dialog_id: str) -> dict[str, Any]:
@@ -195,6 +196,8 @@ def view(session: dict[str, Any]) -> dict[str, Any]:
     elif screen == "done":
         task_id = session.get("task_id")
         text = f"Задача создана: #{task_id}" if task_id else "Сценарий завершён."
+        buttons = [{"label": "Создать новое обращение", "action": ACTION_NEW_REQUEST}]
+        accepts_text = True
         terminal = True
 
     else:
@@ -228,6 +231,9 @@ def submit_action(session: dict[str, Any], action: str) -> dict[str, Any]:
 
     if action == ACTION_CONFIRM:
         return {"status": "task_ready"}
+
+    if action == ACTION_NEW_REQUEST:
+        return {"status": "restart_requested"}
 
     _snapshot(session)
 
