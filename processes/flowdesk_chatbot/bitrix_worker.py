@@ -78,7 +78,7 @@ class Runtime:
                         "name": self.bot_name,
                         "workPosition": "Внутренние обращения",
                     },
-                    "type": "bot",
+                    "type": "personal",
                     "eventMode": "fetch",
                 }
             },
@@ -189,7 +189,10 @@ class Runtime:
             )
             return False
 
-        if result is not True:
+        ok = result is True or (
+            isinstance(result, dict) and result.get("result") is True
+        )
+        if not ok:
             LOG.warning(
                 "Message cleanup returned unexpected result for message=%s: %r",
                 message_id,
@@ -275,7 +278,10 @@ class Runtime:
             )
             return False
 
-        if result is not True:
+        ok = result is True or (
+            isinstance(result, dict) and result.get("result") is True
+        )
+        if not ok:
             LOG.warning(
                 "Text-field toggle returned unexpected result for dialog=%s: %r",
                 dialog_id,
