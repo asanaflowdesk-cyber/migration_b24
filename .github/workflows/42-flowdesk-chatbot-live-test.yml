@@ -1,0 +1,51 @@
+name: 42 | FlowDesk Chatbot live test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  NODE_USE_SYSTEM_CA: "1"
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: "utf-8"
+
+jobs:
+  chatbot-live-test:
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 60
+
+    defaults:
+      run:
+        shell: cmd
+        working-directory: processes/flowdesk_chatbot
+
+    steps:
+      - name: Получить код репозитория
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - name: Найти Python и создать локальное окружение
+        run: call ..\..\scripts\prepare-python.cmd
+
+      - name: Установить зависимости
+        env:
+          CUSTOM_PIP_INDEX_URL: ${{ vars.PIP_INDEX_URL }}
+        run: |
+          if not "%CUSTOM_PIP_INDEX_URL%"=="" set "PIP_INDEX_URL=%CUSTOM_PIP_INDEX_URL%"
+          ".venv\Scripts\python.exe" -m pip install -r ..\flowdesk\requirements.txt
+
+      - name: Запустить DeskFlow для живого теста
+        env:
+          PYTHONUNBUFFERED: "1"
+          PYTHONPATH: ${{ github.workspace }}
+          TARGET_BITRIX_WEBHOOK_URL: ${{ secrets.TARGET_BITRIX_WEBHOOK_URL }}
+          FLOWDESK_PROJECT_ID: "2"
+          FLOWDESK_CHATBOT_DB: ${{ runner.temp }}\flowdesk-chatbot.sqlite3
+        run: |
+          chcp 65001 >nul
+          if not defined TARGET_BITRIX_WEBHOOK_URL (
+            echo Не задан secret TARGET_BITRIX_WEBHOOK_URL
+            exit /b 1
+          )
+          ".venv\Scripts\python.exe" -u -m processes.flowdesk_chatbot.bitrix_worker
