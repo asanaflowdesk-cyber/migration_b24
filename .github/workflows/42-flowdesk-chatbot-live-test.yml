@@ -52,5 +52,6 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}
           TARGET_BITRIX_WEBHOOK_URL: ${{ secrets.TARGET_BITRIX_WEBHOOK_URL }}
           FLOWDESK_PROJECT_ID: "2"
+          FLOWDESK_BOT_NAME: "DeskFlow Test"
         run: |
           ".venv\Scripts\python.exe" -u worker_control.py "${{ inputs.action }}"
