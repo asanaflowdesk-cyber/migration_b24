@@ -28,17 +28,19 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - name: Получить код репозитория
+      - name: Получить код DeskFlow отдельно
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           clean: false
           fetch-depth: 1
+          path: _flowdesk_chatbot_control
 
       - name: Управлять DeskFlow worker
         shell: cmd
         env:
           PYTHONUNBUFFERED: "1"
-          PYTHONPATH: ${{ github.workspace }}
+          FLOWDESK_SOURCE_ROOT: ${{ github.workspace }}\_flowdesk_chatbot_control
+          PYTHONPATH: ${{ github.workspace }}\_flowdesk_chatbot_control
           TARGET_BITRIX_WEBHOOK_URL: ${{ secrets.TARGET_BITRIX_WEBHOOK_URL }}
           FLOWDESK_PROJECT_ID: "2"
           FLOWDESK_BOT_NAME: "DeskFlow Test"
@@ -46,4 +48,4 @@ jobs:
         run: |
           set "PYTHON_EXE=C:\Users\Alyona.Sachyova\AppData\Local\Programs\Python\Python312\python.exe"
           if not "%CUSTOM_PIP_INDEX_URL%"=="" set "PIP_INDEX_URL=%CUSTOM_PIP_INDEX_URL%"
-          "%PYTHON_EXE%" -u processes\flowdesk_chatbot\worker_control.py "${{ inputs.action }}"
+          "%PYTHON_EXE%" -u "_flowdesk_chatbot_control\processes\flowdesk_chatbot\worker_control.py" "${{ inputs.action }}"
