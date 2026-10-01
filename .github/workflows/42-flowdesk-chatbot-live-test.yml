@@ -1,7 +1,17 @@
-name: 42 | FlowDesk Chatbot live test
+name: 42 | FlowDesk Chatbot control
 
 on:
   workflow_dispatch:
+    inputs:
+      action:
+        description: "Что сделать с DeskFlow worker"
+        required: true
+        default: "restart"
+        type: choice
+        options:
+          - restart
+          - start
+          - stop
 
 permissions:
   contents: read
@@ -12,9 +22,9 @@ env:
   PYTHONIOENCODING: "utf-8"
 
 jobs:
-  chatbot-live-test:
+  chatbot-control:
     runs-on: [self-hosted, Windows, X64]
-    timeout-minutes: 60
+    timeout-minutes: 10
 
     defaults:
       run:
@@ -23,29 +33,84 @@ jobs:
 
     steps:
       - name: Получить код репозитория
+        if: ${{ inputs.action != 'stop' }}
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
 
       - name: Найти Python и создать локальное окружение
+        if: ${{ inputs.action != 'stop' }}
         run: call ..\..\scripts\prepare-python.cmd
 
       - name: Установить зависимости
+        if: ${{ inputs.action != 'stop' }}
         env:
           CUSTOM_PIP_INDEX_URL: ${{ vars.PIP_INDEX_URL }}
         run: |
           if not "%CUSTOM_PIP_INDEX_URL%"=="" set "PIP_INDEX_URL=%CUSTOM_PIP_INDEX_URL%"
           ".venv\Scripts\python.exe" -m pip install -r ..\flowdesk\requirements.txt
 
-      - name: Запустить DeskFlow для живого теста
+      - name: Остановить старый DeskFlow worker
+        shell: powershell
+        working-directory: ${{ github.workspace }}
+        run: |
+          $base = Join-Path $env:USERPROFILE ".flowdesk-chatbot"
+          $pidFile = Join-Path $base "worker.pid"
+
+          if (-not (Test-Path $pidFile)) {
+            Write-Host "Активный DeskFlow worker не найден"
+            exit 0
+          }
+
+          $oldPid = [int](Get-Content $pidFile -Raw)
+          $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$oldPid" -ErrorAction SilentlyContinue
+
+          if ($proc -and $proc.CommandLine -like "*processes.flowdesk_chatbot.bitrix_worker*") {
+            Stop-Process -Id $oldPid -Force -ErrorAction SilentlyContinue
+            Write-Host "DeskFlow worker остановлен: PID=$oldPid"
+          } else {
+            Write-Host "PID=$oldPid уже не относится к DeskFlow worker"
+          }
+
+          Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
+
+      - name: Запустить DeskFlow в фоне
+        if: ${{ inputs.action != 'stop' }}
+        shell: powershell
+        working-directory: ${{ github.workspace }}
         env:
           PYTHONUNBUFFERED: "1"
           PYTHONPATH: ${{ github.workspace }}
           TARGET_BITRIX_WEBHOOK_URL: ${{ secrets.TARGET_BITRIX_WEBHOOK_URL }}
           FLOWDESK_PROJECT_ID: "2"
-          FLOWDESK_CHATBOT_DB: ${{ runner.temp }}\flowdesk-chatbot.sqlite3
         run: |
-          chcp 65001 >nul
-          if not defined TARGET_BITRIX_WEBHOOK_URL (
-            echo Не задан secret TARGET_BITRIX_WEBHOOK_URL
-            exit /b 1
-          )
-          ".venv\Scripts\python.exe" -u -m processes.flowdesk_chatbot.bitrix_worker
+          if ([string]::IsNullOrWhiteSpace($env:TARGET_BITRIX_WEBHOOK_URL)) {
+            throw "Не задан secret TARGET_BITRIX_WEBHOOK_URL"
+          }
+
+          $base = Join-Path $env:USERPROFILE ".flowdesk-chatbot"
+          New-Item -ItemType Directory -Force -Path $base | Out-Null
+
+          $env:FLOWDESK_CHATBOT_DB = Join-Path $base "flowdesk_state.sqlite3"
+          $env:RUNNER_TRACKING_ID = ""
+
+          $python = Join-Path $env:GITHUB_WORKSPACE "processes\flowdesk_chatbot\.venv\Scripts\python.exe"
+          $stdout = Join-Path $base "worker.log"
+          $stderr = Join-Path $base "worker.err.log"
+          $pidFile = Join-Path $base "worker.pid"
+
+          $proc = Start-Process -FilePath $python -ArgumentList "-u","-m","processes.flowdesk_chatbot.bitrix_worker" -WorkingDirectory $env:GITHUB_WORKSPACE -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
+
+          Set-Content -Path $pidFile -Value $proc.Id -Encoding ascii
+          Start-Sleep -Seconds 4
+
+          if ($proc.HasExited) {
+            Write-Host "DeskFlow worker завершился сразу после запуска"
+            if (Test-Path $stdout) { Get-Content $stdout -Tail 50 }
+            if (Test-Path $stderr) { Get-Content $stderr -Tail 50 }
+            exit 1
+          }
+
+          Write-Host "DeskFlow worker запущен отдельно от Actions: PID=$($proc.Id)"
+          Write-Host "GitHub job сейчас завершится и освободит runner."
+
+          if (Test-Path $stdout) { Get-Content $stdout -Tail 20 }
+          if (Test-Path $stderr) { Get-Content $stderr -Tail 20 }
