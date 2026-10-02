@@ -274,7 +274,7 @@ class DeskFlowEngineTests(unittest.TestCase):
             }
         }
 
-        files = Runtime.message_files(message)
+        files = parse_message_files(message)
 
         self.assertEqual(
             files,
