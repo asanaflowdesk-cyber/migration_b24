@@ -14,6 +14,7 @@ from processes.flowdesk_chatbot.engine import (
     ACTION_ATTACHMENT_REPLACE,
     ACTION_BACK,
     ACTION_EDIT,
+    ACTION_EDIT_CANCEL,
     ACTION_EDIT_MORE,
     ACTION_EDIT_REVIEW,
     EDIT_FIELD_PREFIX,
@@ -370,6 +371,68 @@ class DeskFlowEngineTests(unittest.TestCase):
         self.assertEqual(session["data"]["document_file_ids"], [])
         self.assertIsNone(session["data"]["document_comment"])
         self.assertIsNone(session["data"]["document"])
+
+    def test_edit_menu_back_without_changes_is_repeatable(self) -> None:
+        session = session_at("confirm")
+        session["data"].update(
+            {
+                "request_type": "Запрос",
+                "target": "Юристы",
+                "request": "Анкета опросник",
+                "description": "Ничего менять не нужно",
+                "insurance_type": "Не применимо",
+            }
+        )
+        original = session["data"].copy()
+
+        for _ in range(25):
+            submit_action(session, ACTION_EDIT)
+            self.assertEqual(session["current_screen"], "edit_menu")
+
+            submit_action(session, ACTION_EDIT_REVIEW)
+            self.assertEqual(session["current_screen"], "confirm")
+            self.assertEqual(session["data"], original)
+            self.assertFalse(session["edit_mode"])
+            self.assertIsNone(session["edit_root"])
+            self.assertIsNone(session["edit_backup"])
+            self.assertEqual(session["edit_history"], [])
+            view(session)
+
+    def test_cancel_selected_field_without_change_restores_request(self) -> None:
+        session = session_at("confirm")
+        session["data"].update(
+            {
+                "request_type": "Запрос",
+                "target": "Юристы",
+                "request": "Анкета опросник",
+                "description": "Исходный текст",
+                "insurance_type": "Не применимо",
+            }
+        )
+        original = {
+            "request_type": session["data"]["request_type"],
+            "target": session["data"]["target"],
+            "request": session["data"]["request"],
+            "description": session["data"]["description"],
+            "insurance_type": session["data"]["insurance_type"],
+        }
+
+        for field_key in ("target", "description", "document"):
+            submit_action(session, ACTION_EDIT)
+            submit_action(session, f"{EDIT_FIELD_PREFIX}{field_key}")
+            self.assertTrue(session["edit_mode"])
+
+            submit_action(session, ACTION_EDIT_CANCEL)
+            self.assertEqual(session["current_screen"], "edit_menu")
+            self.assertFalse(session["edit_mode"])
+            self.assertIsNone(session["edit_backup"])
+
+            for key, expected in original.items():
+                self.assertEqual(session["data"][key], expected)
+
+            submit_action(session, ACTION_EDIT_REVIEW)
+            self.assertEqual(session["current_screen"], "confirm")
+            view(session)
 
     def test_edit_after_offers_edit_more_and_return_to_review(self) -> None:
         session = session_at("confirm")

@@ -194,15 +194,20 @@ def _edit_label(field_key: str) -> str:
     return EDIT_LABELS.get(field_key, field_key)
 
 
-def _finish_edit(session: dict[str, Any], field_key: str | None = None) -> None:
-    root = field_key or str(session.get("edit_root") or "")
-    session["last_edited_field"] = _edit_label(root) if root else None
-    session["current_screen"] = "edit_after"
+def _clear_edit_runtime(session: dict[str, Any]) -> None:
+    """Drop transient editor state without touching the saved request data."""
     session["edit_mode"] = False
     session["edit_root"] = None
     session["edit_backup"] = None
     session["edit_history"] = []
     session["attachment_edit_mode"] = None
+
+
+def _finish_edit(session: dict[str, Any], field_key: str | None = None) -> None:
+    root = field_key or str(session.get("edit_root") or "")
+    session["last_edited_field"] = _edit_label(root) if root else None
+    session["current_screen"] = "edit_after"
+    _clear_edit_runtime(session)
 
 
 def _restore_edit_backup(session: dict[str, Any]) -> None:
@@ -213,11 +218,7 @@ def _restore_edit_backup(session: dict[str, Any]) -> None:
         session["detail_fields"] = list(backup.get("detail_fields") or [])
         session["detail_index"] = int(backup.get("detail_index") or 0)
         session["instruction_path"] = backup.get("instruction_path")
-    session["edit_mode"] = False
-    session["edit_root"] = None
-    session["edit_backup"] = None
-    session["edit_history"] = []
-    session["attachment_edit_mode"] = None
+    _clear_edit_runtime(session)
 
 
 def _edit_snapshot(session: dict[str, Any]) -> None:
@@ -636,25 +637,32 @@ def submit_action(session: dict[str, Any], action: str) -> dict[str, Any]:
         return {"status": "ok"}
 
     if action == ACTION_EDIT:
+        # Entering the editor must always start clean. A stale transient flag
+        # from an earlier cancelled edit must never leak into the new session.
+        _clear_edit_runtime(session)
         session["current_screen"] = "edit_menu"
         _advance_revision(session)
         return {"status": "ok"}
 
     if action == ACTION_EDIT_MORE:
+        _clear_edit_runtime(session)
         session["current_screen"] = "edit_menu"
         _advance_revision(session)
         return {"status": "ok"}
 
     if action == ACTION_EDIT_REVIEW:
+        # "← Назад" from the correction menu is a pure no-op on request data:
+        # close the editor and return to the exact same review screen.
+        _clear_edit_runtime(session)
         session["current_screen"] = "confirm"
         session["history"] = []
         _advance_revision(session)
         return {"status": "ok"}
 
     if action == ACTION_EDIT_CANCEL:
-        # "← Назад" keeps its global meaning during correction too: go back
-        # exactly one edit step. From the first edit screen it cancels that
-        # field correction and returns to the correction menu.
+        # Inside a multi-step replacement go back one editor step. If the user
+        # has not changed anything yet, restore the original request atomically
+        # and return to the correction menu.
         if not _edit_back(session):
             _restore_edit_backup(session)
             session["current_screen"] = "edit_menu"
