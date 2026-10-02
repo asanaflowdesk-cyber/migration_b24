@@ -13,6 +13,7 @@ from common.bitrix import BitrixClient, BitrixError, sanitize_error
 from processes.flowdesk_chatbot.engine import (
     mark_task_created,
     new_session,
+    parse_message_files,
     submit_action,
     submit_attachment_message,
     submit_text,
@@ -813,59 +814,7 @@ class Runtime:
 
     @staticmethod
     def message_files(message: dict[str, Any]) -> list[dict[str, Any]]:
-        params = message.get("params") or {}
-        if not isinstance(params, dict):
-            return []
-
-        # Bitrix24 Chatbots 2.0 sends user attachments in message.params.FILE_ID.
-        # Older/on-premise variants may expose richer objects under FILES/files,
-        # so keep those fallbacks too.
-        raw = (
-            params.get("FILE_ID")
-            or params.get("fileId")
-            or params.get("file_id")
-            or params.get("FILES")
-            or params.get("files")
-            or []
-        )
-
-        if isinstance(raw, dict):
-            raw = list(raw.values())
-        elif not isinstance(raw, (list, tuple, set)):
-            raw = [raw] if raw not in (None, "", False) else []
-
-        files: list[dict[str, Any]] = []
-        seen: set[int] = set()
-
-        for item in raw:
-            file_id = 0
-            name = ""
-
-            if isinstance(item, dict):
-                value = (
-                    item.get("id")
-                    or item.get("ID")
-                    or item.get("fileId")
-                    or item.get("FILE_ID")
-                    or item.get("value")
-                    or item.get("VALUE")
-                )
-                name = str(item.get("name") or item.get("NAME") or "").strip()
-            else:
-                value = item
-
-            try:
-                file_id = int(str(value).strip())
-            except (TypeError, ValueError):
-                file_id = 0
-
-            if file_id <= 0 or file_id in seen:
-                continue
-
-            seen.add(file_id)
-            files.append({"id": file_id, "name": name})
-
-        return files
+        return parse_message_files(message)
 
     def handle_message(self, data: dict[str, Any]) -> None:
         user = data.get("user") or {}
