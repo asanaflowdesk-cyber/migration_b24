@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from pathlib import Path
 from typing import Any
+
+
+LOG = logging.getLogger(__name__)
 
 
 class SessionStore:
@@ -43,7 +47,28 @@ class SessionStore:
             ).fetchone()
         if row is None:
             return None
-        return json.loads(row[0])
+
+        try:
+            payload = json.loads(row[0])
+        except (TypeError, json.JSONDecodeError) as exc:
+            LOG.error(
+                "Corrupt DeskFlow session %s was discarded: %s",
+                session_key,
+                exc,
+            )
+            self.delete_session(session_key)
+            return None
+
+        if not isinstance(payload, dict):
+            LOG.error(
+                "Invalid DeskFlow session %s has type %s and was discarded",
+                session_key,
+                type(payload).__name__,
+            )
+            self.delete_session(session_key)
+            return None
+
+        return payload
 
     def put_session(self, session_key: str, payload: dict[str, Any]) -> None:
         raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
