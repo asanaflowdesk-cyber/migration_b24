@@ -65,6 +65,10 @@ class Runtime:
             f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else ""
         )
         self.task_user_fields: set[str] = set()
+        # Cache the last text-field state per dialog. Most DeskFlow screens are
+        # button-only; repeating the same Bitrix UI toggle on every click costs
+        # one extra REST roundtrip and one throttle slot for no visible benefit.
+        self._text_field_state: dict[str, bool] = {}
         # Daytime: near-realtime polling. Night: low-frequency background check.
         # FLOWDESK_EVENT_POLL_SECONDS remains a backward-compatible daytime fallback.
         self.active_poll_seconds = float(
@@ -414,6 +418,10 @@ class Runtime:
         return fields
 
     def set_text_field(self, dialog_id: str, enabled: bool) -> bool:
+        desired = bool(enabled)
+        if self._text_field_state.get(dialog_id) is desired:
+            return True
+
         # Some on-premise Bitrix24 builds may not expose this newer UI method.
         # Text-field control is cosmetic; it must never block the business flow.
         try:
@@ -423,14 +431,15 @@ class Runtime:
                     "botId": self.bot_id,
                     "botToken": self.bot_token,
                     "dialogId": dialog_id,
-                    "enabled": bool(enabled),
+                    "enabled": desired,
                 },
             )
         except Exception as exc:
+            self._text_field_state.pop(dialog_id, None)
             LOG.warning(
                 "Text-field toggle skipped for dialog=%s enabled=%s: %s",
                 dialog_id,
-                enabled,
+                desired,
                 sanitize_error(exc),
             )
             return False
@@ -439,6 +448,7 @@ class Runtime:
             isinstance(result, dict) and result.get("result") is True
         )
         if not ok:
+            self._text_field_state.pop(dialog_id, None)
             LOG.warning(
                 "Text-field toggle returned unexpected result for dialog=%s: %r",
                 dialog_id,
@@ -446,6 +456,7 @@ class Runtime:
             )
             return False
 
+        self._text_field_state[dialog_id] = desired
         return True
 
     def send(
@@ -551,12 +562,60 @@ class Runtime:
         user_id: int,
         needed: int,
     ) -> list[dict[str, Any]]:
-        rows: list[dict[str, Any]] = []
-        start = 0
+        # Fast path: ask Bitrix to filter DeskFlow tasks server-side. Without
+        # this filter the old implementation could scan up to 500 unrelated
+        # tasks and spend several throttle slots just to draw the start/final screen.
+        try:
+            rows: list[dict[str, Any]] = []
+            start = 0
+            while len(rows) < needed:
+                result = self.call(
+                    "tasks.task.list",
+                    {
+                        "order": {"ID": "desc"},
+                        "filter": {
+                            "CREATED_BY": int(user_id),
+                            "%XML_ID": "FLOWDESK_CHAT_",
+                        },
+                        "select": ["ID", "TITLE", "XML_ID", "CREATED_DATE"],
+                        "start": start,
+                    },
+                )
+                if isinstance(result, dict):
+                    page = result.get("tasks") or result.get("items") or []
+                elif isinstance(result, list):
+                    page = result
+                else:
+                    page = []
 
-        # Bitrix returns 50 tasks per classic list page. Continue only while
-        # needed so opening the bot does not turn into a heavy registry query.
-        for _ in range(10):
+                if not isinstance(page, list) or not page:
+                    break
+
+                for row in page:
+                    if not isinstance(row, dict):
+                        continue
+                    xml_id = str(row.get("xmlId") or row.get("XML_ID") or "")
+                    if xml_id.startswith("FLOWDESK_CHAT_"):
+                        rows.append(row)
+                        if len(rows) >= needed:
+                            return rows
+
+                if len(page) < 50:
+                    break
+                start += 50
+
+            return rows
+
+        except Exception as exc:
+            LOG.warning(
+                "Filtered DeskFlow history query failed; using compatibility scan: %s",
+                sanitize_error(exc),
+            )
+
+        # Compatibility fallback for boxes that reject operator filters on XML_ID.
+        rows = []
+        start = 0
+        for _ in range(4):
             result = self.call(
                 "tasks.task.list",
                 {
@@ -566,11 +625,12 @@ class Runtime:
                     "start": start,
                 },
             )
-            page = []
             if isinstance(result, dict):
                 page = result.get("tasks") or result.get("items") or []
             elif isinstance(result, list):
                 page = result
+            else:
+                page = []
 
             if not isinstance(page, list) or not page:
                 break
@@ -1055,6 +1115,11 @@ class Runtime:
     def run(self) -> None:
         self.register()
         print(f"DeskFlow bot registered: ID={self.bot_id}")
+        print(
+            "Polling: 08:00-22:00 Kazakhstan every "
+            f"{self.active_poll_seconds:g}s; 22:01-07:59 every "
+            f"{self.quiet_poll_seconds:g}s"
+        )
         print("Worker is running. Open the bot in Bitrix24 and send: SOS")
 
         offset_text = self.store.get_meta("event_offset")
@@ -1078,6 +1143,8 @@ class Runtime:
 
                 for event in events:
                     event_id = int(event.get("eventId") or 0)
+                    event_type = str(event.get("type") or "")
+                    started = time.monotonic()
                     try:
                         self.handle_event(event)
                     except Exception:
@@ -1088,6 +1155,14 @@ class Runtime:
                             self.store.set_meta("event_offset", offset)
                         raise
                     else:
+                        duration = time.monotonic() - started
+                        if duration >= 2.0:
+                            LOG.warning(
+                                "Slow event handling: id=%s type=%s duration=%.2fs",
+                                event_id,
+                                event_type,
+                                duration,
+                            )
                         if event_id:
                             offset = event_id + 1
                             self.store.set_meta("event_offset", offset)
