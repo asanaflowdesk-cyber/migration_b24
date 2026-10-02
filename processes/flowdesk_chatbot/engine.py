@@ -196,18 +196,18 @@ def _edit_label(field_key: str) -> str:
 
 def _clear_edit_runtime(session: dict[str, Any]) -> None:
     """Drop transient editor state without touching the saved request data."""
-    _clear_edit_runtime(session)
+    session["edit_mode"] = False
+    session["edit_root"] = None
+    session["edit_backup"] = None
+    session["edit_history"] = []
+    session["attachment_edit_mode"] = None
 
 
 def _finish_edit(session: dict[str, Any], field_key: str | None = None) -> None:
     root = field_key or str(session.get("edit_root") or "")
     session["last_edited_field"] = _edit_label(root) if root else None
     session["current_screen"] = "edit_after"
-    session["edit_mode"] = False
-    session["edit_root"] = None
-    session["edit_backup"] = None
-    session["edit_history"] = []
-    session["attachment_edit_mode"] = None
+    _clear_edit_runtime(session)
 
 
 def _restore_edit_backup(session: dict[str, Any]) -> None:
