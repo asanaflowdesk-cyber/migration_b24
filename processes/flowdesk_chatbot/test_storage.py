@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import tempfile
+from contextlib import closing
 import unittest
 from pathlib import Path
 
@@ -14,11 +15,12 @@ class DeskFlowStorageTests(unittest.TestCase):
             db = Path(tmp) / "state.sqlite3"
             store = SessionStore(str(db))
 
-            with sqlite3.connect(db) as conn:
+            with closing(sqlite3.connect(db)) as conn:
                 conn.execute(
                     "INSERT INTO sessions(session_key, payload) VALUES(?, ?)",
                     ("chat1:1", "{not-json"),
                 )
+                conn.commit()
 
             self.assertIsNone(store.get_session("chat1:1"))
             self.assertIsNone(store.get_session("chat1:1"))
@@ -28,11 +30,12 @@ class DeskFlowStorageTests(unittest.TestCase):
             db = Path(tmp) / "state.sqlite3"
             store = SessionStore(str(db))
 
-            with sqlite3.connect(db) as conn:
+            with closing(sqlite3.connect(db)) as conn:
                 conn.execute(
                     "INSERT INTO sessions(session_key, payload) VALUES(?, ?)",
                     ("chat2:2", "[]"),
                 )
+                conn.commit()
 
             self.assertIsNone(store.get_session("chat2:2"))
 
