@@ -137,6 +137,61 @@ def new_session(user_id: int, dialog_id: str) -> dict[str, Any]:
     }
 
 
+def normalize_session(
+    session: dict[str, Any] | None,
+    *,
+    user_id: int | None = None,
+    dialog_id: str | None = None,
+) -> dict[str, Any]:
+    """Forward-fill sessions saved by older DeskFlow versions.
+
+    The SQLite state survives deployments, so adding a new key must never make
+    an in-progress user session crash after a restart.
+    """
+    if session is None:
+        if user_id is None or dialog_id is None:
+            raise ValueError("user_id and dialog_id are required for a new session")
+        return new_session(user_id=user_id, dialog_id=dialog_id)
+
+    resolved_user_id = int(session.get("user_id") or user_id or 0)
+    resolved_dialog_id = str(session.get("dialog_id") or dialog_id or "")
+    if not resolved_user_id or not resolved_dialog_id:
+        raise ValueError("Stored DeskFlow session has no user_id/dialog_id")
+
+    template = new_session(resolved_user_id, resolved_dialog_id)
+
+    # Keep stable identity/state from storage while supplying only missing keys.
+    for key, default in template.items():
+        if key == "data":
+            continue
+        if key not in session:
+            session[key] = deepcopy(default)
+
+    data = session.get("data")
+    if not isinstance(data, dict):
+        data = {}
+        session["data"] = data
+    for key, default in template["data"].items():
+        if key not in data:
+            data[key] = deepcopy(default)
+
+    # Defensive normalization for collections that older/corrupt sessions may
+    # contain as null after manual edits or interrupted deployments.
+    if not isinstance(session.get("history"), list):
+        session["history"] = []
+    if not isinstance(session.get("edit_history"), list):
+        session["edit_history"] = []
+    if not isinstance(session.get("detail_fields"), list):
+        session["detail_fields"] = []
+    if not isinstance(data.get("details"), dict):
+        data["details"] = {}
+    for key in ("document_file_ids", "document_file_names"):
+        if not isinstance(data.get(key), list):
+            data[key] = []
+
+    return session
+
+
 def _snapshot(session: dict[str, Any]) -> None:
     saved = deepcopy(session)
     saved["history"] = []
@@ -156,6 +211,7 @@ def go_back(session: dict[str, Any]) -> bool:
     session.update(previous)
     session["history"] = history
     session["revision"] = new_revision
+    normalize_session(session)
     return True
 
 
@@ -391,6 +447,7 @@ def _start_text() -> str:
 
 
 def view(session: dict[str, Any]) -> dict[str, Any]:
+    normalize_session(session)
     screen = session["current_screen"]
     data = session["data"]
     buttons: list[dict[str, str]] = []
@@ -624,6 +681,7 @@ def _validate_detail(field_name: str, value: str) -> tuple[bool, str, str]:
 
 
 def submit_action(session: dict[str, Any], action: str) -> dict[str, Any]:
+    normalize_session(session)
     screen = session["current_screen"]
 
     if action == ACTION_BACK:
@@ -800,6 +858,7 @@ def submit_action(session: dict[str, Any], action: str) -> dict[str, Any]:
 
 
 def submit_text(session: dict[str, Any], text: str) -> dict[str, Any]:
+    normalize_session(session)
     value = str(text or "").strip()
     current = view(session)
     if not current["accepts_text"]:
@@ -865,6 +924,7 @@ def submit_attachment_message(
     file_names: list[str],
     text: str = "",
 ) -> dict[str, Any]:
+    normalize_session(session)
     screen = session["current_screen"]
     value = str(text or "").strip()
     ids = [int(x) for x in file_ids if int(x) > 0]
@@ -955,6 +1015,7 @@ def _file_count_text(count: int) -> str:
 
 
 def summary_text(session: dict[str, Any]) -> str:
+    normalize_session(session)
     data = session["data"]
     lines = [
         "[b]Почти готово — давай всё проверим 👀[/b]",
