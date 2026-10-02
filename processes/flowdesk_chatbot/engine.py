@@ -62,6 +62,7 @@ def new_session(user_id: int, dialog_id: str) -> dict[str, Any]:
         "edit_mode": False,
         "edit_root": None,
         "edit_backup": None,
+        "edit_history": [],
         "last_edited_field": None,
         "attachment_edit_mode": None,
         "data": {
@@ -146,6 +147,7 @@ def _finish_edit(session: dict[str, Any], field_key: str | None = None) -> None:
     session["edit_mode"] = False
     session["edit_root"] = None
     session["edit_backup"] = None
+    session["edit_history"] = []
     session["attachment_edit_mode"] = None
 
 
@@ -160,7 +162,38 @@ def _restore_edit_backup(session: dict[str, Any]) -> None:
     session["edit_mode"] = False
     session["edit_root"] = None
     session["edit_backup"] = None
+    session["edit_history"] = []
     session["attachment_edit_mode"] = None
+
+
+def _edit_snapshot(session: dict[str, Any]) -> None:
+    saved = {
+        "data": deepcopy(session["data"]),
+        "current_screen": session.get("current_screen"),
+        "route": session.get("route"),
+        "detail_fields": list(session.get("detail_fields") or []),
+        "detail_index": int(session.get("detail_index") or 0),
+        "instruction_path": deepcopy(session.get("instruction_path")),
+        "attachment_edit_mode": session.get("attachment_edit_mode"),
+    }
+    session.setdefault("edit_history", []).append(saved)
+
+
+def _edit_back(session: dict[str, Any]) -> bool:
+    history = session.get("edit_history") or []
+    if not history:
+        return False
+
+    previous = history.pop()
+    session["data"] = deepcopy(previous["data"])
+    session["current_screen"] = previous["current_screen"]
+    session["route"] = previous["route"]
+    session["detail_fields"] = list(previous["detail_fields"])
+    session["detail_index"] = int(previous["detail_index"])
+    session["instruction_path"] = deepcopy(previous["instruction_path"])
+    session["attachment_edit_mode"] = previous["attachment_edit_mode"]
+    session["edit_history"] = history
+    return True
 
 
 def _save_edit_backup(session: dict[str, Any]) -> None:
@@ -213,6 +246,7 @@ def _start_edit(session: dict[str, Any], field_key: str) -> None:
     _save_edit_backup(session)
     session["edit_mode"] = True
     session["edit_root"] = field_key
+    session["edit_history"] = []
     session["last_edited_field"] = None
 
     if field_key == "request_type":
@@ -564,10 +598,10 @@ def submit_action(session: dict[str, Any], action: str) -> dict[str, Any]:
         return {"status": "ok"}
 
     if action == ACTION_EDIT_CANCEL:
-        if screen == "edit_attachments_input":
-            session["current_screen"] = "edit_attachments"
-            session["attachment_edit_mode"] = None
-        else:
+        # "← Назад" keeps its global meaning during correction too: go back
+        # exactly one edit step. From the first edit screen it cancels that
+        # field correction and returns to the correction menu.
+        if not _edit_back(session):
             _restore_edit_backup(session)
             session["current_screen"] = "edit_menu"
         _advance_revision(session)
@@ -582,12 +616,14 @@ def submit_action(session: dict[str, Any], action: str) -> dict[str, Any]:
         return {"status": "ok"}
 
     if action == ACTION_ATTACHMENT_ADD:
+        _edit_snapshot(session)
         session["attachment_edit_mode"] = "add"
         session["current_screen"] = "edit_attachments_input"
         _advance_revision(session)
         return {"status": "ok"}
 
     if action == ACTION_ATTACHMENT_REPLACE:
+        _edit_snapshot(session)
         session["attachment_edit_mode"] = "replace"
         session["current_screen"] = "edit_attachments_input"
         _advance_revision(session)
@@ -614,7 +650,9 @@ def submit_action(session: dict[str, Any], action: str) -> dict[str, Any]:
     if action == ACTION_NEW_REQUEST:
         return {"status": "restart_requested"}
 
-    if not session.get("edit_mode"):
+    if session.get("edit_mode"):
+        _edit_snapshot(session)
+    else:
         _snapshot(session)
 
     data = session["data"]
@@ -719,7 +757,9 @@ def submit_text(session: dict[str, Any], text: str) -> dict[str, Any]:
         if not ok:
             return {"status": "validation_error", "message": error}
 
-        if not session.get("edit_mode"):
+        if session.get("edit_mode"):
+            _edit_snapshot(session)
+        else:
             _snapshot(session)
 
         session["data"]["details"][field_name] = normalized
@@ -731,7 +771,9 @@ def submit_text(session: dict[str, Any], text: str) -> dict[str, Any]:
                 session["current_screen"] = "description"
 
     elif screen == "description":
-        if not session.get("edit_mode"):
+        if session.get("edit_mode"):
+            _edit_snapshot(session)
+        else:
             _snapshot(session)
         session["data"]["description"] = value
         if session.get("edit_mode"):
@@ -786,6 +828,7 @@ def submit_attachment_message(
         session["current_screen"] = "confirm"
 
     elif screen == "edit_attachments_input":
+        _edit_snapshot(session)
         mode = str(session.get("attachment_edit_mode") or "add")
         if mode == "replace":
             if ids:
