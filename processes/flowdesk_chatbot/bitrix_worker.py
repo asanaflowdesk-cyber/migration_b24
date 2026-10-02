@@ -14,8 +14,10 @@ from processes.flowdesk_chatbot.engine import (
     mark_task_created,
     new_session,
     submit_action,
+    submit_attachment_message,
     submit_text,
     task_description,
+    task_registry_fields,
     task_title,
     view,
 )
@@ -25,6 +27,19 @@ LOG = logging.getLogger("flowdesk_chatbot")
 
 TRIGGERS = {"sos", "help", "помощь", "чп", "/start", "начать"}
 COMMAND_NAME = "flowdesk"
+
+TASK_USER_FIELDS: dict[str, dict[str, Any]] = {
+    "UF_FLOWDESK_REQUEST_TYPE": {"label": "Тип обращения", "sort": 200, "rows": 1},
+    "UF_FLOWDESK_TARGET": {"label": "К кому / подразделение", "sort": 210, "rows": 1},
+    "UF_FLOWDESK_REQUEST": {"label": "Запрос", "sort": 220, "rows": 1},
+    "UF_FLOWDESK_REQUEST_DETAIL": {"label": "Уточнение запроса", "sort": 230, "rows": 1},
+    "UF_FLOWDESK_INSURANCE_TYPE": {"label": "Вид страхования", "sort": 240, "rows": 1},
+    "UF_FLOWDESK_INSURANCE_CLASS": {"label": "Класс страхования", "sort": 250, "rows": 1},
+    "UF_FLOWDESK_PRODUCT": {"label": "Продукт", "sort": 260, "rows": 1},
+    "UF_FLOWDESK_DETAILS": {"label": "Детализация", "sort": 270, "rows": 8},
+    "UF_FLOWDESK_DESCRIPTION": {"label": "Суть обращения", "sort": 280, "rows": 12},
+    "UF_FLOWDESK_INITIATOR_ID": {"label": "Инициатор обращения ID", "sort": 290, "rows": 1},
+}
 
 
 class Runtime:
@@ -42,6 +57,12 @@ class Runtime:
         self.command_name = os.getenv("FLOWDESK_COMMAND_NAME", f"flowdesk_{suffix}")
         self.bot_id = 0
         self._last_api_call = 0.0
+        webhook = os.getenv("TARGET_BITRIX_WEBHOOK_URL", "").strip()
+        parsed = urlsplit(webhook)
+        self.portal_base = (
+            f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else ""
+        )
+        self.task_user_fields: set[str] = set()
         self.event_poll_seconds = float(
             os.getenv("FLOWDESK_EVENT_POLL_SECONDS", "1.5")
         )
@@ -61,12 +82,21 @@ class Runtime:
         self.store.set_meta("bot_token", token)
         return token
 
-    def call(self, method: str, params: dict[str, Any] | None = None) -> Any:
-        # Bitrix bot platform limit is 2 requests/sec per application.
+    def _throttle(self) -> None:
+        # Keep a single conservative limit for classic and REST 3.0 calls.
         elapsed = time.monotonic() - self._last_api_call
         if elapsed < 0.52:
             time.sleep(0.52 - elapsed)
+
+    def call(self, method: str, params: dict[str, Any] | None = None) -> Any:
+        self._throttle()
         result = self.client.call(method, params or {})
+        self._last_api_call = time.monotonic()
+        return result
+
+    def call_v3(self, method: str, params: dict[str, Any] | None = None) -> Any:
+        self._throttle()
+        result = self.client.call_v3(method, params or {})
         self._last_api_call = time.monotonic()
         return result
 
@@ -144,6 +174,76 @@ class Runtime:
                 },
             },
         )
+
+        # Custom task fields are optional at transport level, but they are what
+        # makes the registry exportable without parsing DESCRIPTION. Creation is
+        # best-effort because task user fields require administrator permission.
+        self.ensure_task_user_fields()
+
+    def ensure_task_user_fields(self) -> None:
+        try:
+            result = self.call(
+                "task.item.userfield.getlist",
+                {"ORDER": {"SORT": "ASC"}},
+            )
+        except Exception as exc:
+            LOG.warning(
+                "Could not read task user fields; structured registry fields disabled: %s",
+                sanitize_error(exc),
+            )
+            self.task_user_fields = set()
+            return
+
+        rows = result if isinstance(result, list) else []
+        existing = {
+            str(row.get("FIELD_NAME") or row.get("fieldName") or "")
+            for row in rows
+            if isinstance(row, dict)
+        }
+
+        for field_name, spec in TASK_USER_FIELDS.items():
+            if field_name in existing:
+                continue
+            try:
+                self.call(
+                    "task.item.userfield.add",
+                    {
+                        "PARAMS": {
+                            "USER_TYPE_ID": "string",
+                            "FIELD_NAME": field_name,
+                            "XML_ID": field_name,
+                            "LABEL": spec["label"],
+                            "EDIT_FORM_LABEL": {
+                                "ru": spec["label"],
+                                "en": spec["label"],
+                            },
+                            "SORT": int(spec["sort"]),
+                            "MULTIPLE": "N",
+                            "MANDATORY": "N",
+                            "SETTINGS": {
+                                "ROWS": int(spec["rows"]),
+                            },
+                        }
+                    },
+                )
+            except BitrixError as exc:
+                LOG.warning(
+                    "Task user field %s was not created: %s",
+                    field_name,
+                    sanitize_error(exc),
+                )
+                continue
+            except Exception as exc:
+                LOG.warning(
+                    "Task user field %s creation failed: %s",
+                    field_name,
+                    sanitize_error(exc),
+                )
+                continue
+            existing.add(field_name)
+            LOG.info("Created task user field %s", field_name)
+
+        self.task_user_fields = existing
 
     @staticmethod
     def session_key(dialog_id: str, user_id: int) -> str:
@@ -245,33 +345,26 @@ class Runtime:
         if not current["buttons"]:
             return None
 
-        # Use Bitrix theme tokens rather than arbitrary HEX colors.
-        # Tokens are rendered more consistently across on-premise clients.
-        palette = ("primary", "alert", "secondary", "primary")
         buttons = []
         for index, item in enumerate(current["buttons"]):
-            action = item["action"]
-            if action == "__back__":
-                color_token = "secondary"
-            elif action == "__skip__":
-                color_token = "alert"
-            elif action == "__confirm__":
-                color_token = "primary"
-            elif action == "__new_request__":
-                color_token = "primary"
-            else:
-                color_token = palette[index % len(palette)]
+            style = str(item.get("style") or "secondary")
+            button: dict[str, Any] = {
+                "TEXT": item["label"],
+                "COMMAND": f"/{self.command_name}",
+                "COMMAND_PARAMS": f"{current['revision']}:{index}",
+                "BLOCK": "Y",
+                "DISPLAY": "LINE",
+                "BG_COLOR_TOKEN": style,
+            }
 
-            buttons.append(
-                {
-                    "TEXT": item["label"],
-                    "COMMAND": f"/{self.command_name}",
-                    "COMMAND_PARAMS": f"{current['revision']}:{index}",
-                    "BLOCK": "Y",
-                    "DISPLAY": "LINE",
-                    "BG_COLOR_TOKEN": color_token,
-                }
-            )
+            # Secondary is the calm light-blue choice style. Back/confirm/new
+            # request use primary, while urgent contract and complaint use alert.
+            if style == "secondary":
+                button["TEXT_COLOR"] = "#2067B0"
+            elif style in {"primary", "alert"}:
+                button["TEXT_COLOR"] = "#FFFFFF"
+
+            buttons.append(button)
 
         return {
             "BOT_ID": self.bot_id,
@@ -298,7 +391,7 @@ class Runtime:
                 "DISPLAY": "LINE",
             }
             if keyboard:
-                keyboard["BUTTONS"].append(link)
+                keyboard["BUTTONS"].insert(0, link)
             else:
                 keyboard = {
                     "BOT_ID": self.bot_id,
@@ -443,6 +536,86 @@ class Runtime:
         if not isinstance(result, dict):
             raise RuntimeError(f"Message.update вернул неожиданный ответ: {result!r}")
 
+    def recent_flowdesk_tasks(
+        self,
+        user_id: int,
+        needed: int,
+    ) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        start = 0
+
+        # Bitrix returns 50 tasks per classic list page. Continue only while
+        # needed so opening the bot does not turn into a heavy registry query.
+        for _ in range(10):
+            result = self.call(
+                "tasks.task.list",
+                {
+                    "order": {"ID": "desc"},
+                    "filter": {"CREATED_BY": int(user_id)},
+                    "select": ["ID", "TITLE", "XML_ID", "CREATED_DATE"],
+                    "start": start,
+                },
+            )
+            page = []
+            if isinstance(result, dict):
+                page = result.get("tasks") or result.get("items") or []
+            elif isinstance(result, list):
+                page = result
+
+            if not isinstance(page, list) or not page:
+                break
+
+            for row in page:
+                if not isinstance(row, dict):
+                    continue
+                xml_id = str(row.get("xmlId") or row.get("XML_ID") or "")
+                if xml_id.startswith("FLOWDESK_CHAT_"):
+                    rows.append(row)
+                    if len(rows) >= needed:
+                        return rows
+
+            if len(page) < 50:
+                break
+            start += 50
+
+        return rows
+
+    def history_block(self, session: dict[str, Any]) -> str:
+        page = max(0, int(session.get("history_page") or 0))
+        shown = (page + 1) * 10
+        rows = self.recent_flowdesk_tasks(int(session["user_id"]), shown + 1)
+        session["history_has_more"] = len(rows) > shown
+
+        visible = rows[:shown]
+        if not visible:
+            return ""
+
+        lines = ["", "", "[b]Последние обращения 📋[/b]"]
+        for row in visible:
+            task_id = str(row.get("id") or row.get("ID") or "").strip()
+            title = str(row.get("title") or row.get("TITLE") or "").strip()
+            if not task_id:
+                continue
+
+            parts = [part.strip() for part in title.split("|") if part.strip()]
+            request_type = parts[0] if parts else "Обращение"
+            # Only "Запрос" has a department in the title's second slot.
+            # Direct branch-3 appeals have no department; their next title part
+            # can be an insurance class and must not be mislabeled as a department.
+            target = (
+                parts[1]
+                if request_type == "Запрос" and len(parts) > 1
+                else ""
+            )
+            label = f"#{task_id} · {request_type}"
+            if target:
+                label += f" · {target}"
+
+            link = self.task_link(int(session["user_id"]), task_id)
+            lines.append(f"[url={link}]{label}[/url]")
+
+        return "\n".join(lines)
+
     def render_current(
         self,
         session: dict[str, Any],
@@ -450,19 +623,36 @@ class Runtime:
         link_button: dict[str, str] | None = None,
         text_override: str | None = None,
     ) -> None:
+        history = ""
+        if session.get("current_screen") in {"type", "done"} and not session.get("edit_mode"):
+            history = self.history_block(session)
+
         current = view(session)
         text = text_override if text_override is not None else current["text"]
+        if history:
+            text += history
 
-        # Keep the first screen writable as a recovery point. In this box version,
-        # disabling the field on the very first screen can make the newly created
-        # service chat look completely locked before the first interaction.
-        # After the first button click, button-only screens are locked as intended.
-        text_enabled = bool(
-            current["accepts_text"]
-            or current["terminal"]
-            or current["screen"] == "type"
+        # Keep the final direct-link button on every final re-render, including
+        # after "Показать ещё".
+        if (
+            link_button is None
+            and current["screen"] == "done"
+            and session.get("task_id")
+        ):
+            link_button = {
+                "text": "Открыть обращение",
+                "link": self.task_link(
+                    int(session["user_id"]),
+                    str(session["task_id"]),
+                ),
+            }
+
+        # Global UX rule: text is available only on screens that explicitly
+        # accept text/files. Button-only screens, start and final included, are locked.
+        self.set_text_field(
+            session["dialog_id"],
+            bool(current["accepts_text"]),
         )
-        self.set_text_field(session["dialog_id"], text_enabled)
 
         message_id = session.get("active_message_id")
         if message_id:
@@ -534,6 +724,10 @@ class Runtime:
         if project_id > 0:
             fields["GROUP_ID"] = project_id
 
+        for field_name, value in task_registry_fields(session).items():
+            if field_name in self.task_user_fields:
+                fields[field_name] = value
+
         file_ids = [
             int(file_id)
             for file_id in (session["data"].get("document_file_ids") or [])
@@ -552,11 +746,60 @@ class Runtime:
         if not isinstance(task, dict) or not task.get("id"):
             raise RuntimeError(f"tasks.task.add не вернул task.id: {result!r}")
 
-        return str(task["id"])
+        task_id = str(task["id"])
+        self.send_attachment_comment(session, task_id)
+        return task_id
 
-    @staticmethod
-    def task_link(user_id: int, task_id: str) -> str:
-        return f"/company/personal/user/{user_id}/tasks/task/view/{task_id}/"
+    def send_attachment_comment(
+        self,
+        session: dict[str, Any],
+        task_id: str,
+    ) -> None:
+        comment = str(session["data"].get("document_comment") or "").strip()
+        if not comment:
+            return
+
+        try:
+            self.call_v3(
+                "tasks.task.chat.message.send",
+                {
+                    "fields": {
+                        "taskId": int(task_id),
+                        "text": comment,
+                    }
+                },
+            )
+            return
+        except Exception as exc:
+            LOG.warning(
+                "REST 3.0 task chat message failed for task=%s, using legacy fallback: %s",
+                task_id,
+                sanitize_error(exc),
+            )
+
+        try:
+            self.call(
+                "task.commentitem.add",
+                {
+                    "TASKID": int(task_id),
+                    "FIELDS": {
+                        "POST_MESSAGE": comment,
+                        "AUTHOR_ID": int(session["user_id"]),
+                    },
+                },
+            )
+        except Exception as exc:
+            # The task itself must remain successfully created even if this box
+            # version refuses both comment transports.
+            LOG.error(
+                "Attachment comment could not be written to task=%s: %s",
+                task_id,
+                sanitize_error(exc),
+            )
+
+    def task_link(self, user_id: int, task_id: str) -> str:
+        path = f"/company/personal/user/{user_id}/tasks/task/view/{task_id}/"
+        return f"{self.portal_base}{path}" if self.portal_base else path
 
     def restart_session(self, dialog_id: str, user_id: int) -> dict[str, Any]:
         key = self.session_key(dialog_id, user_id)
@@ -672,26 +915,16 @@ class Runtime:
 
         if session.get("current_screen") == "done":
             self.delete_chat_message(message_id)
-            self.render_current(
-                session,
-                text_override="Обращение завершено. Нажмите «Создать новое обращение» или напишите «SOS».",
-            )
+            self.render_current(session)
             return
 
-        if session.get("current_screen") == "document" and files:
-            names = [item["name"] for item in files if item.get("name")]
-            if text:
-                document_value = text
-            elif names:
-                document_value = "Файл: " + ", ".join(names)
-            else:
-                document_value = "Прикреплённый файл"
-
-            result = submit_text(session, document_value)
-            session["data"]["document_file_ids"] = [
-                int(item["id"]) for item in files
-            ]
-
+        if session.get("current_screen") in {"document", "edit_attachments_input"} and files:
+            result = submit_attachment_message(
+                session,
+                [int(item["id"]) for item in files],
+                [str(item.get("name") or "") for item in files],
+                text,
+            )
             self.delete_chat_message(message_id)
             self.store.put_session(key, session)
             self.render_current(session)
@@ -710,6 +943,16 @@ class Runtime:
 
         if status == "empty":
             self.render_current(session)
+            return
+
+        if status == "validation_error":
+            current = view(session)
+            message = str(result.get("message") or "").strip()
+            text_override = current["text"]
+            if message:
+                text_override += "\n\n" + message
+            self.store.put_session(key, session)
+            self.render_current(session, text_override=text_override)
             return
 
         self.store.put_session(key, session)
@@ -752,7 +995,7 @@ class Runtime:
         except (ValueError, TypeError):
             self.render_current(
                 session,
-                text_override="Кнопка повреждена. Напишите «SOS» и начните заново.",
+                text_override="[b]Ошибочка вышла 🤔[/b]\n[i]Используй кнопки в текущем сообщении — так я пойму, куда идти дальше.[/i]",
             )
             return
 
@@ -762,14 +1005,14 @@ class Runtime:
             # Old keyboards stay visible in chat history, but can never mutate state.
             self.render_current(
                 session,
-                text_override="Эта кнопка уже неактуальна. Используйте последний экран.",
+                text_override="[b]Этот экран уже изменился 🙂[/b]\n[i]Используй кнопки в текущем сообщении.[/i]",
             )
             return
 
         if index < 0 or index >= len(current["buttons"]):
             self.render_current(
                 session,
-                text_override="Эта кнопка уже неактуальна.",
+                text_override="[b]Этот экран уже изменился 🙂[/b]\n[i]Используй кнопки в текущем сообщении.[/i]",
             )
             return
 
@@ -782,9 +1025,8 @@ class Runtime:
             self.store.put_session(key, session)
             self.render_current(
                 session,
-                text_override=f"Задача создана: #{task_id}",
                 link_button={
-                    "text": "Открыть задачу",
+                    "text": "Открыть обращение",
                     "link": self.task_link(user_id, task_id),
                 },
             )

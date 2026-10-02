@@ -2,17 +2,40 @@ name: 41 | FlowDesk ChatBot Test
 
 on:
   workflow_dispatch:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "processes/flowdesk_chatbot/**"
+      - ".github/workflows/41-flowdesk-chatbot-test.yml"
+
+permissions:
+  contents: read
+
+env:
+  NODE_USE_SYSTEM_CA: "1"
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: "utf-8"
 
 jobs:
   test-chatbot:
     runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 10
 
     steps:
-      - name: Получить код
-        uses: actions/checkout@v5
+      - name: Получить код DeskFlow отдельно
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          clean: false
+          fetch-depth: 1
+          path: _flowdesk_chatbot_test
 
-      - name: Проверить доступ к webhook
+      - name: Проверить синтаксис и логику DeskFlow
+        shell: cmd
         env:
-          TARGET_BITRIX_WEBHOOK_URL: ${{ secrets.TARGET_BITRIX_WEBHOOK_URL }}
-          PYTHONPATH: ${{ github.workspace }}
-        run: python -m processes.flowdesk_chatbot.bot
+          PYTHONPATH: ${{ github.workspace }}\_flowdesk_chatbot_test
+        run: |
+          set "PYTHON_EXE=C:\Users\Alyona.Sachyova\AppData\Local\Programs\Python\Python312\python.exe"
+          cd /d "_flowdesk_chatbot_test"
+          "%PYTHON_EXE%" -m py_compile processes\flowdesk_chatbot\config.py processes\flowdesk_chatbot\engine.py processes\flowdesk_chatbot\bitrix_worker.py processes\flowdesk_chatbot\storage.py
+          "%PYTHON_EXE%" -m unittest -v processes.flowdesk_chatbot.test_engine
