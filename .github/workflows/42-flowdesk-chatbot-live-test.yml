@@ -44,6 +44,8 @@ jobs:
           TARGET_BITRIX_WEBHOOK_URL: ${{ secrets.TARGET_BITRIX_WEBHOOK_URL }}
           FLOWDESK_PROJECT_ID: "2"
           FLOWDESK_BOT_NAME: "DeskFlow Test"
+          FLOWDESK_ACTIVE_POLL_SECONDS: "1.0"
+          FLOWDESK_QUIET_POLL_SECONDS: "60.0"
           CUSTOM_PIP_INDEX_URL: ${{ vars.PIP_INDEX_URL }}
         run: |
           set "PYTHON_EXE=C:\Users\Alyona.Sachyova\AppData\Local\Programs\Python\Python312\python.exe"

@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import unittest
+from datetime import datetime, timedelta, timezone
 
 from processes.flowdesk_chatbot.config import PRODUCT_TREE
+from processes.flowdesk_chatbot.polling import (
+    is_active_poll_window,
+    poll_interval_seconds,
+)
 from processes.flowdesk_chatbot.engine import (
     ACTION_ATTACHMENT_ADD,
     ACTION_ATTACHMENT_DELETE,
@@ -30,6 +35,40 @@ def session_at(screen: str) -> dict:
 
 
 class DeskFlowEngineTests(unittest.TestCase):
+    def test_day_night_polling_boundaries(self) -> None:
+        kz = timezone(timedelta(hours=5))
+
+        cases = [
+            (datetime(2026, 10, 2, 7, 59, tzinfo=kz), False),
+            (datetime(2026, 10, 2, 8, 0, tzinfo=kz), True),
+            (datetime(2026, 10, 2, 22, 0, 59, tzinfo=kz), True),
+            (datetime(2026, 10, 2, 22, 1, tzinfo=kz), False),
+        ]
+
+        for moment, expected in cases:
+            with self.subTest(moment=moment):
+                self.assertEqual(is_active_poll_window(moment), expected)
+
+    def test_day_night_polling_intervals(self) -> None:
+        kz = timezone(timedelta(hours=5))
+
+        self.assertEqual(
+            poll_interval_seconds(
+                datetime(2026, 10, 2, 12, 0, tzinfo=kz),
+                active_seconds=1.0,
+                quiet_seconds=60.0,
+            ),
+            1.0,
+        )
+        self.assertEqual(
+            poll_interval_seconds(
+                datetime(2026, 10, 2, 2, 0, tzinfo=kz),
+                active_seconds=1.0,
+                quiet_seconds=60.0,
+            ),
+            60.0,
+        )
+
     def test_start_screen_has_clean_labels_and_locked_text(self) -> None:
         session = new_session(153, "chat999")
         current = view(session)
