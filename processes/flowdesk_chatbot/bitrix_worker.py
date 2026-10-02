@@ -245,20 +245,22 @@ class Runtime:
         if not current["buttons"]:
             return None
 
-        palette = ("#2F80ED", "#7B61FF", "#18A999", "#E0528D", "#E67E22", "#3A9D5D")
+        # Use Bitrix theme tokens rather than arbitrary HEX colors.
+        # Tokens are rendered more consistently across on-premise clients.
+        palette = ("primary", "alert", "secondary", "primary")
         buttons = []
         for index, item in enumerate(current["buttons"]):
             action = item["action"]
             if action == "__back__":
-                bg_color = "#667085"
+                color_token = "secondary"
             elif action == "__skip__":
-                bg_color = "#D97706"
+                color_token = "alert"
             elif action == "__confirm__":
-                bg_color = "#169B62"
+                color_token = "primary"
             elif action == "__new_request__":
-                bg_color = "#2F80ED"
+                color_token = "primary"
             else:
-                bg_color = palette[index % len(palette)]
+                color_token = palette[index % len(palette)]
 
             buttons.append(
                 {
@@ -267,8 +269,7 @@ class Runtime:
                     "COMMAND_PARAMS": f"{current['revision']}:{index}",
                     "BLOCK": "Y",
                     "DISPLAY": "LINE",
-                    "BG_COLOR": bg_color,
-                    "TEXT_COLOR": "#FFFFFF",
+                    "BG_COLOR_TOKEN": color_token,
                 }
             )
 
