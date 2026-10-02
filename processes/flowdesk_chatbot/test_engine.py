@@ -236,6 +236,13 @@ class DeskFlowEngineTests(unittest.TestCase):
         self.assertEqual(session["data"]["target"], "Статисты")
         self.assertEqual(session["data"]["request"], "Бонусы/Премия")
 
+    def test_review_edit_button_is_red_and_last(self) -> None:
+        session = session_at("confirm")
+        current = view(session)
+
+        self.assertEqual(current["buttons"][-1]["label"], "Исправить данные")
+        self.assertEqual(current["buttons"][-1]["style"], "alert")
+
     def test_attachment_editor_is_available_even_after_original_skip(self) -> None:
         session = session_at("confirm")
         session["data"]["request_type"] = "Другое"
