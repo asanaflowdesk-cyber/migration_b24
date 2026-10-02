@@ -492,7 +492,7 @@ def view(session: dict[str, Any]) -> dict[str, Any]:
         text = summary_text(session)
         buttons = [
             _button("Создать обращение", ACTION_CONFIRM, "primary"),
-            _button("Исправить данные", ACTION_EDIT, "secondary"),
+            _button("Исправить данные", ACTION_EDIT, "alert"),
         ]
 
     elif screen == "edit_menu":
