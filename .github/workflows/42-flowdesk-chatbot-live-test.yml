@@ -17,6 +17,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: flowdesk-chatbot-control
+  cancel-in-progress: false
+
 env:
   NODE_USE_SYSTEM_CA: "1"
   PYTHONUTF8: "1"
@@ -46,6 +50,8 @@ jobs:
           FLOWDESK_BOT_NAME: "DeskFlow Test"
           FLOWDESK_ACTIVE_POLL_SECONDS: "1.0"
           FLOWDESK_QUIET_POLL_SECONDS: "60.0"
+          FLOWDESK_EVENT_RETRY_ATTEMPTS: "3"
+          FLOWDESK_EVENT_RETRY_DELAY: "0.75"
           CUSTOM_PIP_INDEX_URL: ${{ vars.PIP_INDEX_URL }}
         run: |
           set "PYTHON_EXE=C:\Users\Alyona.Sachyova\AppData\Local\Programs\Python\Python312\python.exe"
