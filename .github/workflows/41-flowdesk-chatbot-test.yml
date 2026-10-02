@@ -20,7 +20,7 @@ env:
 jobs:
   test-chatbot:
     runs-on: [self-hosted, Windows, X64]
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
       - name: Получить код DeskFlow отдельно
@@ -30,12 +30,17 @@ jobs:
           fetch-depth: 1
           path: _flowdesk_chatbot_test
 
-      - name: Проверить синтаксис и логику DeskFlow
+      - name: Проверить синтаксис и полный набор тестов DeskFlow
         shell: cmd
         env:
           PYTHONPATH: ${{ github.workspace }}\_flowdesk_chatbot_test
+          CUSTOM_PIP_INDEX_URL: ${{ vars.PIP_INDEX_URL }}
         run: |
-          set "PYTHON_EXE=C:\Users\Alyona.Sachyova\AppData\Local\Programs\Python\Python312\python.exe"
+          set "PYTHON_EXE=C:\Users\admpark\.flowdesk-chatbot\venv\Scripts\python.exe"
+          if not exist "%PYTHON_EXE%" set "PYTHON_EXE=C:\Users\Alyona.Sachyova\AppData\Local\Programs\Python\Python312\python.exe"
+          if not "%CUSTOM_PIP_INDEX_URL%"=="" set "PIP_INDEX_URL=%CUSTOM_PIP_INDEX_URL%"
           cd /d "_flowdesk_chatbot_test"
-          "%PYTHON_EXE%" -m py_compile processes\flowdesk_chatbot\config.py processes\flowdesk_chatbot\engine.py processes\flowdesk_chatbot\bitrix_worker.py processes\flowdesk_chatbot\storage.py
-          "%PYTHON_EXE%" -m unittest -v processes.flowdesk_chatbot.test_engine
+          "%PYTHON_EXE%" -c "import requests, truststore" >nul 2>&1
+          if errorlevel 1 "%PYTHON_EXE%" -m pip install -r processes\flowdesk\requirements.txt
+          "%PYTHON_EXE%" -m py_compile processes\flowdesk_chatbot\config.py processes\flowdesk_chatbot\engine.py processes\flowdesk_chatbot\bitrix_worker.py processes\flowdesk_chatbot\polling.py processes\flowdesk_chatbot\storage.py processes\flowdesk_chatbot\worker_control.py
+          "%PYTHON_EXE%" -m unittest discover -v -s processes\flowdesk_chatbot -p "test_*.py"
