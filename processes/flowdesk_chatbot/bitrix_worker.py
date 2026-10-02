@@ -814,12 +814,25 @@ class Runtime:
     @staticmethod
     def message_files(message: dict[str, Any]) -> list[dict[str, Any]]:
         params = message.get("params") or {}
-        raw = params.get("files") or params.get("FILES") or []
+        if not isinstance(params, dict):
+            return []
+
+        # Bitrix24 Chatbots 2.0 sends user attachments in message.params.FILE_ID.
+        # Older/on-premise variants may expose richer objects under FILES/files,
+        # so keep those fallbacks too.
+        raw = (
+            params.get("FILE_ID")
+            or params.get("fileId")
+            or params.get("file_id")
+            or params.get("FILES")
+            or params.get("files")
+            or []
+        )
 
         if isinstance(raw, dict):
             raw = list(raw.values())
-        elif not isinstance(raw, list):
-            raw = [raw] if raw else []
+        elif not isinstance(raw, (list, tuple, set)):
+            raw = [raw] if raw not in (None, "", False) else []
 
         files: list[dict[str, Any]] = []
         seen: set[int] = set()
@@ -834,13 +847,15 @@ class Runtime:
                     or item.get("ID")
                     or item.get("fileId")
                     or item.get("FILE_ID")
+                    or item.get("value")
+                    or item.get("VALUE")
                 )
                 name = str(item.get("name") or item.get("NAME") or "").strip()
             else:
                 value = item
 
             try:
-                file_id = int(value or 0)
+                file_id = int(str(value).strip())
             except (TypeError, ValueError):
                 file_id = 0
 
@@ -865,6 +880,12 @@ class Runtime:
         message_id = int(message.get("id") or 0)
         text = str(message.get("text") or "").strip()
         files = self.message_files(message)
+        if files:
+            LOG.info(
+                "Attachment message detected: message=%s file_ids=%s",
+                message_id,
+                [item["id"] for item in files],
+            )
         user_name = str(user.get("name") or "").strip()
 
         if not user_id or not source_dialog_id:
