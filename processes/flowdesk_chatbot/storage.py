@@ -3,8 +3,9 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 
 LOG = logging.getLogger(__name__)
@@ -14,7 +15,7 @@ class SessionStore:
     def __init__(self, path: str):
         self.path = str(path)
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as conn:
+        with self._connection() as conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS sessions (
@@ -39,8 +40,26 @@ class SessionStore:
         conn.execute("PRAGMA synchronous=NORMAL")
         return conn
 
+    @contextmanager
+    def _connection(self) -> Iterator[sqlite3.Connection]:
+        """Commit/rollback and always close SQLite handles.
+
+        sqlite3.Connection's own context manager does not close the connection.
+        On Windows that can keep the database file locked until garbage
+        collection and gradually accumulate handles in a long-running worker.
+        """
+        conn = self._connect()
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def get_session(self, session_key: str) -> dict[str, Any] | None:
-        with self._connect() as conn:
+        with self._connection() as conn:
             row = conn.execute(
                 "SELECT payload FROM sessions WHERE session_key = ?",
                 (session_key,),
@@ -72,7 +91,7 @@ class SessionStore:
 
     def put_session(self, session_key: str, payload: dict[str, Any]) -> None:
         raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-        with self._connect() as conn:
+        with self._connection() as conn:
             conn.execute(
                 """
                 INSERT INTO sessions(session_key, payload, updated_at)
@@ -85,16 +104,16 @@ class SessionStore:
             )
 
     def delete_session(self, session_key: str) -> None:
-        with self._connect() as conn:
+        with self._connection() as conn:
             conn.execute("DELETE FROM sessions WHERE session_key = ?", (session_key,))
 
     def get_meta(self, key: str, default: str = "") -> str:
-        with self._connect() as conn:
+        with self._connection() as conn:
             row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
         return default if row is None else str(row[0])
 
     def set_meta(self, key: str, value: str | int) -> None:
-        with self._connect() as conn:
+        with self._connection() as conn:
             conn.execute(
                 """
                 INSERT INTO meta(key, value)
