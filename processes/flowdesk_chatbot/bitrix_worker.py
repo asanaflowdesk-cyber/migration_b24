@@ -13,6 +13,7 @@ from common.bitrix import BitrixClient, BitrixError, sanitize_error
 from processes.flowdesk_chatbot.engine import (
     mark_task_created,
     new_session,
+    normalize_session,
     parse_message_files,
     submit_action,
     submit_attachment_message,
@@ -79,6 +80,14 @@ class Runtime:
         )
         self.quiet_poll_seconds = float(
             os.getenv("FLOWDESK_QUIET_POLL_SECONDS", "60.0")
+        )
+        self.event_retry_attempts = max(
+            1,
+            int(os.getenv("FLOWDESK_EVENT_RETRY_ATTEMPTS", "3")),
+        )
+        self.event_retry_delay = max(
+            0.0,
+            float(os.getenv("FLOWDESK_EVENT_RETRY_DELAY", "0.75")),
         )
 
     def _load_or_create_bot_token(self) -> str:
@@ -208,7 +217,18 @@ class Runtime:
             self.task_user_fields = set()
             return
 
-        rows = result if isinstance(result, list) else []
+        if isinstance(result, list):
+            rows = result
+        elif isinstance(result, dict):
+            rows = []
+            for key in ("items", "fields", "result"):
+                value = result.get(key)
+                if isinstance(value, list):
+                    rows = value
+                    break
+        else:
+            rows = []
+
         existing = {
             str(row.get("FIELD_NAME") or row.get("fieldName") or "")
             for row in rows
@@ -557,63 +577,124 @@ class Runtime:
         if not isinstance(result, dict):
             raise RuntimeError(f"Message.update вернул неожиданный ответ: {result!r}")
 
+    def _query_flowdesk_tasks(
+        self,
+        task_filter: dict[str, Any],
+        needed: int,
+    ) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        start = 0
+
+        while len(rows) < needed:
+            result = self.call(
+                "tasks.task.list",
+                {
+                    "order": {"ID": "desc"},
+                    "filter": task_filter,
+                    "select": [
+                        "ID",
+                        "TITLE",
+                        "XML_ID",
+                        "CREATED_DATE",
+                        "UF_FLOWDESK_INITIATOR_ID",
+                    ],
+                    "start": start,
+                },
+            )
+            if isinstance(result, dict):
+                page = result.get("tasks") or result.get("items") or []
+            elif isinstance(result, list):
+                page = result
+            else:
+                page = []
+
+            if not isinstance(page, list) or not page:
+                break
+
+            for row in page:
+                if not isinstance(row, dict):
+                    continue
+                xml_id = str(row.get("xmlId") or row.get("XML_ID") or "")
+                if xml_id.startswith("FLOWDESK_CHAT_"):
+                    rows.append(row)
+                    if len(rows) >= needed:
+                        return rows
+
+            if len(page) < 50:
+                break
+            start += 50
+
+        return rows
+
+    @staticmethod
+    def _merge_task_rows(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        merged: dict[str, dict[str, Any]] = {}
+        for group in groups:
+            for row in group:
+                task_id = str(row.get("id") or row.get("ID") or "").strip()
+                if task_id:
+                    merged[task_id] = row
+
+        def sort_key(row: dict[str, Any]) -> tuple[int, str]:
+            raw_id = str(row.get("id") or row.get("ID") or "")
+            try:
+                numeric = int(raw_id)
+            except ValueError:
+                numeric = 0
+            created = str(row.get("createdDate") or row.get("CREATED_DATE") or "")
+            return numeric, created
+
+        return sorted(merged.values(), key=sort_key, reverse=True)
+
     def recent_flowdesk_tasks(
         self,
         user_id: int,
         needed: int,
     ) -> list[dict[str, Any]]:
-        # Fast path: ask Bitrix to filter DeskFlow tasks server-side. Without
-        # this filter the old implementation could scan up to 500 unrelated
-        # tasks and spend several throttle slots just to draw the start/final screen.
-        try:
-            rows: list[dict[str, Any]] = []
-            start = 0
-            while len(rows) < needed:
-                result = self.call(
-                    "tasks.task.list",
+        xml_filter = {"%XML_ID": "FLOWDESK_CHAT_"}
+
+        # New tasks use the dedicated initiator field. This keeps history correct
+        # even if CREATED_BY is later switched to a service account.
+        initiator_rows: list[dict[str, Any]] = []
+        if "UF_FLOWDESK_INITIATOR_ID" in self.task_user_fields:
+            try:
+                initiator_rows = self._query_flowdesk_tasks(
                     {
-                        "order": {"ID": "desc"},
-                        "filter": {
-                            "CREATED_BY": int(user_id),
-                            "%XML_ID": "FLOWDESK_CHAT_",
-                        },
-                        "select": ["ID", "TITLE", "XML_ID", "CREATED_DATE"],
-                        "start": start,
+                        **xml_filter,
+                        "UF_FLOWDESK_INITIATOR_ID": str(user_id),
                     },
+                    needed,
                 )
-                if isinstance(result, dict):
-                    page = result.get("tasks") or result.get("items") or []
-                elif isinstance(result, list):
-                    page = result
-                else:
-                    page = []
+            except Exception as exc:
+                LOG.warning(
+                    "DeskFlow initiator history query failed: %s",
+                    sanitize_error(exc),
+                )
 
-                if not isinstance(page, list) or not page:
-                    break
+        if len(initiator_rows) >= needed:
+            return initiator_rows[:needed]
 
-                for row in page:
-                    if not isinstance(row, dict):
-                        continue
-                    xml_id = str(row.get("xmlId") or row.get("XML_ID") or "")
-                    if xml_id.startswith("FLOWDESK_CHAT_"):
-                        rows.append(row)
-                        if len(rows) >= needed:
-                            return rows
-
-                if len(page) < 50:
-                    break
-                start += 50
-
-            return rows
-
+        # Compatibility path keeps old tasks created before the custom field and
+        # boxes that reject custom-field filtering visible in history.
+        try:
+            created_rows = self._query_flowdesk_tasks(
+                {
+                    **xml_filter,
+                    "CREATED_BY": int(user_id),
+                },
+                needed,
+            )
+            merged = self._merge_task_rows(initiator_rows, created_rows)
+            if len(merged) >= needed or merged:
+                return merged[:needed]
         except Exception as exc:
             LOG.warning(
                 "Filtered DeskFlow history query failed; using compatibility scan: %s",
                 sanitize_error(exc),
             )
 
-        # Compatibility fallback for boxes that reject operator filters on XML_ID.
-        rows = []
+        # Last-resort scan for older on-premise builds that reject %XML_ID.
+        rows: list[dict[str, Any]] = []
         start = 0
         for _ in range(4):
             result = self.call(
@@ -642,13 +723,13 @@ class Runtime:
                 if xml_id.startswith("FLOWDESK_CHAT_"):
                     rows.append(row)
                     if len(rows) >= needed:
-                        return rows
+                        return self._merge_task_rows(initiator_rows, rows)[:needed]
 
             if len(page) < 50:
                 break
             start += 50
 
-        return rows
+        return self._merge_task_rows(initiator_rows, rows)[:needed]
 
     def history_block(self, session: dict[str, Any]) -> str:
         page = max(0, int(session.get("history_page") or 0))
@@ -726,12 +807,36 @@ class Runtime:
 
         message_id = session.get("active_message_id")
         if message_id:
-            self.update_message(
-                int(message_id),
-                text,
-                session=session,
-                link_button=link_button,
-            )
+            try:
+                self.update_message(
+                    int(message_id),
+                    text,
+                    session=session,
+                    link_button=link_button,
+                )
+            except BitrixError as exc:
+                code = str(exc.code or "").upper()
+                description = str(exc.description or "").casefold()
+                message_missing = (
+                    "NOT_FOUND" in code
+                    or "MESSAGE_ID" in code
+                    or "message not found" in description
+                    or "сообщ" in description and "не найден" in description
+                )
+                if not message_missing:
+                    raise
+
+                LOG.warning(
+                    "Active DeskFlow message %s is gone; creating a replacement",
+                    message_id,
+                )
+                message_id = self.send(
+                    session["dialog_id"],
+                    text,
+                    session=session,
+                    link_button=link_button,
+                )
+                session["active_message_id"] = int(message_id)
         else:
             message_id = self.send(
                 session["dialog_id"],
@@ -944,6 +1049,12 @@ class Runtime:
 
         key = self.session_key(service_dialog_id, user_id)
         session = self.store.get_session(key)
+        if session is not None:
+            session = normalize_session(
+                session,
+                user_id=user_id,
+                dialog_id=service_dialog_id,
+            )
 
         if session is None:
             # Remove stray user text and show a clean first screen.
@@ -1021,6 +1132,12 @@ class Runtime:
 
         key = self.session_key(dialog_id, user_id)
         session = self.store.get_session(key)
+        if session is not None:
+            session = normalize_session(
+                session,
+                user_id=user_id,
+                dialog_id=dialog_id,
+            )
         if session is None:
             session = self.restart_session(dialog_id, user_id)
             self.render_current(session)
@@ -1103,7 +1220,15 @@ class Runtime:
         event_type = str(event.get("type") or "")
         event_id = event.get("eventId")
         data = event.get("data") or {}
-        LOG.info("Event received: id=%s type=%s", event_id, event_type)
+
+        if event_type in {
+            "ONIMBOTV2MESSAGEADD",
+            "ONIMBOTV2COMMANDADD",
+            "ONIMBOTV2JOINCHAT",
+        }:
+            LOG.info("Event received: id=%s type=%s", event_id, event_type)
+        else:
+            LOG.debug("Ignored event: id=%s type=%s", event_id, event_type)
 
         if event_type == "ONIMBOTV2MESSAGEADD":
             self.handle_message(data)
@@ -1111,6 +1236,52 @@ class Runtime:
             self.handle_command(data)
         elif event_type == "ONIMBOTV2JOINCHAT":
             self.handle_join(data)
+
+    def process_event_with_retry(self, event: dict[str, Any]) -> bool:
+        event_id = int(event.get("eventId") or 0)
+        event_type = str(event.get("type") or "")
+
+        for attempt in range(1, self.event_retry_attempts + 1):
+            started = time.monotonic()
+            try:
+                self.handle_event(event)
+            except Exception as exc:
+                if attempt >= self.event_retry_attempts:
+                    LOG.exception(
+                        "Event permanently failed and will be skipped: "
+                        "id=%s type=%s attempts=%s",
+                        event_id,
+                        event_type,
+                        attempt,
+                    )
+                    return False
+
+                wait = min(5.0, self.event_retry_delay * attempt)
+                LOG.warning(
+                    "Event failed, retrying: id=%s type=%s attempt=%s/%s "
+                    "wait=%.2fs error=%s",
+                    event_id,
+                    event_type,
+                    attempt,
+                    self.event_retry_attempts,
+                    wait,
+                    sanitize_error(exc),
+                )
+                if wait:
+                    time.sleep(wait)
+                continue
+
+            duration = time.monotonic() - started
+            if duration >= 2.0:
+                LOG.warning(
+                    "Slow event handling: id=%s type=%s duration=%.2fs",
+                    event_id,
+                    event_type,
+                    duration,
+                )
+            return True
+
+        return False
 
     def run(self) -> None:
         self.register()
@@ -1123,7 +1294,14 @@ class Runtime:
         print("Worker is running. Open the bot in Bitrix24 and send: SOS")
 
         offset_text = self.store.get_meta("event_offset")
-        offset = int(offset_text) if offset_text else None
+        try:
+            offset = int(offset_text) if offset_text else None
+        except (TypeError, ValueError):
+            LOG.warning(
+                "Invalid stored event_offset=%r; requesting a fresh offset",
+                offset_text,
+            )
+            offset = None
 
         while True:
             try:
@@ -1143,29 +1321,16 @@ class Runtime:
 
                 for event in events:
                     event_id = int(event.get("eventId") or 0)
-                    event_type = str(event.get("type") or "")
-                    started = time.monotonic()
-                    try:
-                        self.handle_event(event)
-                    except Exception:
-                        LOG.exception("Ошибка обработки eventId=%s", event_id)
-                        # Keep the failed event in the queue for the next pass.
-                        if event_id:
-                            offset = event_id
-                            self.store.set_meta("event_offset", offset)
-                        raise
-                    else:
-                        duration = time.monotonic() - started
-                        if duration >= 2.0:
-                            LOG.warning(
-                                "Slow event handling: id=%s type=%s duration=%.2fs",
-                                event_id,
-                                event_type,
-                                duration,
-                            )
-                        if event_id:
-                            offset = event_id + 1
-                            self.store.set_meta("event_offset", offset)
+                    ok = self.process_event_with_retry(event)
+                    if not ok:
+                        LOG.error(
+                            "DeskFlow skipped poison event id=%s so later events can continue",
+                            event_id,
+                        )
+
+                    if event_id:
+                        offset = event_id + 1
+                        self.store.set_meta("event_offset", offset)
 
                 next_offset = result.get("nextOffset")
                 if events and next_offset is not None:

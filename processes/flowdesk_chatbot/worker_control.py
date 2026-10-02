@@ -38,10 +38,70 @@ def read_pid() -> int | None:
         return None
 
 
+def worker_command_line(pid: int) -> str:
+    if pid <= 0:
+        return ""
+
+    command = (
+        "$p = Get-CimInstance Win32_Process -Filter \"ProcessId = "
+        f"{int(pid)}\" -ErrorAction SilentlyContinue; "
+        "if ($p) { [Console]::OutputEncoding = [Text.UTF8Encoding]::new(); "
+        "$p.CommandLine }"
+    )
+    result = subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    return (result.stdout or "").strip()
+
+
+def is_expected_worker(pid: int) -> bool:
+    command_line = worker_command_line(pid).casefold()
+    return bool(
+        command_line
+        and "processes.flowdesk_chatbot.bitrix_worker" in command_line
+    )
+
+
+def rotate_log(path: Path, *, max_bytes: int = 5_000_000) -> None:
+    if not path.exists():
+        return
+    try:
+        if path.stat().st_size <= max_bytes:
+            return
+    except OSError:
+        return
+
+    backup = path.with_suffix(path.suffix + ".1")
+    backup.unlink(missing_ok=True)
+    path.replace(backup)
+
+
+def tail_text(path: Path, *, max_bytes: int = 12_000) -> str:
+    if not path.exists():
+        return ""
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            handle.seek(max(0, size - max_bytes))
+            raw = handle.read()
+        return raw.decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
 def stop_worker() -> int:
     pid = read_pid()
     if not pid:
         print("Активный DeskFlow worker не найден")
+        pid_file().unlink(missing_ok=True)
+        return 0
+
+    if not is_expected_worker(pid):
+        print(f"PID={pid} не принадлежит DeskFlow worker; удаляю устаревший PID file")
         pid_file().unlink(missing_ok=True)
         return 0
 
@@ -95,7 +155,7 @@ def deploy_runtime(source_root: Path) -> Path:
 
 
 def ensure_persistent_venv(source_root: Path) -> Path:
-    """Create/update a venv that is NOT inside actions-runner\_work."""
+    """Create/update a venv that is NOT inside the actions-runner workspace."""
     venv = venv_dir()
     python = venv / "Scripts" / "python.exe"
 
@@ -124,6 +184,14 @@ def ensure_persistent_venv(source_root: Path) -> Path:
 
 
 def start_worker() -> int:
+    existing_pid = read_pid()
+    if existing_pid:
+        if is_expected_worker(existing_pid):
+            print(f"DeskFlow worker уже запущен: PID={existing_pid}")
+            return 0
+        print(f"Удаляю устаревший PID file: PID={existing_pid}")
+        pid_file().unlink(missing_ok=True)
+
     webhook = os.environ.get("TARGET_BITRIX_WEBHOOK_URL", "").strip()
     if not webhook:
         print("ERROR: не задан TARGET_BITRIX_WEBHOOK_URL", file=sys.stderr)
@@ -152,6 +220,9 @@ def start_worker() -> int:
     stdout_path = base / "worker.log"
     stderr_path = base / "worker.err.log"
     db_path = base / "flowdesk_state.sqlite3"
+
+    rotate_log(stdout_path)
+    rotate_log(stderr_path)
 
     env = os.environ.copy()
     env["PYTHONPATH"] = str(runtime)
@@ -184,10 +255,10 @@ def start_worker() -> int:
         print("ERROR: DeskFlow worker завершился сразу после запуска", file=sys.stderr)
         if stdout_path.exists():
             print("\n--- worker.log ---")
-            print(stdout_path.read_text(encoding="utf-8", errors="replace")[-5000:])
+            print(tail_text(stdout_path, max_bytes=5000))
         if stderr_path.exists():
             print("\n--- worker.err.log ---", file=sys.stderr)
-            print(stderr_path.read_text(encoding="utf-8", errors="replace")[-5000:], file=sys.stderr)
+            print(tail_text(stderr_path, max_bytes=5000), file=sys.stderr)
         pid_file().unlink(missing_ok=True)
         return 1
 
@@ -195,17 +266,15 @@ def start_worker() -> int:
     print(f"Runtime: {runtime}")
     print("GitHub workspace больше не используется живым worker.")
 
-    if stdout_path.exists():
-        tail = stdout_path.read_text(encoding="utf-8", errors="replace")[-3000:]
-        if tail.strip():
-            print("\n--- worker.log ---")
-            print(tail)
+    tail = tail_text(stdout_path, max_bytes=5000)
+    if tail.strip():
+        print("\n--- worker.log ---")
+        print(tail)
 
-    if stderr_path.exists():
-        tail = stderr_path.read_text(encoding="utf-8", errors="replace")[-3000:]
-        if tail.strip():
-            print("\n--- worker.err.log ---", file=sys.stderr)
-            print(tail, file=sys.stderr)
+    tail = tail_text(stderr_path, max_bytes=5000)
+    if tail.strip():
+        print("\n--- worker.err.log ---", file=sys.stderr)
+        print(tail, file=sys.stderr)
 
     return 0
 
@@ -219,18 +288,11 @@ def status_worker() -> int:
     print(f"Venv: {venv_dir()}")
 
     if pid:
-        result = subprocess.run(
-            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
-        output = (result.stdout or "").strip()
-        alive = bool(output and "No tasks are running" not in output and "INFO:" not in output)
-        print(f"Worker process: {'RUNNING' if alive else 'NOT RUNNING'}")
-        if output:
-            print(output)
+        command_line = worker_command_line(pid)
+        alive = is_expected_worker(pid)
+        print(f"Worker process: {'RUNNING' if alive else 'NOT RUNNING / STALE PID'}")
+        if command_line:
+            print(command_line)
 
     for name in ("worker.log", "worker.err.log"):
         path = base / name
@@ -238,8 +300,8 @@ def status_worker() -> int:
         if not path.exists():
             print("(файл отсутствует)")
             continue
-        text = path.read_text(encoding="utf-8", errors="replace")
-        print(text[-8000:] if text else "(пусто)")
+        tail = tail_text(path, max_bytes=12_000)
+        print(tail if tail else "(пусто)")
 
     return 0
 
