@@ -45,6 +45,7 @@ def new_session(user_id: int, dialog_id: str) -> dict[str, Any]:
             "product": None,
             "subproduct": None,
             "document": None,
+            "document_file_ids": [],
         },
     }
 
