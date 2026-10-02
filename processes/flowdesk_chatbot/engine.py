@@ -283,12 +283,9 @@ def _editable_fields(session: dict[str, Any]) -> list[tuple[str, str]]:
         if data.get(key):
             fields.append((key, EDIT_LABELS[key]))
 
-    if (
-        data.get("document")
-        or data.get("document_file_ids")
-        or data.get("document_comment")
-    ):
-        fields.append(("document", EDIT_LABELS["document"]))
+    # Keep attachments editable even when the user originally pressed
+    # "Пропустить": the correction screen must allow adding them later.
+    fields.append(("document", EDIT_LABELS["document"]))
 
     return fields
 
@@ -714,9 +711,6 @@ def submit_text(session: dict[str, Any], text: str) -> dict[str, Any]:
     if screen == "edit_attachments_input":
         return submit_attachment_message(session, [], [], value)
 
-    if not session.get("edit_mode"):
-        _snapshot(session)
-
     if screen == "details":
         fields = session["detail_fields"]
         index = int(session["detail_index"])
@@ -724,6 +718,9 @@ def submit_text(session: dict[str, Any], text: str) -> dict[str, Any]:
         ok, normalized, error = _validate_detail(field_name, value)
         if not ok:
             return {"status": "validation_error", "message": error}
+
+        if not session.get("edit_mode"):
+            _snapshot(session)
 
         session["data"]["details"][field_name] = normalized
         session["detail_index"] = index + 1
@@ -734,6 +731,8 @@ def submit_text(session: dict[str, Any], text: str) -> dict[str, Any]:
                 session["current_screen"] = "description"
 
     elif screen == "description":
+        if not session.get("edit_mode"):
+            _snapshot(session)
         session["data"]["description"] = value
         if session.get("edit_mode"):
             _finish_edit(session, "description")
@@ -741,6 +740,8 @@ def submit_text(session: dict[str, Any], text: str) -> dict[str, Any]:
             session["current_screen"] = "insurance_type"
 
     elif screen == "document":
+        if not session.get("edit_mode"):
+            _snapshot(session)
         session["data"]["document"] = value
         session["data"]["document_file_ids"] = []
         session["data"]["document_file_names"] = []
