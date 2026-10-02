@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 
+from processes.flowdesk_chatbot.bitrix_worker import Runtime
 from processes.flowdesk_chatbot.config import PRODUCT_TREE
 from processes.flowdesk_chatbot.engine import (
     ACTION_ATTACHMENT_ADD,
@@ -244,6 +245,44 @@ class DeskFlowEngineTests(unittest.TestCase):
         submit_action(session, ACTION_EDIT)
         labels = [button["label"] for button in view(session)["buttons"]]
         self.assertIn("Вложения / ссылка", labels)
+
+    def test_bitrix_file_id_param_is_parsed_from_message_event(self) -> None:
+        message = {
+            "id": 501,
+            "params": {
+                "FILE_ID": ["15423", "15424"],
+            },
+        }
+
+        files = Runtime.message_files(message)
+
+        self.assertEqual(
+            files,
+            [
+                {"id": 15423, "name": ""},
+                {"id": 15424, "name": ""},
+            ],
+        )
+
+    def test_rich_file_object_fallback_is_still_supported(self) -> None:
+        message = {
+            "params": {
+                "FILES": [
+                    {"ID": "77", "NAME": "photo.jpg"},
+                    {"id": 78, "name": "contract.pdf"},
+                ],
+            }
+        }
+
+        files = Runtime.message_files(message)
+
+        self.assertEqual(
+            files,
+            [
+                {"id": 77, "name": "photo.jpg"},
+                {"id": 78, "name": "contract.pdf"},
+            ],
+        )
 
     def test_attachment_add_replace_delete(self) -> None:
         session = session_at("confirm")
