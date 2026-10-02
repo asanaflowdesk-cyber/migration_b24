@@ -245,8 +245,21 @@ class Runtime:
         if not current["buttons"]:
             return None
 
+        palette = ("#2F80ED", "#7B61FF", "#18A999", "#E0528D", "#E67E22", "#3A9D5D")
         buttons = []
         for index, item in enumerate(current["buttons"]):
+            action = item["action"]
+            if action == "__back__":
+                bg_color = "#667085"
+            elif action == "__skip__":
+                bg_color = "#D97706"
+            elif action == "__confirm__":
+                bg_color = "#169B62"
+            elif action == "__new_request__":
+                bg_color = "#2F80ED"
+            else:
+                bg_color = palette[index % len(palette)]
+
             buttons.append(
                 {
                     "TEXT": item["label"],
@@ -254,6 +267,8 @@ class Runtime:
                     "COMMAND_PARAMS": f"{current['revision']}:{index}",
                     "BLOCK": "Y",
                     "DISPLAY": "LINE",
+                    "BG_COLOR": bg_color,
+                    "TEXT_COLOR": "#FFFFFF",
                 }
             )
 
