@@ -13,6 +13,7 @@ from common.bitrix import BitrixClient, BitrixError, sanitize_error
 from processes.flowdesk_chatbot.engine import (
     mark_task_created,
     new_session,
+    parse_message_files,
     submit_action,
     submit_attachment_message,
     submit_text,
@@ -813,44 +814,7 @@ class Runtime:
 
     @staticmethod
     def message_files(message: dict[str, Any]) -> list[dict[str, Any]]:
-        params = message.get("params") or {}
-        raw = params.get("files") or params.get("FILES") or []
-
-        if isinstance(raw, dict):
-            raw = list(raw.values())
-        elif not isinstance(raw, list):
-            raw = [raw] if raw else []
-
-        files: list[dict[str, Any]] = []
-        seen: set[int] = set()
-
-        for item in raw:
-            file_id = 0
-            name = ""
-
-            if isinstance(item, dict):
-                value = (
-                    item.get("id")
-                    or item.get("ID")
-                    or item.get("fileId")
-                    or item.get("FILE_ID")
-                )
-                name = str(item.get("name") or item.get("NAME") or "").strip()
-            else:
-                value = item
-
-            try:
-                file_id = int(value or 0)
-            except (TypeError, ValueError):
-                file_id = 0
-
-            if file_id <= 0 or file_id in seen:
-                continue
-
-            seen.add(file_id)
-            files.append({"id": file_id, "name": name})
-
-        return files
+        return parse_message_files(message)
 
     def handle_message(self, data: dict[str, Any]) -> None:
         user = data.get("user") or {}
@@ -865,6 +829,12 @@ class Runtime:
         message_id = int(message.get("id") or 0)
         text = str(message.get("text") or "").strip()
         files = self.message_files(message)
+        if files:
+            LOG.info(
+                "Attachment message detected: message=%s file_ids=%s",
+                message_id,
+                [item["id"] for item in files],
+            )
         user_name = str(user.get("name") or "").strip()
 
         if not user_id or not source_dialog_id:

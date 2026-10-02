@@ -43,6 +43,60 @@ EDIT_LABELS = {
 }
 
 
+def parse_message_files(message: dict[str, Any]) -> list[dict[str, Any]]:
+    """Extract Drive file IDs from a Bitrix24 chat message event."""
+    params = message.get("params") or {}
+    if not isinstance(params, dict):
+        return []
+
+    raw = (
+        params.get("FILE_ID")
+        or params.get("fileId")
+        or params.get("file_id")
+        or params.get("FILES")
+        or params.get("files")
+        or []
+    )
+
+    if isinstance(raw, dict):
+        raw = list(raw.values())
+    elif not isinstance(raw, (list, tuple, set)):
+        raw = [raw] if raw not in (None, "", False) else []
+
+    files: list[dict[str, Any]] = []
+    seen: set[int] = set()
+
+    for item in raw:
+        file_id = 0
+        name = ""
+
+        if isinstance(item, dict):
+            value = (
+                item.get("id")
+                or item.get("ID")
+                or item.get("fileId")
+                or item.get("FILE_ID")
+                or item.get("value")
+                or item.get("VALUE")
+            )
+            name = str(item.get("name") or item.get("NAME") or "").strip()
+        else:
+            value = item
+
+        try:
+            file_id = int(str(value).strip())
+        except (TypeError, ValueError):
+            file_id = 0
+
+        if file_id <= 0 or file_id in seen:
+            continue
+
+        seen.add(file_id)
+        files.append({"id": file_id, "name": name})
+
+    return files
+
+
 def new_session(user_id: int, dialog_id: str) -> dict[str, Any]:
     return {
         "user_id": int(user_id),
