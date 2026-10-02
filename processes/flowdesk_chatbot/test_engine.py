@@ -174,6 +174,37 @@ class DeskFlowEngineTests(unittest.TestCase):
         self.assertEqual(session["data"]["product"], insurance_class)
         self.assertEqual(session["data"]["subproduct"], product)
 
+    def test_back_during_parent_edit_moves_one_step_not_whole_edit(self) -> None:
+        session = session_at("confirm")
+        session["data"].update(
+            {
+                "request_type": "Запрос",
+                "target": "Юристы",
+                "request": "Согласование документа",
+                "request_detail": "Договор страхования",
+                "description": "Текст",
+            }
+        )
+
+        submit_action(session, ACTION_EDIT)
+        submit_action(session, f"{EDIT_FIELD_PREFIX}target")
+        submit_action(session, "Статисты")
+        self.assertEqual(session["current_screen"], "request")
+
+        # One Back returns to the department choice inside the active edit.
+        submit_action(session, "__edit_cancel__")
+        self.assertEqual(session["current_screen"], "target")
+        self.assertTrue(session["edit_mode"])
+        self.assertIsNone(session["data"]["target"])
+
+        # Back again exits this field correction and restores the original data.
+        submit_action(session, "__edit_cancel__")
+        self.assertEqual(session["current_screen"], "edit_menu")
+        self.assertFalse(session["edit_mode"])
+        self.assertEqual(session["data"]["target"], "Юристы")
+        self.assertEqual(session["data"]["request"], "Согласование документа")
+        self.assertEqual(session["data"]["request_detail"], "Договор страхования")
+
     def test_edit_department_resets_dependent_request_data(self) -> None:
         session = session_at("confirm")
         session["data"].update(
