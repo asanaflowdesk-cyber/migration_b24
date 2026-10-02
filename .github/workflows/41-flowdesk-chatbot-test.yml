@@ -2,9 +2,9 @@ name: 41 | FlowDesk ChatBot Test
 
 on:
   workflow_dispatch:
-  push:
+  pull_request:
     branches:
-      - flowdesk-ux-v2
+      - main
     paths:
       - "processes/flowdesk_chatbot/**"
       - ".github/workflows/41-flowdesk-chatbot-test.yml"
