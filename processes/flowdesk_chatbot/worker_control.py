@@ -155,7 +155,7 @@ def deploy_runtime(source_root: Path) -> Path:
 
 
 def ensure_persistent_venv(source_root: Path) -> Path:
-    """Create/update a venv that is NOT inside actions-runner\_work."""
+    """Create/update a venv that is NOT inside the actions-runner workspace."""
     venv = venv_dir()
     python = venv / "Scripts" / "python.exe"
 
