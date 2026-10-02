@@ -599,7 +599,14 @@ class Runtime:
 
             parts = [part.strip() for part in title.split("|") if part.strip()]
             request_type = parts[0] if parts else "Обращение"
-            target = parts[1] if len(parts) > 1 else ""
+            # Only "Запрос" has a department in the title's second slot.
+            # Direct branch-3 appeals have no department; their next title part
+            # can be an insurance class and must not be mislabeled as a department.
+            target = (
+                parts[1]
+                if request_type == "Запрос" and len(parts) > 1
+                else ""
+            )
             label = f"#{task_id} · {request_type}"
             if target:
                 label += f" · {target}"
@@ -624,6 +631,21 @@ class Runtime:
         text = text_override if text_override is not None else current["text"]
         if history:
             text += history
+
+        # Keep the final direct-link button on every final re-render, including
+        # after "Показать ещё".
+        if (
+            link_button is None
+            and current["screen"] == "done"
+            and session.get("task_id")
+        ):
+            link_button = {
+                "text": "Открыть обращение",
+                "link": self.task_link(
+                    int(session["user_id"]),
+                    str(session["task_id"]),
+                ),
+            }
 
         # Global UX rule: text is available only on screens that explicitly
         # accept text/files. Button-only screens, start and final included, are locked.
