@@ -43,7 +43,7 @@ class Runtime:
         self.bot_id = 0
         self._last_api_call = 0.0
         self.event_poll_seconds = float(
-            os.getenv("FLOWDESK_EVENT_POLL_SECONDS", "3.0")
+            os.getenv("FLOWDESK_EVENT_POLL_SECONDS", "1.5")
         )
 
     def _load_or_create_bot_token(self) -> str:
