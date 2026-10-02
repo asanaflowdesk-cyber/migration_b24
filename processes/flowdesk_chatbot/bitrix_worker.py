@@ -217,7 +217,18 @@ class Runtime:
             self.task_user_fields = set()
             return
 
-        rows = result if isinstance(result, list) else []
+        if isinstance(result, list):
+            rows = result
+        elif isinstance(result, dict):
+            rows = []
+            for key in ("items", "fields", "result"):
+                value = result.get(key)
+                if isinstance(value, list):
+                    rows = value
+                    break
+        else:
+            rows = []
+
         existing = {
             str(row.get("FIELD_NAME") or row.get("fieldName") or "")
             for row in rows
