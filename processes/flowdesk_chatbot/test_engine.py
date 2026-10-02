@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import unittest
 
-from processes.flowdesk_chatbot.bitrix_worker import Runtime
 from processes.flowdesk_chatbot.config import PRODUCT_TREE
 from processes.flowdesk_chatbot.engine import (
     ACTION_ATTACHMENT_ADD,
@@ -14,6 +13,7 @@ from processes.flowdesk_chatbot.engine import (
     ACTION_EDIT_REVIEW,
     EDIT_FIELD_PREFIX,
     new_session,
+    parse_message_files,
     submit_action,
     submit_attachment_message,
     submit_text,
@@ -254,7 +254,7 @@ class DeskFlowEngineTests(unittest.TestCase):
             },
         }
 
-        files = Runtime.message_files(message)
+        files = parse_message_files(message)
 
         self.assertEqual(
             files,
