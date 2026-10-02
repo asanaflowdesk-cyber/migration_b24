@@ -22,6 +22,7 @@ from processes.flowdesk_chatbot.engine import (
     task_title,
     view,
 )
+from processes.flowdesk_chatbot.polling import poll_interval_seconds
 from processes.flowdesk_chatbot.storage import SessionStore
 
 LOG = logging.getLogger("flowdesk_chatbot")
@@ -64,8 +65,16 @@ class Runtime:
             f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else ""
         )
         self.task_user_fields: set[str] = set()
-        self.event_poll_seconds = float(
-            os.getenv("FLOWDESK_EVENT_POLL_SECONDS", "1.5")
+        # Daytime: near-realtime polling. Night: low-frequency background check.
+        # FLOWDESK_EVENT_POLL_SECONDS remains a backward-compatible daytime fallback.
+        self.active_poll_seconds = float(
+            os.getenv(
+                "FLOWDESK_ACTIVE_POLL_SECONDS",
+                os.getenv("FLOWDESK_EVENT_POLL_SECONDS", "1.0"),
+            )
+        )
+        self.quiet_poll_seconds = float(
+            os.getenv("FLOWDESK_QUIET_POLL_SECONDS", "60.0")
         )
 
     def _load_or_create_bot_token(self) -> str:
@@ -1089,7 +1098,12 @@ class Runtime:
                     self.store.set_meta("event_offset", offset)
 
                 if not events:
-                    time.sleep(self.event_poll_seconds)
+                    time.sleep(
+                        poll_interval_seconds(
+                            active_seconds=self.active_poll_seconds,
+                            quiet_seconds=self.quiet_poll_seconds,
+                        )
+                    )
 
             except KeyboardInterrupt:
                 print("\nWorker stopped.")
