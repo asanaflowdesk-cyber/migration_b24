@@ -8,6 +8,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
+from collections.abc import Callable
 
 from eqazyna_bitrix.bitrix_client import BitrixClient
 from eqazyna_bitrix.settings import Settings
@@ -309,7 +310,28 @@ def _rows_from_live(
     return rows
 
 
-def reconcile_package(client: Any, package: dict[str, Any], apply: bool) -> tuple[list[dict[str, Any]], str]:
+def contact_write_suppression() -> Callable[[list[dict[str, int]]], None] | None:
+    queue_url = os.getenv("GOOGLE_QUEUE_URL", "").strip()
+    queue_key = os.getenv("GOOGLE_QUEUE_KEY", "").strip()
+    if not queue_url or not queue_key:
+        return None
+
+    def remember(owners: list[dict[str, int]]) -> None:
+        from queue_founder_packages import queue_call
+
+        # Register before the write so CRM-generated duplicate-contact events
+        # cannot become a new user-selected authority for the package.
+        queue_call(queue_url, queue_key, "remember_owners", owners=owners)
+
+    return remember
+
+
+def reconcile_package(
+    client: Any,
+    package: dict[str, Any],
+    apply: bool,
+    before_contact_writes: Callable[[list[dict[str, int]]], None] | None = None,
+) -> tuple[list[dict[str, Any]], str]:
     items = company_lead_items(package)
     authority_ids = [int(value) for value in package.get("authority_contact_ids", [])]
     if not items:
@@ -336,6 +358,9 @@ def reconcile_package(client: Any, package: dict[str, Any], apply: bool) -> tupl
 
         pending = [row for row in rows if row["status"] == "planned"]
         if pending:
+            contacts = [{"contact_id": int(row["id"]), "owner_id": target} for row in pending if row["entity"] == "contact"]
+            if contacts and before_contact_writes:
+                before_contact_writes(contacts)
             operations = [
                 (
                     f"u{index}",
@@ -406,10 +431,11 @@ def run(client: BitrixClient, output_dir: Path, apply: bool) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
     package_errors: list[dict[str, Any]] = []
     workers = max(1, min(int(os.getenv("OWNER_SYNC_WORKERS", str(MAX_WORKERS)) or MAX_WORKERS), 16, len(packages) or 1))
+    before_contact_writes = contact_write_suppression()
 
     def work(package: dict[str, Any]):
         local = _clone_client(client) if isinstance(client, BitrixClient) else client
-        return package, *reconcile_package(local, package, apply)
+        return package, *reconcile_package(local, package, apply, before_contact_writes)
 
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="owner-full-reconcile") as pool:
         futures = [pool.submit(work, package) for package in packages]

@@ -10,6 +10,7 @@ from eqazyna_bitrix.bitrix_client import BitrixClient
 from reconcile_company_lead_owners import (
     _clone_client,
     add_direct_contact_leads,
+    contact_write_suppression,
     load_snapshot_fast,
     reconcile_package,
     resolve_authority_packages,
@@ -39,10 +40,11 @@ def repair_package_residuals(client: Any, output_dir: Path) -> dict[str, Any]:
     pending = [package for package in packages if has_residuals(package)]
     rows: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
+    before_contact_writes = contact_write_suppression()
 
     def work(package: dict[str, Any]):
         local = _clone_client(client) if isinstance(client, BitrixClient) else client
-        return reconcile_package(local, package, apply=True)
+        return reconcile_package(local, package, apply=True, before_contact_writes=before_contact_writes)
 
     with ThreadPoolExecutor(max_workers=min(8, len(pending) or 1), thread_name_prefix="package-recovery") as pool:
         jobs = {pool.submit(work, package): package for package in pending}

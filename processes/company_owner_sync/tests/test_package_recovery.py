@@ -145,3 +145,38 @@ def test_partial_new_event_cannot_restore_previous_duplicate_authority(tmp_path)
     crm.contacts[837]["ASSIGNED_BY_ID"] = "70"
     assert repair_package_residuals(crm, tmp_path)["status"] == "DONE"
     assert_owner(crm, 70)
+
+
+def test_recovery_suppresses_own_contact_events_before_writing(monkeypatch, tmp_path):
+    import queue_founder_packages
+
+    crm = CRM()
+    monkeypatch.setenv("GOOGLE_QUEUE_URL", "queue")
+    monkeypatch.setenv("GOOGLE_QUEUE_KEY", "key")
+    remembered = []
+
+    def remember(url, key, action, **payload):
+        assert action == "remember_owners"
+        assert crm.writes == []
+        remembered.extend(payload["owners"])
+        return {"ok": True}
+
+    monkeypatch.setattr(queue_founder_packages, "queue_call", remember)
+    assert repair_package_residuals(crm, tmp_path)["status"] == "DONE"
+    assert remembered == [{"contact_id": 838, "owner_id": 69}]
+    assert_owner(crm, 69)
+
+
+def test_failed_event_suppression_does_not_write_duplicate_contacts(monkeypatch, tmp_path):
+    import queue_founder_packages
+
+    crm = CRM()
+    monkeypatch.setenv("GOOGLE_QUEUE_URL", "queue")
+    monkeypatch.setenv("GOOGLE_QUEUE_KEY", "key")
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("queue unavailable")
+
+    monkeypatch.setattr(queue_founder_packages, "queue_call", fail)
+    assert repair_package_residuals(crm, tmp_path)["status"] == "PARTIAL"
+    assert crm.writes == []
