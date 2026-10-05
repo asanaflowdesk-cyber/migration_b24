@@ -495,19 +495,22 @@ class Runtime:
     def launcher_message_meta_key(user_id: int) -> str:
         return f"launcher_message:{int(user_id)}"
 
-    def launcher_message_fields(self) -> dict[str, Any]:
+    def service_chat_link(self, dialog_id: str) -> str:
+        path = f"/online/?IM_DIALOG={dialog_id}"
+        return f"{self.portal_base}{path}" if self.portal_base else path
+
+    def launcher_message_fields(self, service_dialog_id: str) -> dict[str, Any]:
         return {
             "message": (
                 "[b]DeskFlow готов к работе 🙂[/b]\n"
-                "Нажми кнопку ниже — я открою служебный чат для обращения."
+                "Нажми кнопку ниже — откроется служебный чат для обращения."
             ),
             "keyboard": {
                 "BOT_ID": self.bot_id,
                 "BUTTONS": [
                     {
-                        "TEXT": "Открыть DeskFlow",
-                        "COMMAND": f"/{self.command_name}",
-                        "COMMAND_PARAMS": "launcher",
+                        "TEXT": "Открыть служебный чат",
+                        "LINK": self.service_chat_link(service_dialog_id),
                         "BLOCK": "Y",
                         "DISPLAY": "LINE",
                         "BG_COLOR_TOKEN": "primary",
@@ -517,11 +520,16 @@ class Runtime:
             },
         }
 
-    def ensure_launcher_message(self, user_id: int, dialog_id: str) -> int:
-        """Keep one reusable launcher button in the personal bot dialog."""
+    def ensure_launcher_message(
+        self,
+        user_id: int,
+        dialog_id: str,
+        service_dialog_id: str,
+    ) -> int:
+        """Keep one reusable direct-link launcher in the personal bot dialog."""
         meta_key = self.launcher_message_meta_key(user_id)
         existing_text = self.store.get_meta(meta_key).strip()
-        fields = self.launcher_message_fields()
+        fields = self.launcher_message_fields(service_dialog_id)
 
         if existing_text:
             try:
@@ -567,6 +575,55 @@ class Runtime:
             message_id,
         )
         return message_id
+
+    def refresh_known_launchers(self) -> None:
+        """Migrate existing command launchers to direct chat links on restart."""
+        try:
+            entries = self.store.list_meta("launcher_message:")
+        except Exception as exc:
+            LOG.warning(
+                "Could not enumerate DeskFlow launcher messages: %s",
+                sanitize_error(exc),
+            )
+            return
+
+        for key, message_text in entries.items():
+            try:
+                user_id = int(key.split(":", 1)[1])
+                message_id = int(message_text)
+            except (IndexError, TypeError, ValueError):
+                continue
+
+            service_dialog_id = self.get_service_chat(user_id)
+            if not service_dialog_id:
+                continue
+
+            try:
+                result = self.call(
+                    "imbot.v2.Chat.Message.update",
+                    {
+                        "botId": self.bot_id,
+                        "botToken": self.bot_token,
+                        "messageId": message_id,
+                        "fields": self.launcher_message_fields(service_dialog_id),
+                    },
+                )
+                if not isinstance(result, dict):
+                    raise RuntimeError(
+                        f"Launcher update returned unexpected result: {result!r}"
+                    )
+                LOG.info(
+                    "Launcher converted to direct link: user=%s service=%s",
+                    user_id,
+                    service_dialog_id,
+                )
+            except Exception as exc:
+                LOG.warning(
+                    "Launcher migration failed for user=%s message=%s: %s",
+                    user_id,
+                    message_id,
+                    sanitize_error(exc),
+                )
 
     def delete_chat_message(self, message_id: int) -> bool:
         if not message_id:
@@ -1247,18 +1304,23 @@ class Runtime:
         )
 
         if text.casefold() in TRIGGERS:
-            # A trigger may arrive in the old personal dialog. Keep a reusable
-            # launcher button there so the user will not need to type SOS again.
+            # In the personal bot dialog, prepare the managed chat first and
+            # refresh the launcher into a pure LINK button. A link does not
+            # create a command event, so Bitrix has no loading spinner to wait on.
             if not is_service_chat:
+                service_dialog_id = self.ensure_service_chat(user_id, user_name)
                 try:
-                    self.ensure_launcher_message(user_id, source_dialog_id)
+                    self.ensure_launcher_message(
+                        user_id,
+                        source_dialog_id,
+                        service_dialog_id,
+                    )
                 except Exception as exc:
                     LOG.warning(
                         "Launcher button could not be prepared for user=%s: %s",
                         user_id,
                         sanitize_error(exc),
                     )
-                service_dialog_id = self.ensure_service_chat(user_id, user_name)
             else:
                 service_dialog_id = source_dialog_id
                 # In the managed chat the trigger itself must disappear too.
@@ -1359,6 +1421,44 @@ class Runtime:
                 user_id,
                 str(user.get("name") or ""),
             )
+
+            raw_params = str(command.get("params") or "")
+            if raw_params == "launcher":
+                # Compatibility with the short-lived command-button version.
+                # Answer it once to release Bitrix's loading state, then replace
+                # the old launcher message with the stable direct-link version.
+                session = self.restart_session(service_dialog_id, user_id)
+                self.render_current(session)
+                try:
+                    self.answer_command(
+                        data,
+                        "[b]Готово 🙂[/b]\n"
+                        "Служебный чат уже подготовлен. Открой его кнопкой ниже.",
+                        link_button={
+                            "text": "Открыть служебный чат",
+                            "link": self.service_chat_link(service_dialog_id),
+                        },
+                    )
+                except Exception as exc:
+                    LOG.warning(
+                        "Legacy launcher command answer failed for user=%s: %s",
+                        user_id,
+                        sanitize_error(exc),
+                    )
+                try:
+                    self.ensure_launcher_message(
+                        user_id,
+                        dialog_id,
+                        service_dialog_id,
+                    )
+                except Exception as exc:
+                    LOG.warning(
+                        "Legacy launcher message refresh failed for user=%s: %s",
+                        user_id,
+                        sanitize_error(exc),
+                    )
+                return
+
             session = self.restart_session(service_dialog_id, user_id)
             self.render_current(session)
             return
@@ -1443,10 +1543,22 @@ class Runtime:
         if dialog_id.startswith("chat"):
             return
 
-        # The personal bot dialog is only a launcher. The button calls the
-        # same command handler as the in-chat keyboards and opens the service
-        # chat directly; no synthetic SOS message is needed.
-        self.ensure_launcher_message(user_id, dialog_id)
+        # Prepare the service chat up front, then expose a plain hyperlink.
+        # This avoids the command-button loading state entirely.
+        service_dialog_id = self.ensure_service_chat(
+            user_id,
+            str(user.get("name") or ""),
+        )
+        key = self.session_key(service_dialog_id, user_id)
+        if self.store.get_session(key) is None:
+            session = self.restart_session(service_dialog_id, user_id)
+            self.render_current(session)
+
+        self.ensure_launcher_message(
+            user_id,
+            dialog_id,
+            service_dialog_id,
+        )
 
     def handle_event(self, event: dict[str, Any]) -> None:
         event_type = str(event.get("type") or "")
@@ -1517,6 +1629,7 @@ class Runtime:
 
     def run(self) -> None:
         self.register()
+        self.refresh_known_launchers()
         print(f"DeskFlow bot registered: ID={self.bot_id}")
         print(
             "Polling: 08:00-22:00 Kazakhstan every "
