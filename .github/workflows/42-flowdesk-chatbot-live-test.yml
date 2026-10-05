@@ -48,6 +48,7 @@ jobs:
           TARGET_BITRIX_WEBHOOK_URL: ${{ secrets.TARGET_BITRIX_WEBHOOK_URL }}
           FLOWDESK_PROJECT_ID: "2"
           FLOWDESK_BOT_NAME: "DeskFlow Test"
+          FLOWDESK_SERVICE_CHAT_AVATAR_URL: "https://bitrix.theeurasia.kz/picture/K2blnYG5Z7Cm0teajIEf"
           FLOWDESK_ACTIVE_POLL_SECONDS: "1.0"
           FLOWDESK_QUIET_POLL_SECONDS: "60.0"
           FLOWDESK_EVENT_RETRY_ATTEMPTS: "3"
