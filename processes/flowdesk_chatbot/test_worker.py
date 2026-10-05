@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from common.bitrix import BitrixError
+from processes.flowdesk_chatbot.avatar_asset import SERVICE_CHAT_AVATAR_B64
 from processes.flowdesk_chatbot.bitrix_worker import Runtime
 from processes.flowdesk_chatbot.engine import new_session
 from processes.flowdesk_chatbot.worker_control import rotate_log, tail_text
@@ -122,6 +123,38 @@ class DeskFlowWorkerTests(unittest.TestCase):
         self.assertEqual(
             runtime.store.get_meta("service_chat_avatar:chat501"),
             "v1",
+        )
+
+    def test_bundled_service_chat_avatar_is_valid_jpeg_base64(self) -> None:
+        import base64
+
+        payload = base64.b64decode(SERVICE_CHAT_AVATAR_B64, validate=True)
+
+        self.assertTrue(payload.startswith(b"\xff\xd8\xff"))
+        self.assertGreater(len(payload), 1000)
+
+    def test_service_chat_avatar_uses_bundle_without_http_request(self) -> None:
+        runtime = self.runtime()
+
+        with patch(
+            "processes.flowdesk_chatbot.bitrix_worker.requests.get"
+        ) as get:
+            avatar = runtime.load_service_chat_avatar()
+
+        self.assertIsNotNone(avatar)
+        self.assertFalse(get.called)
+
+    def test_avatar_version_is_saved_only_after_confirmed_update(self) -> None:
+        runtime = self.runtime()
+        runtime.load_service_chat_avatar = lambda: ("BASE64_AVATAR", "v1")
+        runtime.call = lambda method, params=None: {"result": False}
+
+        with self.assertRaises(RuntimeError):
+            runtime.ensure_service_chat_avatar("chat501", force=True)
+
+        self.assertEqual(
+            runtime.store.get_meta("service_chat_avatar:chat501"),
+            "",
         )
 
     def test_text_field_toggle_is_not_repeated_when_state_is_unchanged(self) -> None:
