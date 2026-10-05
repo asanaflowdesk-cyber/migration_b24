@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import base64
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from common.bitrix import BitrixError
 from processes.flowdesk_chatbot.bitrix_worker import Runtime
@@ -13,6 +15,7 @@ from processes.flowdesk_chatbot.worker_control import rotate_log, tail_text
 class FakeStore:
     def __init__(self) -> None:
         self.sessions = {}
+        self.meta = {}
 
     def put_session(self, key, payload) -> None:
         self.sessions[key] = payload
@@ -21,10 +24,10 @@ class FakeStore:
         return self.sessions.get(key)
 
     def get_meta(self, key, default=""):
-        return default
+        return self.meta.get(key, default)
 
     def set_meta(self, key, value) -> None:
-        pass
+        self.meta[key] = str(value)
 
 
 class DeskFlowWorkerTests(unittest.TestCase):
@@ -36,10 +39,90 @@ class DeskFlowWorkerTests(unittest.TestCase):
         runtime.portal_base = "https://example.test"
         runtime.store = FakeStore()
         runtime.task_user_fields = set()
+        runtime.service_chat_avatar_url = (
+            "https://bitrix.theeurasia.kz/picture/K2blnYG5Z7Cm0teajIEf"
+        )
+        runtime._service_chat_avatar_b64 = None
+        runtime._service_chat_avatar_version = None
         runtime._text_field_state = {}
         runtime.event_retry_attempts = 3
         runtime.event_retry_delay = 0.0
         return runtime
+
+    def test_service_chat_avatar_download_is_base64_encoded_and_cached(self) -> None:
+        runtime = self.runtime()
+
+        class Response:
+            content = b"fake-image-bytes"
+            headers = {"Content-Type": "image/png"}
+
+            @staticmethod
+            def raise_for_status():
+                return None
+
+        with patch(
+            "processes.flowdesk_chatbot.bitrix_worker.requests.get",
+            return_value=Response(),
+        ) as get:
+            first = runtime.load_service_chat_avatar()
+            second = runtime.load_service_chat_avatar()
+
+        self.assertIsNotNone(first)
+        self.assertEqual(first, second)
+        self.assertEqual(
+            first[0],
+            base64.b64encode(b"fake-image-bytes").decode("ascii"),
+        )
+        self.assertEqual(get.call_count, 1)
+
+    def test_new_service_chat_gets_avatar_at_creation_time(self) -> None:
+        runtime = self.runtime()
+        runtime.load_service_chat_avatar = lambda: ("BASE64_AVATAR", "v1")
+        calls = []
+
+        def fake_call(method, params=None):
+            calls.append((method, params))
+            if method == "imbot.v2.Chat.add":
+                return {"chat": {"dialogId": "chat501"}}
+            raise AssertionError(f"Unexpected method: {method}")
+
+        runtime.call = fake_call
+        dialog_id = runtime.ensure_service_chat(153, "Иван Иванов")
+
+        self.assertEqual(dialog_id, "chat501")
+        add = next(params for method, params in calls if method == "imbot.v2.Chat.add")
+        self.assertEqual(add["fields"]["avatar"], "BASE64_AVATAR")
+        self.assertEqual(
+            runtime.store.get_meta("service_chat_avatar:chat501"),
+            "v1",
+        )
+
+    def test_existing_service_chat_avatar_is_updated_only_once_per_version(self) -> None:
+        runtime = self.runtime()
+        runtime.store.set_meta("service_chat:153", "chat501")
+        runtime.load_service_chat_avatar = lambda: ("BASE64_AVATAR", "v1")
+        methods = []
+
+        def fake_call(method, params=None):
+            methods.append((method, params))
+            if method == "imbot.v2.Chat.get":
+                return {"chat": {"dialogId": "chat501"}}
+            if method == "imbot.v2.Chat.update":
+                self.assertEqual(params["fields"]["avatar"], "BASE64_AVATAR")
+                return True
+            raise AssertionError(f"Unexpected method: {method}")
+
+        runtime.call = fake_call
+
+        self.assertEqual(runtime.ensure_service_chat(153), "chat501")
+        self.assertEqual(runtime.ensure_service_chat(153), "chat501")
+
+        updates = [item for item in methods if item[0] == "imbot.v2.Chat.update"]
+        self.assertEqual(len(updates), 1)
+        self.assertEqual(
+            runtime.store.get_meta("service_chat_avatar:chat501"),
+            "v1",
+        )
 
     def test_text_field_toggle_is_not_repeated_when_state_is_unchanged(self) -> None:
         runtime = self.runtime()
