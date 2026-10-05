@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from common.bitrix import BatchResult, BitrixError
+from common.bitrix import BitrixError
 from processes.flowdesk_chatbot.avatar_asset import SERVICE_CHAT_AVATAR_B64
 from processes.flowdesk_chatbot.bitrix_worker import Runtime
 from processes.flowdesk_chatbot.engine import new_session
@@ -60,10 +60,6 @@ class DeskFlowWorkerTests(unittest.TestCase):
         runtime._text_field_state = {}
         runtime.event_retry_attempts = 3
         runtime.event_retry_delay = 0.0
-        runtime.service_chat_health_active_seconds = 1.0
-        runtime.service_chat_health_quiet_seconds = 60.0
-        runtime._next_service_chat_health_check = 0.0
-        runtime._service_chat_health_cursor = 0
         return runtime
 
     def test_service_chat_avatar_url_is_only_fallback(self) -> None:
@@ -256,20 +252,30 @@ class DeskFlowWorkerTests(unittest.TestCase):
             "",
         )
 
-    def test_launcher_button_uses_native_dialog_action(self) -> None:
+    def test_launcher_button_is_on_demand_command(self) -> None:
         runtime = self.runtime()
-        fields = runtime.launcher_message_fields("chat501")
+        fields = runtime.launcher_message_fields()
 
         self.assertIn("DeskFlow", fields["message"])
         buttons = fields["keyboard"]["BUTTONS"]
         self.assertEqual(len(buttons), 1)
         self.assertEqual(buttons[0]["TEXT"], "Открыть служебный чат")
-        self.assertEqual(buttons[0]["ACTION"], "DIALOG")
-        self.assertEqual(buttons[0]["ACTION_VALUE"], "chat501")
+        self.assertEqual(buttons[0]["COMMAND"], "/flowdesk_test")
+        self.assertEqual(buttons[0]["COMMAND_PARAMS"], "launcher")
         self.assertEqual(buttons[0]["BLOCK"], "N")
         self.assertNotIn("LINK", buttons[0])
+        self.assertNotIn("ACTION", buttons[0])
+
+    def test_launcher_ready_answer_uses_native_dialog_action(self) -> None:
+        runtime = self.runtime()
+        fields = runtime.launcher_ready_fields("chat501")
+
+        buttons = fields["keyboard"]["BUTTONS"]
+        self.assertEqual(len(buttons), 1)
+        self.assertEqual(buttons[0]["TEXT"], "Перейти в служебный чат")
+        self.assertEqual(buttons[0]["ACTION"], "DIALOG")
+        self.assertEqual(buttons[0]["ACTION_VALUE"], "chat501")
         self.assertNotIn("COMMAND", buttons[0])
-        self.assertEqual(buttons[0]["BG_COLOR_TOKEN"], "primary")
 
     def test_launcher_message_is_created_once_then_refreshed(self) -> None:
         runtime = self.runtime()
@@ -285,8 +291,8 @@ class DeskFlowWorkerTests(unittest.TestCase):
 
         runtime.call = fake_call
 
-        first = runtime.ensure_launcher_message(153, "153", "chat501")
-        second = runtime.ensure_launcher_message(153, "153", "chat501")
+        first = runtime.ensure_launcher_message(153, "153")
+        second = runtime.ensure_launcher_message(153, "153")
 
         self.assertEqual(first, 901)
         self.assertEqual(second, 901)
@@ -299,24 +305,15 @@ class DeskFlowWorkerTests(unittest.TestCase):
         self.assertEqual(len(sends), 1)
         self.assertEqual(len(updates), 1)
         button = sends[0][1]["fields"]["keyboard"]["BUTTONS"][0]
-        self.assertEqual(button["TEXT"], "Открыть служебный чат")
-        self.assertEqual(button["ACTION"], "DIALOG")
-        self.assertEqual(button["ACTION_VALUE"], "chat501")
+        self.assertEqual(button["COMMAND_PARAMS"], "launcher")
 
-    def test_known_launcher_is_refreshed_to_native_dialog_action(self) -> None:
+    def test_known_launcher_refresh_does_not_create_service_chat(self) -> None:
         runtime = self.runtime()
         runtime.store.set_meta("launcher_message:153", "901")
-        runtime.store.set_meta("service_chat:153", "chat501")
         calls = []
-
-        runtime.load_service_chat_avatar = lambda: None
 
         def fake_call(method, params=None):
             calls.append((method, params))
-            if method == "imbot.v2.Chat.get":
-                return {"chat": {"dialogId": "chat501"}}
-            if method == "imbot.v2.Chat.User.list":
-                return [{"id": 103, "bot": True}, {"id": 153, "bot": False}]
             if method == "imbot.v2.Chat.Message.update":
                 return {"result": True}
             raise AssertionError(f"Unexpected method: {method}")
@@ -324,61 +321,81 @@ class DeskFlowWorkerTests(unittest.TestCase):
         runtime.call = fake_call
         runtime.refresh_known_launchers()
 
-        updates = [item for item in calls if item[0] == "imbot.v2.Chat.Message.update"]
-        self.assertEqual(len(updates), 1)
-        button = updates[0][1]["fields"]["keyboard"]["BUTTONS"][0]
-        self.assertEqual(button["ACTION"], "DIALOG")
-        self.assertEqual(button["ACTION_VALUE"], "chat501")
-        self.assertNotIn("LINK", button)
-        self.assertNotIn("COMMAND", button)
-
-    def test_health_sweep_detects_deleted_service_chat_without_restart(self) -> None:
-        runtime = self.runtime()
-        runtime.store.set_meta("service_chat:153", "chat501")
-        recovered = []
-
-        runtime.call_batch = lambda commands: BatchResult(
-            success={"u153": [{"id": 103, "bot": True}]},
-            errors={},
+        self.assertEqual(
+            [method for method, _ in calls],
+            ["imbot.v2.Chat.Message.update"],
         )
-        runtime.recover_service_chat = (
-            lambda user_id, dialog_id: recovered.append((user_id, dialog_id))
-            or "chat777"
+        button = calls[0][1]["fields"]["keyboard"]["BUTTONS"][0]
+        self.assertEqual(button["COMMAND_PARAMS"], "launcher")
+
+    def test_handle_join_does_not_create_service_chat(self) -> None:
+        runtime = self.runtime()
+        launched = []
+        runtime.ensure_launcher_message = (
+            lambda user_id, dialog_id: launched.append((user_id, dialog_id)) or 901
+        )
+        runtime.ensure_service_chat = lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("service chat must not be created on join")
         )
 
-        with patch(
-            "processes.flowdesk_chatbot.bitrix_worker.poll_interval_seconds",
-            return_value=1.0,
-        ):
-            runtime.reconcile_service_chats_if_due()
+        runtime.handle_join(
+            {
+                "user": {"id": 153, "name": "Иван Иванов"},
+                "chat": {"dialogId": "153"},
+            }
+        )
 
-        self.assertEqual(recovered, [(153, "chat501")])
+        self.assertEqual(launched, [(153, "153")])
 
-    def test_health_sweep_keeps_valid_service_chat(self) -> None:
+    def test_launcher_command_checks_chat_only_when_clicked(self) -> None:
         runtime = self.runtime()
-        runtime.store.set_meta("service_chat:153", "chat501")
-        recovered = []
+        runtime.ensure_service_chat = lambda user_id, user_name="": "chat777"
+        rendered = []
+        answered = []
+        runtime.render_current = lambda session, **kwargs: rendered.append(session["dialog_id"])
+        runtime.answer_launcher_command = (
+            lambda data, service_dialog_id: answered.append(service_dialog_id)
+        )
 
-        runtime.call_batch = lambda commands: BatchResult(
-            success={
-                "u153": [
-                    {"id": 103, "bot": True},
-                    {"id": 153, "bot": False},
-                ]
+        runtime.handle_command(
+            {
+                "command": {
+                    "command": "flowdesk_test",
+                    "params": "launcher",
+                },
+                "user": {"id": 153, "name": "Иван Иванов"},
+                "chat": {"dialogId": "153"},
+            }
+        )
+
+        self.assertEqual(runtime.store.get_meta("service_chat:153"), "")
+        self.assertEqual(rendered, ["chat777"])
+        self.assertEqual(answered, ["chat777"])
+
+    def test_launcher_command_answer_releases_spinner_and_returns_dialog_button(self) -> None:
+        runtime = self.runtime()
+        seen = {}
+
+        def fake_call(method, params=None):
+            self.assertEqual(method, "imbot.v2.Command.answer")
+            seen.update(params)
+            return {"result": True}
+
+        runtime.call = fake_call
+        runtime.answer_launcher_command(
+            {
+                "command": {"id": 44},
+                "message": {"id": 901},
+                "chat": {"dialogId": "153"},
             },
-            errors={},
-        )
-        runtime.recover_service_chat = (
-            lambda user_id, dialog_id: recovered.append((user_id, dialog_id))
+            "chat777",
         )
 
-        with patch(
-            "processes.flowdesk_chatbot.bitrix_worker.poll_interval_seconds",
-            return_value=1.0,
-        ):
-            runtime.reconcile_service_chats_if_due()
-
-        self.assertEqual(recovered, [])
+        self.assertEqual(seen["commandId"], 44)
+        self.assertEqual(seen["messageId"], 901)
+        button = seen["fields"]["keyboard"]["BUTTONS"][0]
+        self.assertEqual(button["ACTION"], "DIALOG")
+        self.assertEqual(button["ACTION_VALUE"], "chat777")
 
     def test_text_field_toggle_is_not_repeated_when_state_is_unchanged(self) -> None:
         runtime = self.runtime()

@@ -100,18 +100,6 @@ class Runtime:
             0.0,
             float(os.getenv("FLOWDESK_EVENT_RETRY_DELAY", "0.75")),
         )
-        # Keep launcher targets valid without requiring a worker restart.
-        # One batched health check covers up to 50 service chats at a time.
-        self.service_chat_health_active_seconds = max(
-            1.0,
-            float(os.getenv("FLOWDESK_SERVICE_CHAT_HEALTH_ACTIVE_SECONDS", "1.0")),
-        )
-        self.service_chat_health_quiet_seconds = max(
-            1.0,
-            float(os.getenv("FLOWDESK_SERVICE_CHAT_HEALTH_QUIET_SECONDS", "60.0")),
-        )
-        self._next_service_chat_health_check = 0.0
-        self._service_chat_health_cursor = 0
 
     def _load_or_create_bot_token(self) -> str:
         configured = os.getenv("FLOWDESK_BOT_TOKEN", "").strip()
@@ -143,15 +131,6 @@ class Runtime:
     def call_v3(self, method: str, params: dict[str, Any] | None = None) -> Any:
         self._throttle()
         result = self.client.call_v3(method, params or {})
-        self._last_api_call = time.monotonic()
-        return result
-
-    def call_batch(
-        self,
-        commands: dict[str, tuple[str, dict[str, Any]]],
-    ):
-        self._throttle()
-        result = self.client.batch(commands)
         self._last_api_call = time.monotonic()
         return result
 
@@ -594,17 +573,36 @@ class Runtime:
         path = f"/online/?IM_DIALOG={dialog_id}"
         return f"{self.portal_base}{path}" if self.portal_base else path
 
-    def launcher_message_fields(self, service_dialog_id: str) -> dict[str, Any]:
+    def launcher_message_fields(self) -> dict[str, Any]:
         return {
             "message": (
                 "[b]DeskFlow готов к работе 🙂[/b]\n"
-                "Нажми кнопку ниже — откроется служебный чат для обращения."
+                "Нажми кнопку ниже — я проверю служебный чат и подготовлю его к работе."
             ),
             "keyboard": {
                 "BOT_ID": self.bot_id,
                 "BUTTONS": [
                     {
                         "TEXT": "Открыть служебный чат",
+                        "COMMAND": f"/{self.command_name}",
+                        "COMMAND_PARAMS": "launcher",
+                        "BLOCK": "N",
+                        "DISPLAY": "LINE",
+                        "BG_COLOR_TOKEN": "primary",
+                        "TEXT_COLOR": "#FFFFFF",
+                    }
+                ],
+            },
+        }
+
+    def launcher_ready_fields(self, service_dialog_id: str) -> dict[str, Any]:
+        return {
+            "message": "[b]Готово 🙂[/b]\nСлужебный чат проверен и готов к работе.",
+            "keyboard": {
+                "BOT_ID": self.bot_id,
+                "BUTTONS": [
+                    {
+                        "TEXT": "Перейти в служебный чат",
                         "ACTION": "DIALOG",
                         "ACTION_VALUE": service_dialog_id,
                         "BLOCK": "N",
@@ -616,16 +614,11 @@ class Runtime:
             },
         }
 
-    def ensure_launcher_message(
-        self,
-        user_id: int,
-        dialog_id: str,
-        service_dialog_id: str,
-    ) -> int:
-        """Keep one reusable direct-link launcher in the personal bot dialog."""
+    def ensure_launcher_message(self, user_id: int, dialog_id: str) -> int:
+        """Keep one reusable on-demand launcher in the personal bot dialog."""
         meta_key = self.launcher_message_meta_key(user_id)
         existing_text = self.store.get_meta(meta_key).strip()
-        fields = self.launcher_message_fields(service_dialog_id)
+        fields = self.launcher_message_fields()
 
         if existing_text:
             try:
@@ -672,142 +665,8 @@ class Runtime:
         )
         return message_id
 
-    def refresh_launcher_target(
-        self,
-        user_id: int,
-        service_dialog_id: str,
-    ) -> bool:
-        message_text = self.store.get_meta(
-            self.launcher_message_meta_key(user_id)
-        ).strip()
-        if not message_text:
-            return False
-
-        try:
-            message_id = int(message_text)
-        except (TypeError, ValueError):
-            return False
-
-        result = self.call(
-            "imbot.v2.Chat.Message.update",
-            {
-                "botId": self.bot_id,
-                "botToken": self.bot_token,
-                "messageId": message_id,
-                "fields": self.launcher_message_fields(service_dialog_id),
-            },
-        )
-        return isinstance(result, dict)
-
-    def recover_service_chat(
-        self,
-        user_id: int,
-        stale_dialog_id: str,
-    ) -> str:
-        new_dialog_id = self.ensure_service_chat(user_id)
-        if new_dialog_id == stale_dialog_id:
-            return new_dialog_id
-
-        self.refresh_launcher_target(user_id, new_dialog_id)
-
-        # Prepare a clean first screen so the replacement chat is immediately
-        # usable when the user presses the launcher.
-        session = self.restart_session(new_dialog_id, user_id)
-        self.render_current(session)
-
-        LOG.info(
-            "Service chat self-healed for user=%s: %s -> %s",
-            user_id,
-            stale_dialog_id,
-            new_dialog_id,
-        )
-        return new_dialog_id
-
-    def reconcile_service_chats_if_due(self) -> None:
-        now = time.monotonic()
-        if now < self._next_service_chat_health_check:
-            return
-
-        interval = poll_interval_seconds(
-            active_seconds=self.service_chat_health_active_seconds,
-            quiet_seconds=self.service_chat_health_quiet_seconds,
-        )
-        self._next_service_chat_health_check = now + interval
-
-        entries = self.store.list_meta("service_chat:")
-        pairs: list[tuple[int, str]] = []
-        for key, dialog_id in entries.items():
-            try:
-                user_id = int(key.split(":", 1)[1])
-            except (IndexError, TypeError, ValueError):
-                continue
-            dialog_id = str(dialog_id or "").strip()
-            if user_id > 0 and dialog_id.startswith("chat"):
-                pairs.append((user_id, dialog_id))
-
-        if not pairs:
-            self._service_chat_health_cursor = 0
-            return
-
-        pairs.sort(key=lambda item: item[0])
-        start = self._service_chat_health_cursor % len(pairs)
-        ordered = pairs[start:] + pairs[:start]
-        batch_pairs = ordered[:50]
-        self._service_chat_health_cursor = (start + len(batch_pairs)) % len(pairs)
-
-        commands = {
-            f"u{user_id}": (
-                "imbot.v2.Chat.User.list",
-                {
-                    "botId": self.bot_id,
-                    "botToken": self.bot_token,
-                    "dialogId": dialog_id,
-                    "limit": 200,
-                },
-            )
-            for user_id, dialog_id in batch_pairs
-        }
-
-        try:
-            batch = self.call_batch(commands)
-        except Exception as exc:
-            LOG.warning(
-                "Service chat health batch failed: %s",
-                sanitize_error(exc),
-            )
-            return
-
-        for user_id, dialog_id in batch_pairs:
-            key = f"u{user_id}"
-            if key in batch.errors:
-                LOG.warning(
-                    "Service chat health check error for user=%s chat=%s: %s",
-                    user_id,
-                    dialog_id,
-                    batch.errors[key],
-                )
-                continue
-
-            rows = self.chat_user_rows(batch.success.get(key))
-            member_ok = any(
-                int(row.get("id") or 0) == user_id
-                for row in rows
-            )
-            if member_ok:
-                continue
-
-            try:
-                self.recover_service_chat(user_id, dialog_id)
-            except Exception as exc:
-                LOG.warning(
-                    "Service chat self-heal failed for user=%s chat=%s: %s",
-                    user_id,
-                    dialog_id,
-                    sanitize_error(exc),
-                )
-
     def refresh_known_launchers(self) -> None:
-        """Migrate existing command launchers to direct chat links on restart."""
+        """Convert saved launchers to the on-demand command without creating chats."""
         try:
             entries = self.store.list_meta("launcher_message:")
         except Exception as exc:
@@ -825,23 +684,13 @@ class Runtime:
                 continue
 
             try:
-                service_dialog_id = self.ensure_service_chat(user_id)
-            except Exception as exc:
-                LOG.warning(
-                    "Service chat recovery failed for launcher user=%s: %s",
-                    user_id,
-                    sanitize_error(exc),
-                )
-                continue
-
-            try:
                 result = self.call(
                     "imbot.v2.Chat.Message.update",
                     {
                         "botId": self.bot_id,
                         "botToken": self.bot_token,
                         "messageId": message_id,
-                        "fields": self.launcher_message_fields(service_dialog_id),
+                        "fields": self.launcher_message_fields(),
                     },
                 )
                 if not isinstance(result, dict):
@@ -849,9 +698,8 @@ class Runtime:
                         f"Launcher update returned unexpected result: {result!r}"
                     )
                 LOG.info(
-                    "Launcher converted to direct link: user=%s service=%s",
+                    "Launcher converted to on-demand command: user=%s",
                     user_id,
-                    service_dialog_id,
                 )
             except Exception as exc:
                 LOG.warning(
@@ -860,6 +708,42 @@ class Runtime:
                     message_id,
                     sanitize_error(exc),
                 )
+
+    def answer_launcher_command(
+        self,
+        data: dict[str, Any],
+        service_dialog_id: str,
+    ) -> None:
+        command = data.get("command") or {}
+        message = data.get("message") or {}
+        chat = data.get("chat") or {}
+
+        command_id = int(command.get("id") or 0)
+        message_id = int(message.get("id") or 0)
+        dialog_id = str(chat.get("dialogId") or "")
+
+        if not command_id or not message_id or not dialog_id:
+            raise ValueError(
+                "Неполные данные launcher-команды: "
+                f"command_id={command_id}, message_id={message_id}, "
+                f"dialog_id={dialog_id!r}"
+            )
+
+        result = self.call(
+            "imbot.v2.Command.answer",
+            {
+                "botId": self.bot_id,
+                "botToken": self.bot_token,
+                "commandId": command_id,
+                "messageId": message_id,
+                "dialogId": dialog_id,
+                "fields": self.launcher_ready_fields(service_dialog_id),
+            },
+        )
+        if not isinstance(result, dict) or result.get("result") is not True:
+            raise RuntimeError(
+                f"Launcher Command.answer вернул неожиданный ответ: {result!r}"
+            )
 
     def delete_chat_message(self, message_id: int) -> bool:
         if not message_id:
@@ -1549,7 +1433,6 @@ class Runtime:
                     self.ensure_launcher_message(
                         user_id,
                         source_dialog_id,
-                        service_dialog_id,
                     )
                 except Exception as exc:
                     LOG.warning(
@@ -1651,50 +1534,37 @@ class Runtime:
         if not user_id or not dialog_id:
             return
 
+        raw_params = str(command.get("params") or "")
+        if raw_params == "launcher":
+            service_dialog_id = self.ensure_service_chat(
+                user_id,
+                str(user.get("name") or ""),
+            )
+
+            key = self.session_key(service_dialog_id, user_id)
+            session = self.store.get_session(key)
+            if session is None:
+                session = self.restart_session(service_dialog_id, user_id)
+            else:
+                session = normalize_session(
+                    session,
+                    user_id=user_id,
+                    dialog_id=service_dialog_id,
+                )
+            self.render_current(session)
+
+            # Command.answer is mandatory for a keyboard COMMAND. It releases
+            # Bitrix's loading state and returns the native DIALOG button for
+            # the verified/new service chat.
+            self.answer_launcher_command(data, service_dialog_id)
+            return
+
         service_dialog_id = self.get_service_chat(user_id)
         if not service_dialog_id or dialog_id != service_dialog_id:
             service_dialog_id = self.ensure_service_chat(
                 user_id,
                 str(user.get("name") or ""),
             )
-
-            raw_params = str(command.get("params") or "")
-            if raw_params == "launcher":
-                # Compatibility with the short-lived command-button version.
-                # Answer it once to release Bitrix's loading state, then replace
-                # the old launcher message with the stable direct-link version.
-                session = self.restart_session(service_dialog_id, user_id)
-                self.render_current(session)
-                try:
-                    self.answer_command(
-                        data,
-                        "[b]Готово 🙂[/b]\n"
-                        "Служебный чат уже подготовлен. Открой его кнопкой ниже.",
-                        link_button={
-                            "text": "Открыть служебный чат",
-                            "link": self.service_chat_link(service_dialog_id),
-                        },
-                    )
-                except Exception as exc:
-                    LOG.warning(
-                        "Legacy launcher command answer failed for user=%s: %s",
-                        user_id,
-                        sanitize_error(exc),
-                    )
-                try:
-                    self.ensure_launcher_message(
-                        user_id,
-                        dialog_id,
-                        service_dialog_id,
-                    )
-                except Exception as exc:
-                    LOG.warning(
-                        "Legacy launcher message refresh failed for user=%s: %s",
-                        user_id,
-                        sanitize_error(exc),
-                    )
-                return
-
             session = self.restart_session(service_dialog_id, user_id)
             self.render_current(session)
             return
@@ -1779,21 +1649,11 @@ class Runtime:
         if dialog_id.startswith("chat"):
             return
 
-        # Prepare the service chat up front, then expose a plain hyperlink.
-        # This avoids the command-button loading state entirely.
-        service_dialog_id = self.ensure_service_chat(
-            user_id,
-            str(user.get("name") or ""),
-        )
-        key = self.session_key(service_dialog_id, user_id)
-        if self.store.get_session(key) is None:
-            session = self.restart_session(service_dialog_id, user_id)
-            self.render_current(session)
-
+        # Do not create a technical chat just because the employee opened
+        # the bot. The launcher validates/creates it only when clicked.
         self.ensure_launcher_message(
             user_id,
             dialog_id,
-            service_dialog_id,
         )
 
     def handle_event(self, event: dict[str, Any]) -> None:
@@ -1886,8 +1746,6 @@ class Runtime:
 
         while True:
             try:
-                self.reconcile_service_chats_if_due()
-
                 params: dict[str, Any] = {
                     "botId": self.bot_id,
                     "botToken": self.bot_token,
