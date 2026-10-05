@@ -681,8 +681,14 @@ class Runtime:
             except (IndexError, TypeError, ValueError):
                 continue
 
-            service_dialog_id = self.get_service_chat(user_id)
-            if not service_dialog_id:
+            try:
+                service_dialog_id = self.ensure_service_chat(user_id)
+            except Exception as exc:
+                LOG.warning(
+                    "Service chat recovery failed for launcher user=%s: %s",
+                    user_id,
+                    sanitize_error(exc),
+                )
                 continue
 
             try:
