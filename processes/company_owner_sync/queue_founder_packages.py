@@ -16,6 +16,7 @@ import requests
 from eqazyna_bitrix.bitrix_client import BitrixClient
 from eqazyna_bitrix.settings import Settings
 from fast_package_reconciler import process_package_fast
+from authority_state import remember_authority_sources
 from sync_founder_packages import build_packages, is_founder_contact, load_snapshot, normalized_id, select_source_package
 
 
@@ -325,6 +326,18 @@ def process_claim(
                 contact_id, version, False, "failed", "source_contact_package_not_resolved", "MANUAL_REVIEW", operation_id
             )
         else:
+            package_contacts = {
+                normalized_id(contact.get("id"))
+                for contact in packages_by_contact[contact_id].get("contacts", [])
+            }
+            lead_linked_contacts = {
+                value for lead in snapshot["leads"]
+                if (value := normalized_id(lead.get("CONTACT_ID"))) in package_contacts
+            }
+            if lead_linked_contacts and contact_id not in lead_linked_contacts:
+                # An unlinked duplicate must not move the package back.
+                results_by_key[(contact_id, version)] = _result_payload(contact_id, version, True, "ignored", "")
+                continue
             raw_jobs.append({
                 "item": item,
                 "contact_id": contact_id,
@@ -448,6 +461,7 @@ def process_claim(
                     )
 
     if journal_entries:
+        remember_authority_sources(output_dir, [entry["operation"] for entry in journal_entries])
         for start in range(0, len(journal_entries), 20):
             best_effort_queue_call(
                 queue_url,
@@ -482,11 +496,15 @@ def process_queue(
     worker_id = f"{os.getenv('GITHUB_RUN_ID', 'local')}-{uuid.uuid4().hex[:12]}"
     total_items = total_processed = total_ignored = total_partial = total_failures = batches = 0
     claim_limit = min(max(int(os.getenv("OWNER_SYNC_CLAIM_LIMIT", "100") or 100), 1), 500)
+    busy = False
+    drained = False
     for batch_no in range(1, max_batches + 1):
         print(f"[QUEUE] claim request batch={batch_no}; limit={claim_limit}", flush=True)
         claim = queue_call(queue_url, queue_key, "claim", worker_id=worker_id, limit=claim_limit)
         items = claim.get("items") or []
         if not items:
+            busy = bool(claim.get("busy"))
+            drained = not busy
             print(f"[QUEUE] no work; busy={bool(claim.get('busy'))}", flush=True)
             break
         batches += 1
@@ -528,6 +546,8 @@ def process_queue(
         "ignored": total_ignored,
         "partial": total_partial,
         "failures": total_failures,
+        "busy": busy,
+        "drained": drained,
     }
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "queue_summary.json").write_text(

@@ -145,7 +145,6 @@ function enqueue_(body) {
     if (lastOwner === ownerId) {
       return {ok: true, queued: false, dispatch: false, reason: 'owner_unchanged', contact_id: contactId};
     }
-    props.setProperty(ownerKey_(contactId), String(ownerId));
   }
 
   const sheet = sheet_();
@@ -166,6 +165,9 @@ function enqueue_(body) {
     if (!active_(row[2])) row[2] = 'PENDING';
   }
   writeRows_(sheet, rows);
+  // Remember the owner only after the durable queue row was saved. Otherwise
+  // a spreadsheet failure makes every retry look like owner_unchanged.
+  if (hasOwner) props.setProperty(ownerKey_(contactId), String(ownerId));
   const active = rows.some(row => active_(row[2]));
   const dispatchPending = dispatchPending_(props);
   const dispatch = !active && !dispatchPending;

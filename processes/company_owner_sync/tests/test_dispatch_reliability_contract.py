@@ -6,14 +6,11 @@ EVENT_JS = ROOT / "integrations" / "bitrix_owner_sync_webhook" / "api" / "bitrix
 QUEUE_GS = ROOT / "integrations" / "bitrix_owner_sync_queue" / "Code.gs"
 
 
-def test_event_retries_github_dispatch_and_records_failure():
+def test_event_reports_durable_queue_for_persistent_worker():
     source = EVENT_JS.read_text(encoding="utf-8")
-    assert "const GITHUB_DISPATCH_ATTEMPTS = 3" in source
-    assert "GITHUB_RETRYABLE_STATUSES" in source
-    assert "async function dispatchGithub" in source
-    assert 'queueRequest("dispatch_error"' in source
-    assert "github_dispatch_not_configured" in source
-    assert "dispatch_attempts" in source
+    assert 'queueRequest("enqueue"' in source
+    assert 'processing: "persistent_worker"' in source
+    assert 'queued: queued.queued !== false' in source
 
 
 def test_queue_keeps_failed_dispatch_pending_and_visible():

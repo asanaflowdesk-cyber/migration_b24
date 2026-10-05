@@ -9,6 +9,7 @@ from pathlib import Path
 from eqazyna_bitrix.bitrix_client import BitrixClient
 from eqazyna_bitrix.settings import Settings
 from queue_founder_packages import process_queue
+from package_recovery import repair_package_residuals
 
 
 LOG = logging.getLogger("company_owner_sync_worker")
@@ -37,6 +38,8 @@ def run() -> None:
     poll_seconds = max(float(os.getenv("OWNER_SYNC_POLL_SECONDS", "5")), 1.0)
     error_sleep = max(float(os.getenv("OWNER_SYNC_ERROR_SLEEP_SECONDS", "10")), 2.0)
     max_batches = max(int(os.getenv("OWNER_SYNC_MAX_BATCHES", "20")), 1)
+    recovery_seconds = max(float(os.getenv("OWNER_SYNC_RECOVERY_SECONDS", "300")), 30.0)
+    next_recovery = 0.0
     output_dir = Path(
         os.getenv(
             "OWNER_SYNC_OUTPUT_DIR",
@@ -62,6 +65,14 @@ def run() -> None:
                 output_dir,
                 max_batches,
             )
+
+            if summary.get("drained") and time.monotonic() >= next_recovery:
+                # Recovery errors must not prevent subsequent owner events.
+                next_recovery = time.monotonic() + recovery_seconds
+                try:
+                    repair_package_residuals(client, output_dir)
+                except Exception as exc:
+                    LOG.exception("31A residual recovery failed: %s", type(exc).__name__)
 
             if int(summary.get("items") or 0) == 0:
                 time.sleep(poll_seconds)

@@ -35,7 +35,7 @@ function parseBody(request) {
 function isFounderContact(contact) {
   const post = String(contact?.POST || "").toLocaleLowerCase("ru-RU");
   const comments = String(contact?.COMMENTS || "");
-  return post.includes("руковод") || post.includes("учред") || comments.includes("EQAZYNA_DIRECTOR:");
+  return post.includes("руковод") || post.includes("директор") || post.includes("учред") || comments.toLocaleLowerCase("ru-RU").includes("eqazyna_director:");
 }
 
 function sleep(ms) {

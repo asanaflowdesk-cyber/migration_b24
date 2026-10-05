@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -119,7 +120,30 @@ def ensure_persistent_venv(source_root: Path) -> Path:
     return venv
 
 
-def start_worker() -> int:
+def wait_for_recovery(proc: subprocess.Popen, report: Path, started: float, timeout: float) -> int:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            print("ERROR: worker exited before the first recovery completed", file=sys.stderr)
+            return 1
+        if report.exists() and report.stat().st_mtime >= started:
+            data = json.loads(report.read_text(encoding="utf-8"))
+            print("[DEPLOY RECOVERY] " + json.dumps(data["summary"], ensure_ascii=False))
+            sources: dict[int, dict] = {}
+            for row in data.get("changes", []):
+                source_id = int(row["source_contact_id"])
+                item = sources.setdefault(source_id, {"source_contact_id": source_id, "owner_id": row["target"], "updated": 0, "errors": 0})
+                item["updated"] += row.get("status") == "updated"
+                item["errors"] += row.get("status") == "error"
+            for source_id in sorted(sources):
+                print("[DEPLOY PACKAGE] " + json.dumps(sources[source_id]))
+            return 1 if data["summary"].get("errors") else 0
+        time.sleep(2)
+    print("ERROR: worker is running, but the first recovery report is not ready", file=sys.stderr)
+    return 1
+
+
+def start_worker(wait_recovery: float = 0) -> int:
     required = (
         "TARGET_BITRIX_WEBHOOK_URL",
         "GOOGLE_QUEUE_URL",
@@ -167,6 +191,7 @@ def start_worker() -> int:
         creationflags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
         creationflags |= getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
 
+    started = time.time()
     with stdout_path.open("ab") as out, stderr_path.open("ab") as err:
         proc = subprocess.Popen(
             [str(python), "-u", str(company_dir / "persistent_worker.py")],
@@ -198,6 +223,8 @@ def start_worker() -> int:
     print(f"Idle poll: {env.get('OWNER_SYNC_POLL_SECONDS', '5')} sec")
     print("Перенос пакетов больше не ждёт GitHub Action.")
 
+    if wait_recovery:
+        return wait_for_recovery(proc, output_dir / "recovery.json", started, wait_recovery)
     return 0
 
 
@@ -238,6 +265,7 @@ def status_worker() -> int:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("action", choices=["start", "stop", "restart", "status"])
+    parser.add_argument("--wait-recovery", type=float, default=0)
     args = parser.parse_args()
 
     if args.action == "status":
@@ -249,7 +277,7 @@ def main() -> int:
             return code
 
     if args.action in {"start", "restart"}:
-        return start_worker()
+        return start_worker(args.wait_recovery)
 
     return 0
 

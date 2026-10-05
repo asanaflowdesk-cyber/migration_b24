@@ -58,8 +58,9 @@ def is_founder_contact(contact: dict[str, Any]) -> bool:
     comments = str(contact.get("COMMENTS") or "")
     return (
         "руковод" in post
+        or "директор" in post
         or "учред" in post
-        or "EQAZYNA_DIRECTOR:" in comments
+        or "eqazyna_director:" in comments.casefold()
     )
 
 

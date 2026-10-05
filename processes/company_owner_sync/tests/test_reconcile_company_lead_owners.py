@@ -76,7 +76,7 @@ class Client:
 def test_only_director_contact_is_authority():
     assert is_director_authority_contact(contact(100, 17, "Руководитель"))
     assert is_director_authority_contact(contact(100, 17, "Директор"))
-    assert not is_director_authority_contact(contact(100, 17, "Учредитель"))
+    assert is_director_authority_contact(contact(100, 17, "Учредитель"))
 
 
 def test_one_director_owner_becomes_target_without_date_modify_logic():

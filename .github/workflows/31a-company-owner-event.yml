@@ -1,6 +1,12 @@
 name: 31A | Founder package worker control
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - 'processes/company_owner_sync/**'
+      - 'integrations/bitrix_owner_sync_queue/**'
+      - '.github/workflows/31a-company-owner-event.yml'
   workflow_dispatch:
     inputs:
       action:
@@ -13,6 +19,11 @@ on:
           - start
           - stop
           - status
+
+concurrency:
+  group: founder-package-owner-writes
+  queue: max
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -36,6 +47,20 @@ jobs:
           fetch-depth: 1
           path: _owner_sync_control
 
+      - name: Проверить логику перед обновлением worker
+        if: github.event_name == 'push' || inputs.action == 'start' || inputs.action == 'restart'
+        shell: cmd
+        env:
+          OWNER_SYNC_SOURCE_ROOT: ${{ github.workspace }}\_owner_sync_control
+          CUSTOM_PIP_INDEX_URL: ${{ vars.PIP_INDEX_URL }}
+        run: |
+          set "PYTHON_EXE=C:\Users\Alyona.Sachyova\AppData\Local\Programs\Python\Python312\python.exe"
+          if not "%CUSTOM_PIP_INDEX_URL%"=="" set "PIP_INDEX_URL=%CUSTOM_PIP_INDEX_URL%"
+          set "PYTHONPATH=%OWNER_SYNC_SOURCE_ROOT%\processes\company_owner_sync;%OWNER_SYNC_SOURCE_ROOT%\processes\eqazyna_leads"
+          "%PYTHON_EXE%" -c "from pathlib import Path; import os; from worker_control import ensure_persistent_venv; ensure_persistent_venv(Path(os.environ['OWNER_SYNC_SOURCE_ROOT']))"
+          if errorlevel 1 exit /b 1
+          "%USERPROFILE%\.company-owner-sync\venv\Scripts\python.exe" -m pytest -q "_owner_sync_control\processes\company_owner_sync\tests"
+
       - name: Управлять 31A worker
         shell: cmd
         env:
@@ -49,8 +74,9 @@ jobs:
           OWNER_SYNC_WORKERS: "8"
           OWNER_SYNC_CLAIM_LIMIT: "100"
           OWNER_SYNC_POLL_SECONDS: "5"
+          OWNER_SYNC_RECOVERY_SECONDS: "300"
           CUSTOM_PIP_INDEX_URL: ${{ vars.PIP_INDEX_URL }}
         run: |
           set "PYTHON_EXE=C:\Users\Alyona.Sachyova\AppData\Local\Programs\Python\Python312\python.exe"
           if not "%CUSTOM_PIP_INDEX_URL%"=="" set "PIP_INDEX_URL=%CUSTOM_PIP_INDEX_URL%"
-          "%PYTHON_EXE%" -u "_owner_sync_control\processes\company_owner_sync\worker_control.py" "${{ inputs.action }}"
+          "%PYTHON_EXE%" -u "_owner_sync_control\processes\company_owner_sync\worker_control.py" "${{ inputs.action || 'restart' }}" --wait-recovery "${{ github.event_name == 'push' && '300' || '0' }}"

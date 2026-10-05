@@ -12,10 +12,12 @@ from typing import Any
 from eqazyna_bitrix.bitrix_client import BitrixClient
 from eqazyna_bitrix.settings import Settings
 from fast_package_reconciler import batch_execute, bulk_owners
+from authority_state import load_authority_sources
 from sync_founder_packages import (
     build_packages,
     load,
     normalized_id,
+    is_founder_contact,
     write_report,
     write_summary,
 )
@@ -26,19 +28,8 @@ MAX_STABILIZE_ROUNDS = 3
 
 
 def is_director_authority_contact(contact: dict[str, Any]) -> bool:
-    """Only an actual director/manager contact may define the package owner.
-
-    A generic founder contact is deliberately not enough for the bulk repair:
-    the invariant requested for workflow 31 is company/lead owner == current
-    owner of the director contact.
-    """
-    post = str(contact.get("POST") or "").casefold()
-    comments = str(contact.get("COMMENTS") or "")
-    return (
-        "руковод" in post
-        or "директор" in post
-        or "eqazyna_director:" in comments.casefold()
-    )
+    """A lead-linked director/founder contact is the ownership authority."""
+    return is_founder_contact(contact)
 
 
 def _clone_client(client: BitrixClient) -> BitrixClient:
@@ -82,15 +73,15 @@ def load_snapshot_fast(client: BitrixClient) -> dict[str, list[dict[str, Any]]]:
 def resolve_authority_packages(
     packages: list[dict[str, Any]],
     contacts: list[dict[str, Any]],
+    leads: list[dict[str, Any]] | None = None,
+    authority_sources: dict[str, int] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Resolve one deterministic owner for every package without DATE_MODIFY.
+    """Resolve from CONTACT_ID of package leads, never from DATE_MODIFY.
 
-    Rules:
-    - authority is only a director/manager contact;
-    - every authority contact in one FIO package must have an owner;
-    - if there are several authority contacts, all must point to the same owner;
-    - otherwise the package is not touched. We never guess by newest card, role,
-      ROP list or user id.
+    The source of a completed owner-change event stays authoritative for its
+    package. Without that event history, competing lead-linked contacts must
+    agree. Unlinked duplicate contacts are targets, not competing authorities.
+    ``leads=None`` is retained for callers holding a preselected package.
     """
     contacts_by_id = {
         contact_id: contact
@@ -99,6 +90,10 @@ def resolve_authority_packages(
     }
     resolved: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
+    linked_ids = {
+        value for lead in leads or []
+        if (value := normalized_id(lead.get("CONTACT_ID"))) is not None
+    }
 
     for package in packages:
         authority: list[dict[str, Any]] = []
@@ -107,6 +102,16 @@ def resolve_authority_packages(
             contact = contacts_by_id.get(contact_id or 0)
             if contact and is_director_authority_contact(contact):
                 authority.append(contact)
+
+        if leads is not None:
+            authority = [contact for contact in authority if normalized_id(contact.get("ID")) in linked_ids]
+        remembered = (authority_sources or {}).get(str(package.get("fio") or ""))
+        if remembered:
+            selected = [contact for contact in authority if normalized_id(contact.get("ID")) == remembered]
+            if not selected:
+                skipped.append({"type": "remembered_source_not_lead_linked", "fio": package.get("fio", ""), "company_title": f"contact_id={remembered}"})
+                continue
+            authority = selected
 
         if not authority:
             skipped.append({
@@ -154,6 +159,7 @@ def resolve_authority_packages(
         item["owner_id"] = owner_ids[0]
         item["source_contact_id"] = authority_ids[0]
         item["authority_contact_ids"] = authority_ids
+        item["sync_package_contacts"] = leads is not None
         resolved.append(item)
 
     return resolved, skipped
@@ -162,6 +168,13 @@ def resolve_authority_packages(
 def company_lead_items(package: dict[str, Any]) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     seen: set[tuple[str, int]] = set()
+
+    if package.get("sync_package_contacts"):
+        source_ids = set(package.get("authority_contact_ids") or [])
+        for contact in package.get("contacts", []):
+            contact_id = normalized_id(contact.get("id"))
+            if contact_id and contact_id not in source_ids:
+                items.append({"entity": "contact", "id": contact_id, "title": str(contact.get("title") or "")})
 
     def add_lead(lead: dict[str, Any]) -> None:
         lead_id = normalized_id(lead.get("id"))
@@ -380,7 +393,8 @@ def run(client: BitrixClient, output_dir: Path, apply: bool) -> dict[str, Any]:
         snapshot["contacts"],
         snapshot["requisites"],
     )
-    packages, authority_skipped = resolve_authority_packages(raw_packages, snapshot["contacts"])
+    state_dir = Path(os.getenv("OWNER_SYNC_OUTPUT_DIR", str(Path.home() / ".company-owner-sync" / "output")))
+    packages, authority_skipped = resolve_authority_packages(raw_packages, snapshot["contacts"], snapshot["leads"], load_authority_sources(state_dir))
     packages = add_direct_contact_leads(packages, snapshot["leads"])
     skipped = raw_skipped + authority_skipped
 

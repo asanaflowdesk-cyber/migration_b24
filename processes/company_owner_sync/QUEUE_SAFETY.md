@@ -1,38 +1,29 @@
-# Sequential founder-package synchronization
+# Founder package synchronization
 
-Workflows 31 and 31A share `founder-package-owner-writes`, with
-`queue: max` and `cancel-in-progress: false`. GitHub allows 100 pending
-runs in this group. Overflow, manual cancellation and timeouts are not recovered
-automatically. This is a bounded execution queue, not a durable event journal.
+Owner events use the durable Google Apps Script queue. The persistent worker
+drains it before periodic full CRM recovery. A busy claim or a batch limit
+does not count as a drained queue.
 
-The source owner is refreshed after the CRM scan and checked before each write.
-Target owners changed since the plan are not overwritten. Each write is read
-back; a failure stops remaining writes for that package, reports errors and exits
-nonzero. A fresh rerun skips already-correct records. No automatic rollback is
-attempted because it could overwrite a subsequent user change.
+The authority is a lead-linked director/founder contact, never DATE_MODIFY.
+An unlinked duplicate cannot drive a package when a linked contact exists.
+A completed event's source is persisted outside runtime. Without event history,
+conflicting linked owners are skipped rather than guessed.
 
-## Deployment and acceptance
+Recovery updates only ASSIGNED_BY_ID on package contacts, companies and leads.
+Source ownership is refreshed and writes are read back. A changing source is
+retried within bounded stabilization rounds. Failed writes leave residuals for
+the next pass. Repeating a successful pass produces no additional writes.
 
-1. Do not overlap deployment with an old running transfer. Wait for old runs;
-   already-queued runs may still reference the old workflow/code.
-2. First run 31A manually in dry_run on the new revision for a known contact.
-3. On approved test records, submit three different contacts simultaneously;
-   confirm one running transfer and the others pending, with no replacement.
-4. Apply once and inspect the report and CRM. Repeat: no additional writes.
-5. Change the source owner while processing: the run must report failure rather
-   than claim complete success. Rerun with fresh CRM data to reconcile.
-6. Check failed/cancelled runs explicitly; there is no background retry service.
+Workflows 31 and 31A share founder-package-owner-writes, queue: max and
+cancel-in-progress: false. This serializes Action runs and deployments, not
+the detached worker or external writers. Bitrix writes are not transactional;
+a later conflicting write is corrected on a subsequent recovery pass.
 
-## Remaining boundaries
+Push deployments run regression tests before restarting and wait for a fresh
+recovery report. Tests cover lost events, duplicate contacts, source changes,
+unverified writes, preserved stages, restart state and failed queue writes.
+Live deployment logs still require inspection.
 
-- External users and other workflows are not locked by this group. Other writers
-  must be audited before enabling overlapping bulk operations.
-- Bitrix updates are not transactional. A race between read and write remains;
-  stopping on error does not undo an already-written record.
-- Duplicate founder contacts with conflicting owners still use existing source
-  selection rules. Simultaneous edits to different duplicates require manual
-  resolution; this patch does not invent a new ownership priority.
-- Full FIO matching, package membership, and skipped ambiguous companies retain
-  existing behavior. Deals are not part of this script's package.
-- Local tests cover Python logic with a fake CRM, not live Windows runner or
-  Bitrix behavior. Live acceptance is still required.
+Apps Script must be separately published as a new web-app version. Recovery
+works with the existing queue, but does not make its old enqueue path atomic.
+Ambiguous FIO or company membership is reported. Deals are outside this scope.

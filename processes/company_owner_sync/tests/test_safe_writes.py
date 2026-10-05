@@ -88,8 +88,11 @@ def test_workflows_share_bounded_serial_queue():
         assert "cancel-in-progress: false" in text
 
 
-def test_event_queue_has_manual_and_fast_recovery_triggers():
+def test_event_worker_deploys_on_push_and_has_residual_recovery():
     root = Path(__file__).resolve().parents[3]
     text = (root / ".github/workflows" / "31a-company-owner-event.yml").read_text(encoding="utf-8")
     assert "workflow_dispatch:" in text
-    assert 'cron: "*/5 * * * *"' in text
+    assert 'push:' in text
+    assert 'OWNER_SYNC_RECOVERY_SECONDS: "300"' in text
+    worker = (root / "processes" / "company_owner_sync" / "persistent_worker.py").read_text(encoding="utf-8")
+    assert "repair_package_residuals(client, output_dir)" in worker
