@@ -150,6 +150,25 @@ class DeskFlowIntegrityTests(unittest.TestCase):
             ["Создать новое обращение"],
         )
 
+    def test_it_system_failure_is_instruction_dead_end(self) -> None:
+        session = new_session(153, "chat999")
+        submit_action(session, "Запрос")
+        submit_action(session, "IT")
+        submit_action(session, "Сообщение о сбое")
+
+        self.assertEqual(session["current_screen"], "instruction")
+        current = view(session)
+        self.assertTrue(current["terminal"])
+        self.assertIn("Похоже, здесь нужен другой маршрут", current["text"])
+        self.assertIn(
+            "objectId=237",
+            current["text"],
+        )
+        self.assertEqual(
+            [button["label"] for button in current["buttons"]],
+            ["Создать новое обращение"],
+        )
+
     def test_every_product_tree_path_is_reachable(self) -> None:
         for insurance_type, classes in PRODUCT_TREE.items():
             self.assertIsInstance(classes, dict)
