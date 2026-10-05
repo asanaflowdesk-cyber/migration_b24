@@ -166,6 +166,50 @@ class DeskFlowWorkerTests(unittest.TestCase):
             "",
         )
 
+    def test_launcher_button_opens_deskflow_command(self) -> None:
+        runtime = self.runtime()
+        fields = runtime.launcher_message_fields()
+
+        self.assertIn("DeskFlow", fields["message"])
+        buttons = fields["keyboard"]["BUTTONS"]
+        self.assertEqual(len(buttons), 1)
+        self.assertEqual(buttons[0]["TEXT"], "Открыть DeskFlow")
+        self.assertEqual(buttons[0]["COMMAND"], "/flowdesk_test")
+        self.assertEqual(buttons[0]["COMMAND_PARAMS"], "launcher")
+        self.assertEqual(buttons[0]["BG_COLOR_TOKEN"], "primary")
+
+    def test_launcher_message_is_created_once_then_refreshed(self) -> None:
+        runtime = self.runtime()
+        calls = []
+
+        def fake_call(method, params=None):
+            calls.append((method, params))
+            if method == "imbot.v2.Chat.Message.send":
+                return {"id": 901}
+            if method == "imbot.v2.Chat.Message.update":
+                return {"result": True}
+            raise AssertionError(f"Unexpected method: {method}")
+
+        runtime.call = fake_call
+
+        first = runtime.ensure_launcher_message(153, "153")
+        second = runtime.ensure_launcher_message(153, "153")
+
+        self.assertEqual(first, 901)
+        self.assertEqual(second, 901)
+        self.assertEqual(
+            runtime.store.get_meta("launcher_message:153"),
+            "901",
+        )
+        sends = [item for item in calls if item[0] == "imbot.v2.Chat.Message.send"]
+        updates = [item for item in calls if item[0] == "imbot.v2.Chat.Message.update"]
+        self.assertEqual(len(sends), 1)
+        self.assertEqual(len(updates), 1)
+        self.assertEqual(
+            sends[0][1]["fields"]["keyboard"]["BUTTONS"][0]["TEXT"],
+            "Открыть DeskFlow",
+        )
+
     def test_text_field_toggle_is_not_repeated_when_state_is_unchanged(self) -> None:
         runtime = self.runtime()
         calls = []
