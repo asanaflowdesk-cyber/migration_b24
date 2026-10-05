@@ -431,42 +431,6 @@ class Runtime:
             if isinstance(row, dict)
         )
 
-    def restore_service_chat_user(self, dialog_id: str, user_id: int) -> bool:
-        if self.service_chat_has_user(dialog_id, user_id):
-            return True
-
-        LOG.warning(
-            "DeskFlow user=%s is missing from saved service chat=%s; restoring membership",
-            user_id,
-            dialog_id,
-        )
-
-        result = self.call(
-            "imbot.v2.Chat.User.add",
-            {
-                "botId": self.bot_id,
-                "botToken": self.bot_token,
-                "dialogId": dialog_id,
-                "userIds": [int(user_id)],
-            },
-        )
-
-        ok = result is True or (
-            isinstance(result, dict) and result.get("result") is True
-        )
-        if not ok:
-            LOG.warning(
-                "Chat.User.add returned unexpected result for user=%s chat=%s: %r",
-                user_id,
-                dialog_id,
-                result,
-            )
-            return False
-
-        # Do not trust a nominal success blindly: verify that the employee is
-        # actually back in the chat before reusing the stored dialog id.
-        return self.service_chat_has_user(dialog_id, user_id)
-
     def ensure_service_chat(self, user_id: int, user_name: str = "") -> str:
         existing = self.get_service_chat(user_id)
 
@@ -487,10 +451,7 @@ class Runtime:
                 )
                 if chat_exists:
                     try:
-                        member_ok = self.restore_service_chat_user(
-                            existing,
-                            user_id,
-                        )
+                        member_ok = self.service_chat_has_user(existing, user_id)
                     except Exception as exc:
                         member_ok = False
                         LOG.warning(
@@ -512,9 +473,13 @@ class Runtime:
                             )
                         return existing
 
+                    # Important: after a user explicitly deletes/leaves a chat,
+                    # Bitrix may keep the chat object but the old dialog remains
+                    # unavailable in the UI. Re-adding membership is therefore
+                    # not enough. Abandon the stale chat and create a fresh one.
                     LOG.warning(
-                        "Saved service chat %s cannot be restored for user=%s; "
-                        "a replacement chat will be created",
+                        "Saved service chat %s no longer contains user=%s; "
+                        "creating a fresh replacement instead of reusing it",
                         existing,
                         user_id,
                     )
@@ -555,6 +520,8 @@ class Runtime:
 
         self.store.set_meta(self.service_chat_meta_key(user_id), dialog_id)
         if existing and existing != dialog_id:
+            self.store.delete_session(self.session_key(existing, user_id))
+            self._text_field_state.pop(existing, None)
             LOG.info(
                 "Service chat replaced for user=%s: %s -> %s",
                 user_id,
