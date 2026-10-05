@@ -24,6 +24,9 @@ class FakeStore:
     def get_session(self, key):
         return self.sessions.get(key)
 
+    def delete_session(self, key):
+        self.sessions.pop(key, None)
+
     def get_meta(self, key, default=""):
         return self.meta.get(key, default)
 
@@ -145,39 +148,10 @@ class DeskFlowWorkerTests(unittest.TestCase):
             "v1",
         )
 
-    def test_removed_user_is_readded_to_saved_service_chat(self) -> None:
+    def test_removed_user_gets_fresh_service_chat_not_old_chat(self) -> None:
         runtime = self.runtime()
         runtime.store.set_meta("service_chat:153", "chat501")
-        runtime.load_service_chat_avatar = lambda: None
-        calls = []
-        list_count = {"value": 0}
-
-        def fake_call(method, params=None):
-            calls.append((method, params))
-            if method == "imbot.v2.Chat.get":
-                return {"chat": {"dialogId": "chat501"}}
-            if method == "imbot.v2.Chat.User.list":
-                list_count["value"] += 1
-                if list_count["value"] == 1:
-                    return [{"id": 103, "bot": True}]
-                return [{"id": 103, "bot": True}, {"id": 153, "bot": False}]
-            if method == "imbot.v2.Chat.User.add":
-                self.assertEqual(params["dialogId"], "chat501")
-                self.assertEqual(params["userIds"], [153])
-                return {"result": True}
-            raise AssertionError(f"Unexpected method: {method}")
-
-        runtime.call = fake_call
-
-        self.assertEqual(runtime.ensure_service_chat(153), "chat501")
-        self.assertEqual(
-            [method for method, _ in calls].count("imbot.v2.Chat.User.add"),
-            1,
-        )
-
-    def test_unrestorable_saved_chat_is_replaced(self) -> None:
-        runtime = self.runtime()
-        runtime.store.set_meta("service_chat:153", "chat501")
+        runtime.store.put_session("chat501:153", {"stale": True})
         runtime.load_service_chat_avatar = lambda: None
         calls = []
 
@@ -187,8 +161,6 @@ class DeskFlowWorkerTests(unittest.TestCase):
                 return {"chat": {"dialogId": "chat501"}}
             if method == "imbot.v2.Chat.User.list":
                 return [{"id": 103, "bot": True}]
-            if method == "imbot.v2.Chat.User.add":
-                return {"result": False}
             if method == "imbot.v2.Chat.add":
                 self.assertEqual(params["fields"]["userIds"], [153])
                 return {"chat": {"dialogId": "chat777"}}
@@ -197,6 +169,34 @@ class DeskFlowWorkerTests(unittest.TestCase):
         runtime.call = fake_call
 
         self.assertEqual(runtime.ensure_service_chat(153, "Иван Иванов"), "chat777")
+        self.assertEqual(runtime.store.get_meta("service_chat:153"), "chat777")
+        self.assertIsNone(runtime.store.get_session("chat501:153"))
+        self.assertNotIn(
+            "imbot.v2.Chat.User.add",
+            [method for method, _ in calls],
+        )
+
+    def test_membership_check_failure_gets_fresh_service_chat(self) -> None:
+        runtime = self.runtime()
+        runtime.store.set_meta("service_chat:153", "chat501")
+        runtime.load_service_chat_avatar = lambda: None
+
+        def fake_call(method, params=None):
+            if method == "imbot.v2.Chat.get":
+                return {"chat": {"dialogId": "chat501"}}
+            if method == "imbot.v2.Chat.User.list":
+                raise BitrixError(
+                    method,
+                    "ACCESS_DENIED",
+                    "Access denied",
+                )
+            if method == "imbot.v2.Chat.add":
+                return {"chat": {"dialogId": "chat777"}}
+            raise AssertionError(f"Unexpected method: {method}")
+
+        runtime.call = fake_call
+
+        self.assertEqual(runtime.ensure_service_chat(153), "chat777")
         self.assertEqual(runtime.store.get_meta("service_chat:153"), "chat777")
 
     def test_missing_saved_chat_is_replaced(self) -> None:
