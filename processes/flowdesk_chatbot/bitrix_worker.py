@@ -100,6 +100,18 @@ class Runtime:
             0.0,
             float(os.getenv("FLOWDESK_EVENT_RETRY_DELAY", "0.75")),
         )
+        # Keep launcher targets valid without requiring a worker restart.
+        # One batched health check covers up to 50 service chats at a time.
+        self.service_chat_health_active_seconds = max(
+            1.0,
+            float(os.getenv("FLOWDESK_SERVICE_CHAT_HEALTH_ACTIVE_SECONDS", "1.0")),
+        )
+        self.service_chat_health_quiet_seconds = max(
+            1.0,
+            float(os.getenv("FLOWDESK_SERVICE_CHAT_HEALTH_QUIET_SECONDS", "60.0")),
+        )
+        self._next_service_chat_health_check = 0.0
+        self._service_chat_health_cursor = 0
 
     def _load_or_create_bot_token(self) -> str:
         configured = os.getenv("FLOWDESK_BOT_TOKEN", "").strip()
@@ -131,6 +143,15 @@ class Runtime:
     def call_v3(self, method: str, params: dict[str, Any] | None = None) -> Any:
         self._throttle()
         result = self.client.call_v3(method, params or {})
+        self._last_api_call = time.monotonic()
+        return result
+
+    def call_batch(
+        self,
+        commands: dict[str, tuple[str, dict[str, Any]]],
+    ):
+        self._throttle()
+        result = self.client.batch(commands)
         self._last_api_call = time.monotonic()
         return result
 
@@ -414,6 +435,17 @@ class Runtime:
     def get_service_chat(self, user_id: int) -> str:
         return self.store.get_meta(self.service_chat_meta_key(user_id)).strip()
 
+    @staticmethod
+    def chat_user_rows(result: Any) -> list[dict[str, Any]]:
+        if isinstance(result, list):
+            return [row for row in result if isinstance(row, dict)]
+        if isinstance(result, dict):
+            for key in ("users", "items", "result"):
+                value = result.get(key)
+                if isinstance(value, list):
+                    return [row for row in value if isinstance(row, dict)]
+        return []
+
     def service_chat_has_user(self, dialog_id: str, user_id: int) -> bool:
         result = self.call(
             "imbot.v2.Chat.User.list",
@@ -424,15 +456,14 @@ class Runtime:
                 "limit": 200,
             },
         )
-        rows = result if isinstance(result, list) else []
         return any(
             int(row.get("id") or 0) == int(user_id)
-            for row in rows
-            if isinstance(row, dict)
+            for row in self.chat_user_rows(result)
         )
 
     def ensure_service_chat(self, user_id: int, user_name: str = "") -> str:
         existing = self.get_service_chat(user_id)
+        resolved_user_name = (user_name or "").strip()
 
         if existing:
             try:
@@ -450,6 +481,16 @@ class Runtime:
                     and str(chat.get("dialogId") or "") == existing
                 )
                 if chat_exists:
+                    if not resolved_user_name:
+                        old_name = str(
+                            chat.get("name")
+                            or chat.get("title")
+                            or ""
+                        ).strip()
+                        prefix = "DeskFlow — "
+                        if old_name.startswith(prefix):
+                            resolved_user_name = old_name[len(prefix):].strip()
+
                     try:
                         member_ok = self.service_chat_has_user(existing, user_id)
                     except Exception as exc:
@@ -491,7 +532,7 @@ class Runtime:
                     sanitize_error(exc),
                 )
 
-        title_name = (user_name or "").strip() or f"ID {user_id}"
+        title_name = resolved_user_name or f"ID {user_id}"
         chat_fields: dict[str, Any] = {
             "title": f"DeskFlow — {title_name}",
             "description": "Служебный чат для внутренних обращений DeskFlow",
@@ -564,8 +605,9 @@ class Runtime:
                 "BUTTONS": [
                     {
                         "TEXT": "Открыть служебный чат",
-                        "LINK": self.service_chat_link(service_dialog_id),
-                        "BLOCK": "Y",
+                        "ACTION": "DIALOG",
+                        "ACTION_VALUE": service_dialog_id,
+                        "BLOCK": "N",
                         "DISPLAY": "LINE",
                         "BG_COLOR_TOKEN": "primary",
                         "TEXT_COLOR": "#FFFFFF",
@@ -629,6 +671,140 @@ class Runtime:
             message_id,
         )
         return message_id
+
+    def refresh_launcher_target(
+        self,
+        user_id: int,
+        service_dialog_id: str,
+    ) -> bool:
+        message_text = self.store.get_meta(
+            self.launcher_message_meta_key(user_id)
+        ).strip()
+        if not message_text:
+            return False
+
+        try:
+            message_id = int(message_text)
+        except (TypeError, ValueError):
+            return False
+
+        result = self.call(
+            "imbot.v2.Chat.Message.update",
+            {
+                "botId": self.bot_id,
+                "botToken": self.bot_token,
+                "messageId": message_id,
+                "fields": self.launcher_message_fields(service_dialog_id),
+            },
+        )
+        return isinstance(result, dict)
+
+    def recover_service_chat(
+        self,
+        user_id: int,
+        stale_dialog_id: str,
+    ) -> str:
+        new_dialog_id = self.ensure_service_chat(user_id)
+        if new_dialog_id == stale_dialog_id:
+            return new_dialog_id
+
+        self.refresh_launcher_target(user_id, new_dialog_id)
+
+        # Prepare a clean first screen so the replacement chat is immediately
+        # usable when the user presses the launcher.
+        session = self.restart_session(new_dialog_id, user_id)
+        self.render_current(session)
+
+        LOG.info(
+            "Service chat self-healed for user=%s: %s -> %s",
+            user_id,
+            stale_dialog_id,
+            new_dialog_id,
+        )
+        return new_dialog_id
+
+    def reconcile_service_chats_if_due(self) -> None:
+        now = time.monotonic()
+        if now < self._next_service_chat_health_check:
+            return
+
+        interval = poll_interval_seconds(
+            active_seconds=self.service_chat_health_active_seconds,
+            quiet_seconds=self.service_chat_health_quiet_seconds,
+        )
+        self._next_service_chat_health_check = now + interval
+
+        entries = self.store.list_meta("service_chat:")
+        pairs: list[tuple[int, str]] = []
+        for key, dialog_id in entries.items():
+            try:
+                user_id = int(key.split(":", 1)[1])
+            except (IndexError, TypeError, ValueError):
+                continue
+            dialog_id = str(dialog_id or "").strip()
+            if user_id > 0 and dialog_id.startswith("chat"):
+                pairs.append((user_id, dialog_id))
+
+        if not pairs:
+            self._service_chat_health_cursor = 0
+            return
+
+        pairs.sort(key=lambda item: item[0])
+        start = self._service_chat_health_cursor % len(pairs)
+        ordered = pairs[start:] + pairs[:start]
+        batch_pairs = ordered[:50]
+        self._service_chat_health_cursor = (start + len(batch_pairs)) % len(pairs)
+
+        commands = {
+            f"u{user_id}": (
+                "imbot.v2.Chat.User.list",
+                {
+                    "botId": self.bot_id,
+                    "botToken": self.bot_token,
+                    "dialogId": dialog_id,
+                    "limit": 200,
+                },
+            )
+            for user_id, dialog_id in batch_pairs
+        }
+
+        try:
+            batch = self.call_batch(commands)
+        except Exception as exc:
+            LOG.warning(
+                "Service chat health batch failed: %s",
+                sanitize_error(exc),
+            )
+            return
+
+        for user_id, dialog_id in batch_pairs:
+            key = f"u{user_id}"
+            if key in batch.errors:
+                LOG.warning(
+                    "Service chat health check error for user=%s chat=%s: %s",
+                    user_id,
+                    dialog_id,
+                    batch.errors[key],
+                )
+                continue
+
+            rows = self.chat_user_rows(batch.success.get(key))
+            member_ok = any(
+                int(row.get("id") or 0) == user_id
+                for row in rows
+            )
+            if member_ok:
+                continue
+
+            try:
+                self.recover_service_chat(user_id, dialog_id)
+            except Exception as exc:
+                LOG.warning(
+                    "Service chat self-heal failed for user=%s chat=%s: %s",
+                    user_id,
+                    dialog_id,
+                    sanitize_error(exc),
+                )
 
     def refresh_known_launchers(self) -> None:
         """Migrate existing command launchers to direct chat links on restart."""
@@ -1710,6 +1886,8 @@ class Runtime:
 
         while True:
             try:
+                self.reconcile_service_chats_if_due()
+
                 params: dict[str, Any] = {
                     "botId": self.bot_id,
                     "botToken": self.bot_token,
