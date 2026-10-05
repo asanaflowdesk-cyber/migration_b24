@@ -110,15 +110,45 @@ class DeskFlowIntegrityTests(unittest.TestCase):
                 # intentionally fall through into the ordinary appeal flow.
                 self._finish_branch_three(session)
 
-    def test_all_direct_request_types_reach_confirmation(self) -> None:
+    def test_all_direct_request_types_reach_expected_destination(self) -> None:
         for request_type, route in REQUEST_TYPES.items():
             if route == "request_tree":
                 continue
-            with self.subTest(request_type=request_type):
+            with self.subTest(request_type=request_type, route=route):
                 session = new_session(153, "chat999")
                 result = submit_action(session, request_type)
                 self.assertEqual(result["status"], "ok")
-                self._finish_branch_three(session)
+
+                if route == "branch_3":
+                    self._finish_branch_three(session)
+                elif route == "instruction":
+                    self.assertEqual(session["current_screen"], "instruction")
+                    self.assertIn((request_type,), INSTRUCTIONS)
+                    current = view(session)
+                    self.assertTrue(current["terminal"])
+                    self.assertEqual(
+                        [button["action"] for button in current["buttons"]],
+                        ["__new_request__"],
+                    )
+                else:
+                    self.fail(f"Unexpected direct route: {route}")
+
+    def test_marketing_business_cards_is_instruction_leaf(self) -> None:
+        session = new_session(153, "chat999")
+        submit_action(session, "Запрос")
+        submit_action(session, "Маркетологи")
+        submit_action(session, "Заказ визиток")
+
+        self.assertEqual(session["current_screen"], "instruction")
+        current = view(session)
+        self.assertIn(
+            "12K7Nu-iEuqgnW1xEk0roaqnMf19YAfre",
+            current["text"],
+        )
+        self.assertEqual(
+            [button["label"] for button in current["buttons"]],
+            ["Создать новое обращение"],
+        )
 
     def test_every_product_tree_path_is_reachable(self) -> None:
         for insurance_type, classes in PRODUCT_TREE.items():
