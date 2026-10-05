@@ -14,6 +14,7 @@ from urllib.parse import urlsplit
 import requests
 
 from common.bitrix import BitrixClient, BitrixError, sanitize_error
+from processes.flowdesk_chatbot.avatar_asset import SERVICE_CHAT_AVATAR_B64
 from processes.flowdesk_chatbot.engine import (
     mark_task_created,
     new_session,
@@ -294,15 +295,36 @@ class Runtime:
         return f"{dialog_id}:{user_id}"
 
     def load_service_chat_avatar(self) -> tuple[str, str] | None:
-        """Load the configured service-chat avatar and cache its Base64 payload."""
-        if not self.service_chat_avatar_url:
-            return None
+        """Return a stable Base64 avatar for service chats.
 
+        Prefer the bundled approved avatar so the worker does not depend on a
+        browser-authenticated /picture/... URL. The configured URL is kept only
+        as a fallback for future replacements.
+        """
         if self._service_chat_avatar_b64 and self._service_chat_avatar_version:
             return (
                 self._service_chat_avatar_b64,
                 self._service_chat_avatar_version,
             )
+
+        bundled = str(SERVICE_CHAT_AVATAR_B64 or "").strip()
+        if bundled:
+            try:
+                content = base64.b64decode(bundled, validate=True)
+            except Exception as exc:
+                LOG.error(
+                    "Bundled DeskFlow avatar is invalid Base64: %s",
+                    sanitize_error(exc),
+                )
+            else:
+                if content:
+                    version = hashlib.sha256(content).hexdigest()[:16]
+                    self._service_chat_avatar_b64 = bundled
+                    self._service_chat_avatar_version = version
+                    return bundled, version
+
+        if not self.service_chat_avatar_url:
+            return None
 
         try:
             response = requests.get(
@@ -314,7 +336,7 @@ class Runtime:
             response.raise_for_status()
         except Exception as exc:
             LOG.warning(
-                "Service chat avatar could not be loaded from %s: %s",
+                "Service chat avatar fallback could not be loaded from %s: %s",
                 self.service_chat_avatar_url,
                 sanitize_error(exc),
             )
@@ -358,7 +380,7 @@ class Runtime:
         if not force and self.store.get_meta(meta_key).strip() == version:
             return
 
-        self.call(
+        result = self.call(
             "imbot.v2.Chat.update",
             {
                 "botId": self.bot_id,
@@ -369,8 +391,21 @@ class Runtime:
                 },
             },
         )
+
+        ok = result is True or (
+            isinstance(result, dict) and result.get("result") is True
+        )
+        if not ok:
+            raise RuntimeError(
+                f"Chat.update did not confirm avatar update: {result!r}"
+            )
+
         self.store.set_meta(meta_key, version)
-        LOG.info("Service chat avatar applied: dialog=%s version=%s", dialog_id, version)
+        LOG.info(
+            "Service chat avatar applied: dialog=%s version=%s",
+            dialog_id,
+            version,
+        )
 
     @staticmethod
     def service_chat_meta_key(user_id: int) -> str:
@@ -439,11 +474,20 @@ class Runtime:
             raise RuntimeError(f"Chat.add не вернул dialogId группового чата: {result!r}")
 
         self.store.set_meta(self.service_chat_meta_key(user_id), dialog_id)
+
+        # Some on-premise builds accept avatar in Chat.add but still return the
+        # default initials icon. Force one explicit update after creation and
+        # only then mark the avatar version as applied.
         if avatar_version:
-            self.store.set_meta(
-                self.service_chat_avatar_meta_key(dialog_id),
-                avatar_version,
-            )
+            try:
+                self.ensure_service_chat_avatar(dialog_id, force=True)
+            except Exception as exc:
+                LOG.warning(
+                    "New service chat avatar update failed for %s: %s",
+                    dialog_id,
+                    sanitize_error(exc),
+                )
+
         LOG.info("Service chat created for user=%s: %s", user_id, dialog_id)
         return dialog_id
 
