@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import logging
 import os
 import secrets
@@ -8,6 +10,8 @@ import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
+
+import requests
 
 from common.bitrix import BitrixClient, BitrixError, sanitize_error
 from processes.flowdesk_chatbot.engine import (
@@ -66,6 +70,12 @@ class Runtime:
             f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else ""
         )
         self.task_user_fields: set[str] = set()
+        self.service_chat_avatar_url = os.getenv(
+            "FLOWDESK_SERVICE_CHAT_AVATAR_URL",
+            "https://bitrix.theeurasia.kz/picture/K2blnYG5Z7Cm0teajIEf",
+        ).strip()
+        self._service_chat_avatar_b64: str | None = None
+        self._service_chat_avatar_version: str | None = None
         # Cache the last text-field state per dialog. Most DeskFlow screens are
         # button-only; repeating the same Bitrix UI toggle on every click costs
         # one extra REST roundtrip and one throttle slot for no visible benefit.
@@ -283,6 +293,85 @@ class Runtime:
     def session_key(dialog_id: str, user_id: int) -> str:
         return f"{dialog_id}:{user_id}"
 
+    def load_service_chat_avatar(self) -> tuple[str, str] | None:
+        """Load the configured service-chat avatar and cache its Base64 payload."""
+        if not self.service_chat_avatar_url:
+            return None
+
+        if self._service_chat_avatar_b64 and self._service_chat_avatar_version:
+            return (
+                self._service_chat_avatar_b64,
+                self._service_chat_avatar_version,
+            )
+
+        try:
+            response = requests.get(
+                self.service_chat_avatar_url,
+                timeout=20,
+                allow_redirects=True,
+                headers={"User-Agent": "DeskFlow/1.0"},
+            )
+            response.raise_for_status()
+        except Exception as exc:
+            LOG.warning(
+                "Service chat avatar could not be loaded from %s: %s",
+                self.service_chat_avatar_url,
+                sanitize_error(exc),
+            )
+            return None
+
+        content = bytes(response.content or b"")
+        content_type = str(response.headers.get("Content-Type") or "").casefold()
+        if not content:
+            LOG.warning("Service chat avatar response was empty")
+            return None
+
+        if content_type and not content_type.startswith("image/"):
+            LOG.warning(
+                "Service chat avatar URL returned non-image content-type=%s",
+                content_type,
+            )
+            return None
+
+        avatar_b64 = base64.b64encode(content).decode("ascii")
+        version = hashlib.sha256(content).hexdigest()[:16]
+        self._service_chat_avatar_b64 = avatar_b64
+        self._service_chat_avatar_version = version
+        return avatar_b64, version
+
+    @staticmethod
+    def service_chat_avatar_meta_key(dialog_id: str) -> str:
+        return f"service_chat_avatar:{dialog_id}"
+
+    def ensure_service_chat_avatar(
+        self,
+        dialog_id: str,
+        *,
+        force: bool = False,
+    ) -> None:
+        avatar = self.load_service_chat_avatar()
+        if avatar is None:
+            return
+
+        avatar_b64, version = avatar
+        meta_key = self.service_chat_avatar_meta_key(dialog_id)
+        if not force and self.store.get_meta(meta_key).strip() == version:
+            return
+
+        self.call(
+            "imbot.v2.Chat.update",
+            {
+                "botId": self.bot_id,
+                "botToken": self.bot_token,
+                "dialogId": dialog_id,
+                "fields": {
+                    "avatar": avatar_b64,
+                },
+            },
+        )
+        self.store.set_meta(meta_key, version)
+        LOG.info("Service chat avatar applied: dialog=%s version=%s", dialog_id, version)
+
     @staticmethod
     def service_chat_meta_key(user_id: int) -> str:
         return f"service_chat:{int(user_id)}"
@@ -305,6 +394,14 @@ class Runtime:
                 )
                 chat = result.get("chat") if isinstance(result, dict) else None
                 if isinstance(chat, dict) and str(chat.get("dialogId") or "") == existing:
+                    try:
+                        self.ensure_service_chat_avatar(existing)
+                    except Exception as exc:
+                        LOG.warning(
+                            "Existing service chat avatar update failed for %s: %s",
+                            existing,
+                            sanitize_error(exc),
+                        )
                     return existing
             except Exception as exc:
                 LOG.warning(
@@ -315,16 +412,24 @@ class Runtime:
                 )
 
         title_name = (user_name or "").strip() or f"ID {user_id}"
+        chat_fields: dict[str, Any] = {
+            "title": f"DeskFlow — {title_name}",
+            "description": "Служебный чат для внутренних обращений DeskFlow",
+            "userIds": [int(user_id)],
+        }
+
+        avatar = self.load_service_chat_avatar()
+        avatar_version = None
+        if avatar is not None:
+            avatar_b64, avatar_version = avatar
+            chat_fields["avatar"] = avatar_b64
+
         result = self.call(
             "imbot.v2.Chat.add",
             {
                 "botId": self.bot_id,
                 "botToken": self.bot_token,
-                "fields": {
-                    "title": f"DeskFlow — {title_name}",
-                    "description": "Служебный чат для внутренних обращений DeskFlow",
-                    "userIds": [int(user_id)],
-                },
+                "fields": chat_fields,
             },
         )
 
@@ -334,6 +439,11 @@ class Runtime:
             raise RuntimeError(f"Chat.add не вернул dialogId группового чата: {result!r}")
 
         self.store.set_meta(self.service_chat_meta_key(user_id), dialog_id)
+        if avatar_version:
+            self.store.set_meta(
+                self.service_chat_avatar_meta_key(dialog_id),
+                avatar_version,
+            )
         LOG.info("Service chat created for user=%s: %s", user_id, dialog_id)
         return dialog_id
 
