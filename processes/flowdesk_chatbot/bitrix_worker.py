@@ -491,6 +491,83 @@ class Runtime:
         LOG.info("Service chat created for user=%s: %s", user_id, dialog_id)
         return dialog_id
 
+    @staticmethod
+    def launcher_message_meta_key(user_id: int) -> str:
+        return f"launcher_message:{int(user_id)}"
+
+    def launcher_message_fields(self) -> dict[str, Any]:
+        return {
+            "message": (
+                "[b]DeskFlow готов к работе 🙂[/b]\n"
+                "Нажми кнопку ниже — я открою служебный чат для обращения."
+            ),
+            "keyboard": {
+                "BOT_ID": self.bot_id,
+                "BUTTONS": [
+                    {
+                        "TEXT": "Открыть DeskFlow",
+                        "COMMAND": f"/{self.command_name}",
+                        "COMMAND_PARAMS": "launcher",
+                        "BLOCK": "Y",
+                        "DISPLAY": "LINE",
+                        "BG_COLOR_TOKEN": "primary",
+                        "TEXT_COLOR": "#FFFFFF",
+                    }
+                ],
+            },
+        }
+
+    def ensure_launcher_message(self, user_id: int, dialog_id: str) -> int:
+        """Keep one reusable launcher button in the personal bot dialog."""
+        meta_key = self.launcher_message_meta_key(user_id)
+        existing_text = self.store.get_meta(meta_key).strip()
+        fields = self.launcher_message_fields()
+
+        if existing_text:
+            try:
+                message_id = int(existing_text)
+                result = self.call(
+                    "imbot.v2.Chat.Message.update",
+                    {
+                        "botId": self.bot_id,
+                        "botToken": self.bot_token,
+                        "messageId": message_id,
+                        "fields": fields,
+                    },
+                )
+                if isinstance(result, dict):
+                    return message_id
+            except Exception as exc:
+                LOG.warning(
+                    "Launcher message %s could not be refreshed for user=%s: %s",
+                    existing_text,
+                    user_id,
+                    sanitize_error(exc),
+                )
+
+        result = self.call(
+            "imbot.v2.Chat.Message.send",
+            {
+                "botId": self.bot_id,
+                "botToken": self.bot_token,
+                "dialogId": dialog_id,
+                "fields": fields,
+            },
+        )
+        if not isinstance(result, dict) or not result.get("id"):
+            raise RuntimeError(
+                f"Launcher Message.send не вернул id: {result!r}"
+            )
+
+        message_id = int(result["id"])
+        self.store.set_meta(meta_key, message_id)
+        LOG.info(
+            "Launcher button message created for user=%s message=%s",
+            user_id,
+            message_id,
+        )
+        return message_id
+
     def delete_chat_message(self, message_id: int) -> bool:
         if not message_id:
             return False
@@ -1170,9 +1247,17 @@ class Runtime:
         )
 
         if text.casefold() in TRIGGERS:
-            # A trigger may arrive in the old personal dialog. The actual UI
-            # always lives in a bot-owned service chat where DeskFlow is owner.
+            # A trigger may arrive in the old personal dialog. Keep a reusable
+            # launcher button there so the user will not need to type SOS again.
             if not is_service_chat:
+                try:
+                    self.ensure_launcher_message(user_id, source_dialog_id)
+                except Exception as exc:
+                    LOG.warning(
+                        "Launcher button could not be prepared for user=%s: %s",
+                        user_id,
+                        sanitize_error(exc),
+                    )
                 service_dialog_id = self.ensure_service_chat(user_id, user_name)
             else:
                 service_dialog_id = source_dialog_id
@@ -1358,11 +1443,10 @@ class Runtime:
         if dialog_id.startswith("chat"):
             return
 
-        # The personal bot dialog is only a launcher.
-        self.send(
-            dialog_id,
-            "Напишите «SOS». DeskFlow откроет ваш служебный чат обращения.",
-        )
+        # The personal bot dialog is only a launcher. The button calls the
+        # same command handler as the in-chat keyboards and opens the service
+        # chat directly; no synthetic SOS message is needed.
+        self.ensure_launcher_message(user_id, dialog_id)
 
     def handle_event(self, event: dict[str, Any]) -> None:
         event_type = str(event.get("type") or "")
