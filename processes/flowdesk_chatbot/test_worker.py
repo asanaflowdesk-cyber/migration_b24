@@ -50,7 +50,7 @@ class DeskFlowWorkerTests(unittest.TestCase):
         runtime.event_retry_delay = 0.0
         return runtime
 
-    def test_service_chat_avatar_download_is_base64_encoded_and_cached(self) -> None:
+    def test_service_chat_avatar_url_is_only_fallback(self) -> None:
         runtime = self.runtime()
 
         class Response:
@@ -61,10 +61,16 @@ class DeskFlowWorkerTests(unittest.TestCase):
             def raise_for_status():
                 return None
 
-        with patch(
-            "processes.flowdesk_chatbot.bitrix_worker.requests.get",
-            return_value=Response(),
-        ) as get:
+        with (
+            patch(
+                "processes.flowdesk_chatbot.bitrix_worker.SERVICE_CHAT_AVATAR_B64",
+                "",
+            ),
+            patch(
+                "processes.flowdesk_chatbot.bitrix_worker.requests.get",
+                return_value=Response(),
+            ) as get,
+        ):
             first = runtime.load_service_chat_avatar()
             second = runtime.load_service_chat_avatar()
 
@@ -85,6 +91,9 @@ class DeskFlowWorkerTests(unittest.TestCase):
             calls.append((method, params))
             if method == "imbot.v2.Chat.add":
                 return {"chat": {"dialogId": "chat501"}}
+            if method == "imbot.v2.Chat.update":
+                self.assertEqual(params["fields"]["avatar"], "BASE64_AVATAR")
+                return {"result": True}
             raise AssertionError(f"Unexpected method: {method}")
 
         runtime.call = fake_call
