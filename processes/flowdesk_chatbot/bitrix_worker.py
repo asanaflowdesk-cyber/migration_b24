@@ -414,6 +414,59 @@ class Runtime:
     def get_service_chat(self, user_id: int) -> str:
         return self.store.get_meta(self.service_chat_meta_key(user_id)).strip()
 
+    def service_chat_has_user(self, dialog_id: str, user_id: int) -> bool:
+        result = self.call(
+            "imbot.v2.Chat.User.list",
+            {
+                "botId": self.bot_id,
+                "botToken": self.bot_token,
+                "dialogId": dialog_id,
+                "limit": 200,
+            },
+        )
+        rows = result if isinstance(result, list) else []
+        return any(
+            int(row.get("id") or 0) == int(user_id)
+            for row in rows
+            if isinstance(row, dict)
+        )
+
+    def restore_service_chat_user(self, dialog_id: str, user_id: int) -> bool:
+        if self.service_chat_has_user(dialog_id, user_id):
+            return True
+
+        LOG.warning(
+            "DeskFlow user=%s is missing from saved service chat=%s; restoring membership",
+            user_id,
+            dialog_id,
+        )
+
+        result = self.call(
+            "imbot.v2.Chat.User.add",
+            {
+                "botId": self.bot_id,
+                "botToken": self.bot_token,
+                "dialogId": dialog_id,
+                "userIds": [int(user_id)],
+            },
+        )
+
+        ok = result is True or (
+            isinstance(result, dict) and result.get("result") is True
+        )
+        if not ok:
+            LOG.warning(
+                "Chat.User.add returned unexpected result for user=%s chat=%s: %r",
+                user_id,
+                dialog_id,
+                result,
+            )
+            return False
+
+        # Do not trust a nominal success blindly: verify that the employee is
+        # actually back in the chat before reusing the stored dialog id.
+        return self.service_chat_has_user(dialog_id, user_id)
+
     def ensure_service_chat(self, user_id: int, user_name: str = "") -> str:
         existing = self.get_service_chat(user_id)
 
@@ -428,16 +481,43 @@ class Runtime:
                     },
                 )
                 chat = result.get("chat") if isinstance(result, dict) else None
-                if isinstance(chat, dict) and str(chat.get("dialogId") or "") == existing:
+                chat_exists = (
+                    isinstance(chat, dict)
+                    and str(chat.get("dialogId") or "") == existing
+                )
+                if chat_exists:
                     try:
-                        self.ensure_service_chat_avatar(existing)
+                        member_ok = self.restore_service_chat_user(
+                            existing,
+                            user_id,
+                        )
                     except Exception as exc:
+                        member_ok = False
                         LOG.warning(
-                            "Existing service chat avatar update failed for %s: %s",
+                            "Saved service chat membership check failed "
+                            "for user=%s chat=%s: %s",
+                            user_id,
                             existing,
                             sanitize_error(exc),
                         )
-                    return existing
+
+                    if member_ok:
+                        try:
+                            self.ensure_service_chat_avatar(existing)
+                        except Exception as exc:
+                            LOG.warning(
+                                "Existing service chat avatar update failed for %s: %s",
+                                existing,
+                                sanitize_error(exc),
+                            )
+                        return existing
+
+                    LOG.warning(
+                        "Saved service chat %s cannot be restored for user=%s; "
+                        "a replacement chat will be created",
+                        existing,
+                        user_id,
+                    )
             except Exception as exc:
                 LOG.warning(
                     "Saved service chat %s is unavailable for user=%s: %s",
@@ -474,6 +554,13 @@ class Runtime:
             raise RuntimeError(f"Chat.add не вернул dialogId группового чата: {result!r}")
 
         self.store.set_meta(self.service_chat_meta_key(user_id), dialog_id)
+        if existing and existing != dialog_id:
+            LOG.info(
+                "Service chat replaced for user=%s: %s -> %s",
+                user_id,
+                existing,
+                dialog_id,
+            )
 
         # Some on-premise builds accept avatar in Chat.add but still return the
         # default initials icon. Force one explicit update after creation and
@@ -594,8 +681,14 @@ class Runtime:
             except (IndexError, TypeError, ValueError):
                 continue
 
-            service_dialog_id = self.get_service_chat(user_id)
-            if not service_dialog_id:
+            try:
+                service_dialog_id = self.ensure_service_chat(user_id)
+            except Exception as exc:
+                LOG.warning(
+                    "Service chat recovery failed for launcher user=%s: %s",
+                    user_id,
+                    sanitize_error(exc),
+                )
                 continue
 
             try:
