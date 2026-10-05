@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 
 
@@ -129,6 +130,7 @@ def wait_for_recovery(proc: subprocess.Popen, report: Path, started: float, time
         if report.exists() and report.stat().st_mtime >= started:
             data = json.loads(report.read_text(encoding="utf-8"))
             print("[DEPLOY RECOVERY] " + json.dumps(data["summary"], ensure_ascii=False))
+            print("[DEPLOY SKIPS] " + json.dumps(dict(Counter(item.get("type", "unknown") for item in data.get("skipped", []))), ensure_ascii=False))
             sources: dict[int, dict] = {}
             for row in data.get("changes", []):
                 source_id = int(row["source_contact_id"])

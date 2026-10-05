@@ -348,6 +348,12 @@ def process_claim(
             })
 
     valid_jobs, aliases = _coalesce_and_partition(raw_jobs)
+    # Persist the selected event intent before any CRM write. A partial transfer
+    # must not let recovery revert to a previous duplicate's recorded source.
+    remember_authority_sources(output_dir, [
+        {"status": "ACCEPTED", "fio": job["package"].get("fio"), "contact_id": job["contact_id"]}
+        for job in valid_jobs
+    ])
     duplicate_events = max(len(raw_jobs) - len(valid_jobs), 0)
     overlap_count = sum(
         1

@@ -6,7 +6,8 @@ does not count as a drained queue.
 
 The authority is a lead-linked director/founder contact, never DATE_MODIFY.
 An unlinked duplicate cannot drive a package when a linked contact exists.
-A completed event's source is persisted outside runtime. Without event history,
+An accepted event's source is persisted outside runtime before CRM writes, so
+a partial transfer cannot revert to the previous event's source. Without history,
 conflicting linked owners are skipped rather than guessed.
 
 Recovery updates only ASSIGNED_BY_ID on package contacts, companies and leads.

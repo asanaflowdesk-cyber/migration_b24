@@ -16,11 +16,11 @@ def load_authority_sources(output_dir: Path) -> dict[str, int]:
 
 
 def remember_authority_sources(output_dir: Path, operations: list[dict[str, Any]]) -> None:
-    completed = [operation for operation in operations if operation.get("status") == "DONE" and operation.get("fio") and operation.get("contact_id")]
-    if not completed:
+    accepted = [operation for operation in operations if operation.get("status") in {"ACCEPTED", "DONE"} and operation.get("fio") and operation.get("contact_id")]
+    if not accepted:
         return
     sources = load_authority_sources(output_dir)
-    for operation in completed:
+    for operation in accepted:
         sources[str(operation["fio"])] = int(operation["contact_id"])
     output_dir.mkdir(parents=True, exist_ok=True)
     temporary = output_dir / "authority_sources.json.tmp"

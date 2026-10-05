@@ -123,3 +123,25 @@ def test_event_authority_survives_worker_restart(tmp_path):
     assert repair_package_residuals(crm, tmp_path)["status"] == "DONE"
     assert_owner(crm, 69)
     assert json.loads((tmp_path / "recovery.json").read_text())["summary"]["updated"] == 1
+
+
+def test_partial_new_event_cannot_restore_previous_duplicate_authority(tmp_path):
+    crm = CRM()
+    crm.leads[2625]["CONTACT_ID"] = "838"
+    packages, _ = build_packages(list(crm.companies.values()), list(crm.leads.values()), list(crm.contacts.values()), crm.requisites)
+    remember_authority_sources(tmp_path, [{"status": "DONE", "fio": packages[0]["fio"], "contact_id": 838}])
+    update_lead = crm.update_lead
+
+    def blocked_write(item_id, fields):
+        if int(item_id) != 2624:
+            update_lead(item_id, fields)
+
+    crm.update_lead = blocked_write
+    results, failures = process_claim(crm, tmp_path, {"claim_id": "test", "items": [{"contact_id": 837, "version": 1}]})
+    assert failures == 1
+    assert results[0]["status"] == "PARTIAL"
+    assert list(load_authority_sources(tmp_path).values()) == [837]
+    crm.update_lead = update_lead
+    crm.contacts[837]["ASSIGNED_BY_ID"] = "70"
+    assert repair_package_residuals(crm, tmp_path)["status"] == "DONE"
+    assert_owner(crm, 70)

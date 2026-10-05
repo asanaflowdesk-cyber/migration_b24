@@ -78,7 +78,7 @@ def resolve_authority_packages(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Resolve from CONTACT_ID of package leads, never from DATE_MODIFY.
 
-    The source of a completed owner-change event stays authoritative for its
+    The source of an accepted owner-change event stays authoritative for its
     package. Without that event history, competing lead-linked contacts must
     agree. Unlinked duplicate contacts are targets, not competing authorities.
     ``leads=None`` is retained for callers holding a preselected package.
