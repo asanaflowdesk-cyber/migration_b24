@@ -112,6 +112,19 @@ class SessionStore:
             row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
         return default if row is None else str(row[0])
 
+    def list_meta(self, prefix: str = "") -> dict[str, str]:
+        with self._connection() as conn:
+            if prefix:
+                rows = conn.execute(
+                    "SELECT key, value FROM meta WHERE key LIKE ? ORDER BY key",
+                    (f"{prefix}%",),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT key, value FROM meta ORDER BY key"
+                ).fetchall()
+        return {str(key): str(value) for key, value in rows}
+
     def set_meta(self, key: str, value: str | int) -> None:
         with self._connection() as conn:
             conn.execute(
