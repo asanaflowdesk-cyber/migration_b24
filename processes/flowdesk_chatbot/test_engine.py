@@ -79,11 +79,12 @@ class DeskFlowEngineTests(unittest.TestCase):
 
         labels = [button["label"] for button in current["buttons"]]
         self.assertEqual(
-            labels[:6],
+            labels[:7],
             [
                 "Запрос",
                 "Предложение / Идея",
                 "Вопрос / Уточнение",
+                "Калькулятор ОГПО ВТС",
                 "Горит контракт",
                 "Жалоба",
                 "Другое",
@@ -95,6 +96,37 @@ class DeskFlowEngineTests(unittest.TestCase):
         self.assertEqual(styles["Горит контракт"], "alert")
         self.assertEqual(styles["Жалоба"], "alert")
         self.assertEqual(styles["Другое"], "primary")
+
+    def test_calculator_request_type_opens_instruction_without_task(self) -> None:
+        session = new_session(153, "chat999")
+
+        result = submit_action(session, "Калькулятор ОГПО ВТС")
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(session["current_screen"], "instruction")
+        current = view(session)
+        self.assertFalse(current["accepts_text"])
+        self.assertTrue(current["terminal"])
+        self.assertIn("Скачать Excel-файл", current["text"])
+        self.assertIn(
+            "https://bitrix.theeurasia.kz/bitrix/tools/disk/focus.php?objectId=235",
+            current["text"],
+        )
+        self.assertIn(
+            "1sjoARC6DGuwNoztoQ2HJaU8iDgpdXxiQ",
+            current["text"],
+        )
+        self.assertEqual(
+            [button["label"] for button in current["buttons"]],
+            ["Создать новое обращение"],
+        )
+
+    def test_instruction_exit_restarts_cleanly(self) -> None:
+        session = new_session(153, "chat999")
+        submit_action(session, "Калькулятор ОГПО ВТС")
+        result = submit_action(session, "__new_request__")
+
+        self.assertEqual(result["status"], "restart_requested")
 
     def test_button_screen_is_locked_and_back_is_primary(self) -> None:
         session = new_session(153, "chat999")
