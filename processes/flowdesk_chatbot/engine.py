@@ -463,10 +463,22 @@ def view(session: dict[str, Any]) -> dict[str, Any]:
             _button("Запрос", "Запрос", "secondary"),
             _button("Предложение / Идея", "Предложение / Идея", "secondary"),
             _button("Вопрос / Уточнение", "Вопрос / Уточнение", "secondary"),
-            _button("Горит контракт", "Горит контракт", "alert"),
-            _button("Жалоба", "Жалоба", "alert"),
-            _button("Другое", "Другое", "primary"),
         ]
+        if not session.get("edit_mode"):
+            buttons.append(
+                _button(
+                    "Калькулятор ОГПО ВТС",
+                    "Калькулятор ОГПО ВТС",
+                    "secondary",
+                )
+            )
+        buttons.extend(
+            [
+                _button("Горит контракт", "Горит контракт", "alert"),
+                _button("Жалоба", "Жалоба", "alert"),
+                _button("Другое", "Другое", "primary"),
+            ]
+        )
         if not session.get("edit_mode") and session.get("history_has_more"):
             buttons.append(_button("Показать ещё", ACTION_HISTORY_MORE, "secondary"))
 
@@ -596,6 +608,9 @@ def view(session: dict[str, Any]) -> dict[str, Any]:
     elif screen == "instruction":
         path = tuple(session.get("instruction_path") or [])
         text = INSTRUCTIONS[path]
+        buttons = [
+            _button("Создать новое обращение", ACTION_NEW_REQUEST, "primary"),
+        ]
         terminal = True
 
     elif screen == "done":
@@ -783,12 +798,19 @@ def submit_action(session: dict[str, Any], action: str) -> dict[str, Any]:
         if session.get("edit_mode"):
             if route == "request_tree":
                 session["current_screen"] = "target"
-            else:
+            elif route == "branch_3":
                 _finish_edit(session)
+            else:
+                raise ValueError(
+                    "Инструкционный тип нельзя выбрать при редактировании обращения"
+                )
         elif route == "request_tree":
             session["current_screen"] = "target"
         elif route == "branch_3":
             session["current_screen"] = "description"
+        elif route == "instruction":
+            session["instruction_path"] = [action]
+            session["current_screen"] = "instruction"
         else:
             raise ValueError(f"Неизвестный стартовый маршрут: {route}")
 
