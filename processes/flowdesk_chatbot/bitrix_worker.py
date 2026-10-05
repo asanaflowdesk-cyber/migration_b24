@@ -849,12 +849,6 @@ class Runtime:
         key = self.session_key(session["dialog_id"], int(session["user_id"]))
         self.store.put_session(key, session)
 
-        if current["terminal"] and current["screen"] == "instruction":
-            session["current_screen"] = "done"
-            session["history"] = []
-            session["revision"] = int(session["revision"]) + 1
-            self.store.put_session(key, session)
-
     def find_existing_task(self, xml_id: str) -> str:
         result = self.call(
             "tasks.task.list",
