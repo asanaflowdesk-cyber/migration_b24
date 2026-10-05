@@ -205,13 +205,26 @@ class DeskFlowIntegrityTests(unittest.TestCase):
                     self.assertIn(field_name, DETAIL_FIELDS)
                     self.assertIn(field_name, VALID_DETAIL_VALUES)
 
-    def test_instruction_keys_point_to_instruction_leaves(self) -> None:
+    def test_instruction_keys_point_to_instruction_routes(self) -> None:
         leaf_routes = {
             path: leaf["route"]
             for path, leaf in iter_request_leaves(REQUEST_TREE)
         }
+        direct_instruction_paths = {
+            (request_type,)
+            for request_type, route in REQUEST_TYPES.items()
+            if route == "instruction"
+        }
+
         for path in INSTRUCTIONS:
             with self.subTest(path=path):
+                if path in direct_instruction_paths:
+                    self.assertEqual(
+                        REQUEST_TYPES[path[0]],
+                        "instruction",
+                    )
+                    continue
+
                 self.assertIn(path, leaf_routes)
                 self.assertEqual(leaf_routes[path], "instruction")
 
