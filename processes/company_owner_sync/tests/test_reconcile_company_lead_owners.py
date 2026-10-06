@@ -138,6 +138,22 @@ def test_direct_contact_lead_from_any_package_card_is_reconciled_once():
     }
 
 
+def test_apply_accepts_lead_linked_contact_without_role_or_marker():
+    source = package()
+    source["authority_contact_ids"] = [100]
+    plain = contact(100, 17, "")
+    plain["COMMENTS"] = ""
+    client = Client([plain], company_owner=9, lead_owner=8)
+
+    rows, error = reconcile_package(client, source, apply=True)
+
+    assert error == ""
+    assert client.companies[10]["ASSIGNED_BY_ID"] == 17
+    assert client.leads[20]["ASSIGNED_BY_ID"] == 17
+    assert all(row["target"] == 17 for row in rows)
+    assert all(row["status"] == "updated" for row in rows)
+
+
 def test_apply_mirrors_company_and_lead_to_live_director_owner():
     source = package()
     source["authority_contact_ids"] = [100]

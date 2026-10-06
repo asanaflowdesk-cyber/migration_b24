@@ -18,7 +18,6 @@ from sync_founder_packages import (
     build_packages,
     load,
     normalized_id,
-    is_founder_contact,
     write_report,
     write_summary,
 )
@@ -29,8 +28,8 @@ MAX_STABILIZE_ROUNDS = 3
 
 
 def is_director_authority_contact(contact: dict[str, Any]) -> bool:
-    """A lead-linked director/founder contact is the ownership authority."""
-    return is_founder_contact(contact)
+    """Compatibility predicate: authority is established by CRM linkage, not card text."""
+    return normalized_id(contact.get("ID")) is not None
 
 
 def _clone_client(client: BitrixClient) -> BitrixClient:
@@ -274,8 +273,6 @@ def live_authority_owner(
             return None, None, "director_contact_missing"
         if normalized_id(value.get("ID")) not in {None, contact_id}:
             return None, None, "director_contact_identity_changed"
-        if not is_director_authority_contact(value):
-            return None, None, "director_contact_no_longer_authority"
         if not normalized_id(value.get("ASSIGNED_BY_ID")):
             return None, None, "director_contact_without_owner"
         contacts.append(value)
