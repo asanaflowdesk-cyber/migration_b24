@@ -288,6 +288,11 @@ def process_claim(
         for contact in snapshot["contacts"]
         if (contact_id := normalized_id(contact.get("ID"))) is not None
     }
+    linked_contact_ids = {
+        contact_id
+        for lead in snapshot["leads"]
+        if (contact_id := normalized_id(lead.get("CONTACT_ID"))) is not None
+    }
     unresolved: set[int] = set()
     ignored: set[int] = set()
     missing: set[int] = set()
@@ -299,7 +304,7 @@ def process_claim(
             contact = contacts_by_id.get(contact_id)
             if contact is None:
                 missing.add(contact_id)
-            elif not is_founder_contact(contact):
+            elif contact_id not in linked_contact_ids and not is_founder_contact(contact):
                 ignored.add(contact_id)
             else:
                 unresolved.add(contact_id)

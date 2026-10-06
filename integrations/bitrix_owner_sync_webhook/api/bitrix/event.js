@@ -32,12 +32,6 @@ function parseBody(request) {
   return {};
 }
 
-function isFounderContact(contact) {
-  const post = String(contact?.POST || "").toLocaleLowerCase("ru-RU");
-  const comments = String(contact?.COMMENTS || "");
-  return post.includes("руковод") || post.includes("директор") || post.includes("учред") || comments.toLocaleLowerCase("ru-RU").includes("eqazyna_director:");
-}
-
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -160,9 +154,6 @@ export default async function handler(request, response) {
   if (!expectedDomain || actualDomain !== expectedDomain) return response.status(403).json({error: "unexpected_bitrix_domain"});
 
   const changedContact = await fetchChangedContact(body, contactId);
-  if (changedContact && !isFounderContact(changedContact)) {
-    return response.status(202).json({accepted: true, queued: false, dispatched: false, reason: "ordinary_contact", contact_id: contactId});
-  }
 
   let queued;
   try {

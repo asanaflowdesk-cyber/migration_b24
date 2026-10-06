@@ -132,6 +132,25 @@ def test_update_plan_contains_auditable_before_and_after_values():
     ]
 
 
+
+def test_lead_linked_contact_does_not_need_role_or_marker():
+    plain_contact = contact(100, "Иванов Иван Иванович", 17, 10)
+    plain_contact["POST"] = ""
+    plain_contact["COMMENTS"] = ""
+    packages, skipped = build_packages(
+        [company(10, 9)],
+        [lead(1, 10, 8, 100)],
+        [plain_contact],
+        [],
+    )
+    assert skipped == []
+    assert len(packages) == 1
+    assert packages[0]["source_contact_id"] == 100
+    assert {(row["entity"], row["id"], row["target"]) for row in build_update_rows(packages)} == {
+        ("company", 10, 17),
+        ("lead", 1, 17),
+    }
+
 def test_fio_requires_last_and_first_name():
     assert person_from_text("Иванов") is None
 

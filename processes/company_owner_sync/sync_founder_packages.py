@@ -115,7 +115,18 @@ def build_packages(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     companies = list(companies)
     leads = list(leads)
-    contacts = [item for item in contacts if is_founder_contact(item)]
+    linked_contact_ids = {
+        contact_id
+        for lead in leads
+        if (contact_id := normalized_id(lead.get("CONTACT_ID"))) is not None
+    }
+    # A role/marker in the contact card is optional. A real CRM relation
+    # lead.CONTACT_ID is sufficient to make the contact an ownership source.
+    # Keep the legacy marker path for old packages that do not yet have a lead link.
+    contacts = [
+        item for item in contacts
+        if is_founder_contact(item) or normalized_id(item.get("ID")) in linked_contact_ids
+    ]
     requisites = list(requisites)
     contact_keys, requisite_keys, ambiguous_bases = _resolved_person_keys(contacts, requisites)
 
@@ -188,7 +199,14 @@ def build_packages(
             ),
             None,
         )
-        owned_contacts = [item for item in group_contacts if normalized_id(item.get("ASSIGNED_BY_ID"))]
+        linked_group_contacts = [
+            item for item in group_contacts
+            if normalized_id(item.get("ID")) in linked_contact_ids
+        ]
+        # Prefer the contact that is actually linked from a lead. Legacy
+        # card markers are fallback only for packages without CONTACT_ID yet.
+        source_candidates = linked_group_contacts or group_contacts
+        owned_contacts = [item for item in source_candidates if normalized_id(item.get("ASSIGNED_BY_ID"))]
         if not owned_contacts:
             skipped.append({"type": "founder_without_owner", "fio": display_person(key)})
             continue
@@ -289,8 +307,8 @@ def apply_updates(client: BitrixClient, rows: list[dict[str, Any]]) -> None:
             if source_id in blocked:
                 raise RuntimeError("package_stopped_after_error; rerun with fresh CRM data")
             source = client.call("crm.contact.get", {"id": source_id})
-            if not isinstance(source, dict) or not is_founder_contact(source):
-                raise RuntimeError("source_missing_or_no_longer_founder")
+            if not isinstance(source, dict):
+                raise RuntimeError("source_contact_not_found")
             if normalized_id(source.get("ASSIGNED_BY_ID")) != row["target"]:
                 raise RuntimeError("source_owner_changed; rerun with fresh CRM data")
             current = client.call(f"crm.{row['entity']}.get", {"id": row["id"]})
@@ -418,15 +436,6 @@ def run(
             }
             write_summary(output_dir, summary)
             return summary
-        if not is_founder_contact(source_contact):
-            summary = {
-                "source_contact_id": source_contact_id,
-                "ignored": 1,
-                "errors": 0,
-                "reason": "not_founder_or_director",
-            }
-            write_summary(output_dir, summary)
-            return summary
         if not normalized_id(source_contact.get("ASSIGNED_BY_ID")):
             summary = {
                 "source_contact_id": source_contact_id,
@@ -485,7 +494,7 @@ def run(
     # The full scan can take minutes. Refresh the source after it, before planning.
     for package in packages:
         source = client.call("crm.contact.get", {"id": package["source_contact_id"]})
-        if not isinstance(source, dict) or not is_founder_contact(source) or not normalized_id(source.get("ASSIGNED_BY_ID")):
+        if not isinstance(source, dict) or not normalized_id(source.get("ASSIGNED_BY_ID")):
             summary = {"errors": 1, "reason": "source_invalid_after_scan", "source_contact_id": package["source_contact_id"]}
             write_summary(output_dir, summary)
             return summary

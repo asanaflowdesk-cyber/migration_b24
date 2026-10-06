@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from sync_founder_packages import apply_updates, build_update_rows, is_founder_contact, normalized_id
+from sync_founder_packages import apply_updates, build_update_rows, normalized_id
 
 ProgressCallback = Callable[[dict[str, Any], list[dict[str, Any]]], None]
 
@@ -144,8 +144,6 @@ def process_package(
     source = client.call("crm.contact.get", {"id": source_contact_id})
     if not isinstance(source, dict):
         return {"success": False, "retryable": False, "reason": "source_contact_not_found", "status": "MANUAL_REVIEW", "operation": {}, "items": []}
-    if not is_founder_contact(source):
-        return {"success": True, "retryable": False, "reason": "not_founder_or_director", "status": "IGNORED", "operation": {}, "items": []}
     target_owner_id = normalized_id(source.get("ASSIGNED_BY_ID"))
     if not target_owner_id:
         return {"success": False, "retryable": False, "reason": "source_contact_without_owner", "status": "MANUAL_REVIEW", "operation": {}, "items": []}
@@ -193,9 +191,9 @@ def process_package(
 
     for round_no in range(max_reconcile_rounds + 1):
         source_now = client.call("crm.contact.get", {"id": source_contact_id})
-        if not isinstance(source_now, dict) or not is_founder_contact(source_now):
+        if not isinstance(source_now, dict):
             operation["status"] = "MANUAL_REVIEW"
-            operation["last_error"] = "source_missing_or_no_longer_founder"
+            operation["last_error"] = "source_contact_not_found"
             break
         if normalized_id(source_now.get("ASSIGNED_BY_ID")) != target_owner_id:
             operation["status"] = "MANUAL_REVIEW"

@@ -135,3 +135,10 @@ def test_webhook_reports_suppressed_queue_event_as_not_queued():
     root = Path(__file__).resolve().parents[3]
     text = (root / "integrations/bitrix_owner_sync_webhook/api/bitrix/event.js").read_text(encoding="utf-8")
     assert "queued: queued.queued !== false" in text
+
+
+def test_webhook_has_no_contact_card_role_gate():
+    root = Path(__file__).resolve().parents[3]
+    text = (root / "integrations/bitrix_owner_sync_webhook/api/bitrix/event.js").read_text(encoding="utf-8")
+    assert "ordinary_contact" not in text
+    assert "isFounderContact" not in text

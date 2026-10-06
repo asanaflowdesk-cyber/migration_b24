@@ -101,11 +101,15 @@ def resolve_authority_packages(
         for item in package.get("contacts", []):
             contact_id = normalized_id(item.get("id"))
             contact = contacts_by_id.get(contact_id or 0)
-            if contact and is_director_authority_contact(contact):
+            if not contact:
+                continue
+            # CONTACT_ID is the primary authority signal. Card fields such as
+            # POST/COMMENTS are legacy hints only and are not required.
+            if leads is None:
+                if is_director_authority_contact(contact):
+                    authority.append(contact)
+            elif contact_id in linked_ids:
                 authority.append(contact)
-
-        if leads is not None:
-            authority = [contact for contact in authority if normalized_id(contact.get("ID")) in linked_ids]
         remembered = (authority_sources or {}).get(str(package.get("fio") or ""))
         if remembered:
             selected = [contact for contact in authority if normalized_id(contact.get("ID")) == remembered]

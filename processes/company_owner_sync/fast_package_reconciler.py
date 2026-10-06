@@ -6,7 +6,7 @@ from typing import Any
 from urllib.parse import urlencode
 
 from package_reconciler import package_items, utc_now, write_operation
-from sync_founder_packages import is_founder_contact, normalized_id
+from sync_founder_packages import normalized_id
 
 BATCH_SIZE = 50
 
@@ -112,8 +112,6 @@ def _source_owner(client: Any, source_contact_id: int) -> tuple[int | None, str]
         return None, type(exc).__name__
     if not isinstance(source, dict):
         return None, "source_contact_not_found"
-    if not is_founder_contact(source):
-        return None, "source_missing_or_no_longer_founder"
     return normalized_id(source.get("ASSIGNED_BY_ID")), ""
 
 
@@ -235,8 +233,6 @@ def process_package_fast(
 ) -> dict[str, Any]:
     package = copy.deepcopy(package)
     owner_id, source_error = _source_owner(client, source_contact_id)
-    if source_error == "source_missing_or_no_longer_founder":
-        return {"success": True, "retryable": False, "reason": source_error, "status": "IGNORED", "operation": {}, "items": []}
     if source_error or not owner_id:
         return {"success": False, "retryable": False, "reason": source_error or "source_contact_without_owner", "status": "MANUAL_REVIEW", "operation": {}, "items": []}
 
