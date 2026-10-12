@@ -121,6 +121,9 @@ class DeskFlowIntegrityTests(unittest.TestCase):
 
                 if route == "branch_3":
                     self._finish_branch_three(session)
+                elif route == "initiative":
+                    self.assertEqual(session["current_screen"], "initiative_profile")
+                    self.assertFalse(view(session)["accepts_text"])
                 elif route == "instruction":
                     self.assertEqual(session["current_screen"], "instruction")
                     self.assertIn((request_type,), INSTRUCTIONS)

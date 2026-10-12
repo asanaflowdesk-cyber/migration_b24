@@ -5,6 +5,7 @@ from copy import deepcopy
 from typing import Any
 from uuid import uuid4
 
+from processes.flowdesk_chatbot import initiatives
 from processes.flowdesk_chatbot.config import (
     DETAIL_FIELDS,
     DETAIL_QUESTIONS,
@@ -133,6 +134,7 @@ def new_session(user_id: int, dialog_id: str) -> dict[str, Any]:
             "document_file_ids": [],
             "document_file_names": [],
             "document_comment": None,
+            "initiative": None,
         },
     }
 
@@ -188,6 +190,16 @@ def normalize_session(
     for key in ("document_file_ids", "document_file_names"):
         if not isinstance(data.get(key), list):
             data[key] = []
+
+    if (
+        data.get("request_type") == "Предложение / Идея"
+        and session["current_screen"] not in {"type", "done"}
+        and not initiatives.is_initiative(session)
+    ):
+        # Old unfinished proposals retain their text/files and collect only the
+        # additional questionnaire answers after deployment.
+        initiatives.begin(session)
+        session["revision"] = int(session["revision"]) + 1
 
     return session
 
@@ -448,6 +460,8 @@ def _start_text() -> str:
 
 def view(session: dict[str, Any]) -> dict[str, Any]:
     normalize_session(session)
+    if session["current_screen"].startswith("initiative_"):
+        return initiatives.view(session)
     screen = session["current_screen"]
     data = session["data"]
     buttons: list[dict[str, str]] = []
@@ -479,6 +493,8 @@ def view(session: dict[str, Any]) -> dict[str, Any]:
                 _button("Другое", "Другое", "primary"),
             ]
         )
+        if not session.get("edit_mode"):
+            buttons.append(_button("Сообщить о сбое", "Сообщить о сбое", "secondary"))
         if not session.get("edit_mode") and session.get("history_has_more"):
             buttons.append(_button("Показать ещё", ACTION_HISTORY_MORE, "secondary"))
 
@@ -622,6 +638,10 @@ def view(session: dict[str, Any]) -> dict[str, Any]:
             if task_id
             else "[b]Готово! Обращение создано ✅🙂[/b]"
         )
+        if initiatives.is_initiative(session):
+            text = "[b]Инициатива отправлена на первичное рассмотрение ✅[/b]"
+            if task_id:
+                text += f"\n\n[b]Номер инициативы:[/b] #{task_id}"
         buttons = [_button("Создать новое обращение", ACTION_NEW_REQUEST, "primary")]
         if session.get("history_has_more"):
             buttons.append(_button("Показать ещё", ACTION_HISTORY_MORE, "secondary"))
@@ -697,6 +717,8 @@ def _validate_detail(field_name: str, value: str) -> tuple[bool, str, str]:
 
 def submit_action(session: dict[str, Any], action: str) -> dict[str, Any]:
     normalize_session(session)
+    if session["current_screen"].startswith("initiative_"):
+        return initiatives.submit_action(session, action)
     screen = session["current_screen"]
 
     if action == ACTION_BACK:
@@ -795,7 +817,9 @@ def submit_action(session: dict[str, Any], action: str) -> dict[str, Any]:
     if screen == "type":
         data["request_type"] = action
         route = REQUEST_TYPES[action]
-        if session.get("edit_mode"):
+        if route == "initiative":
+            initiatives.begin(session)
+        elif session.get("edit_mode"):
             if route == "request_tree":
                 session["current_screen"] = "target"
             elif route == "branch_3":
@@ -881,6 +905,8 @@ def submit_action(session: dict[str, Any], action: str) -> dict[str, Any]:
 
 def submit_text(session: dict[str, Any], text: str) -> dict[str, Any]:
     normalize_session(session)
+    if session["current_screen"].startswith("initiative_"):
+        return initiatives.submit_text(session, text)
     value = str(text or "").strip()
     current = view(session)
     if not current["accepts_text"]:
@@ -947,6 +973,8 @@ def submit_attachment_message(
     text: str = "",
 ) -> dict[str, Any]:
     normalize_session(session)
+    if session["current_screen"].startswith("initiative_"):
+        return initiatives.submit_materials(session, file_ids, file_names, text)
     screen = session["current_screen"]
     value = str(text or "").strip()
     ids = [int(x) for x in file_ids if int(x) > 0]
@@ -1038,6 +1066,8 @@ def _file_count_text(count: int) -> str:
 
 def summary_text(session: dict[str, Any]) -> str:
     normalize_session(session)
+    if initiatives.is_initiative(session):
+        return initiatives.summary(session)
     data = session["data"]
     lines = [
         "[b]Почти готово — давай всё проверим 👀[/b]",
@@ -1091,6 +1121,9 @@ def summary_text(session: dict[str, Any]) -> str:
 
 
 def task_title(session: dict[str, Any]) -> str:
+    if initiatives.is_initiative(session):
+        title = initiatives.state(session)["answers"].get("title", {}).get("text") or "Инициатива"
+        return f"Предложение / Идея | {title}"[:250]
     data = session["data"]
     parts = [
         data.get("request_type"),
@@ -1126,6 +1159,8 @@ def task_registry_fields(session: dict[str, Any]) -> dict[str, str]:
         "UF_FLOWDESK_DESCRIPTION": data.get("description"),
         "UF_FLOWDESK_INITIATOR_ID": str(session.get("user_id") or ""),
     }
+    if initiatives.is_initiative(session):
+        mapping.update(initiatives.registry_fields(session))
     return {
         key: str(value)
         for key, value in mapping.items()
@@ -1134,6 +1169,8 @@ def task_registry_fields(session: dict[str, Any]) -> dict[str, str]:
 
 
 def task_description(session: dict[str, Any]) -> str:
+    if initiatives.is_initiative(session):
+        return initiatives.summary(session, markup=False)
     data = session["data"]
     lines: list[str] = []
 

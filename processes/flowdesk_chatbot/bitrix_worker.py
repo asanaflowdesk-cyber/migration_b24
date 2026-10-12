@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import logging
 import os
 import secrets
@@ -15,6 +16,8 @@ import requests
 
 from common.bitrix import BitrixClient, BitrixError, sanitize_error
 from processes.flowdesk_chatbot.avatar_asset import SERVICE_CHAT_AVATAR_B64
+from processes.flowdesk_chatbot import initiatives
+from processes.flowdesk_chatbot.initiator_profile import fetch_profile
 from processes.flowdesk_chatbot.engine import (
     mark_task_created,
     new_session,
@@ -48,6 +51,7 @@ TASK_USER_FIELDS: dict[str, dict[str, Any]] = {
     "UF_FLOWDESK_DESCRIPTION": {"label": "Суть обращения", "sort": 280, "rows": 12},
     "UF_FLOWDESK_INITIATOR_ID": {"label": "Инициатор обращения ID", "sort": 290, "rows": 1},
 }
+TASK_USER_FIELDS.update(initiatives.TASK_FIELDS)
 
 
 class Runtime:
@@ -1175,6 +1179,100 @@ class Runtime:
 
         return "\n".join(lines)
 
+    def initiative_draft(self, user_id: int) -> dict[str, Any] | None:
+        raw = self.store.get_meta(f"initiative_draft:{int(user_id)}")
+        if not raw:
+            return None
+        try:
+            draft = json.loads(raw)
+            if (
+                not isinstance(draft, dict)
+                or int(draft.get("user_id") or 0) != int(user_id)
+                or draft.get("current_screen") != "initiative_saved"
+                or not initiatives.is_initiative(draft)
+            ):
+                return None
+            return draft
+        except (ValueError, TypeError):
+            LOG.warning("Invalid initiative draft for user=%s", user_id)
+            return None
+
+    def prepare_initiative(self, session: dict[str, Any]) -> None:
+        if not session.get("current_screen", "").startswith("initiative_"):
+            return
+        ini = initiatives.state(session)
+        user_id = int(session["user_id"])
+        if not ini["draft_checked"]:
+            ini["draft_checked"] = True
+            draft = self.initiative_draft(user_id)
+            if draft and draft.get("request_id") != session.get("request_id"):
+                session["current_screen"] = "initiative_existing_draft"
+                session["revision"] = int(session["revision"]) + 1
+        if session["current_screen"] == "initiative_existing_draft" or ini["profile_loaded"]:
+            return
+
+        cached: dict[str, Any] = {}
+        raw = self.store.get_meta(f"initiative_profile:{user_id}")
+        try:
+            parsed = json.loads(raw) if raw else {}
+            cached = parsed if isinstance(parsed, dict) else {}
+        except (ValueError, TypeError):
+            pass
+        previous = cached.get("profile") or {}
+        previous_source = cached.get("source") or {}
+        if not isinstance(previous, dict):
+            previous = {}
+        if not isinstance(previous_source, dict):
+            previous_source = {}
+        try:
+            profile = fetch_profile(self.call, user_id)
+            ini["profile_source"] = dict(profile)
+            # Reuse corrections only while the corresponding profile source
+            # remains unchanged. Employee transfers/renames are picked up.
+            ini["profile"] = {
+                key: previous.get(key, value) if previous_source.get(key, "") == value else value
+                for key, value in profile.items()
+            }
+        except Exception as exc:
+            LOG.warning("Initiator profile could not be read for user=%s: %s", user_id, sanitize_error(exc))
+            ini["profile"] = dict(previous)
+            ini["profile_source"] = dict(previous_source)
+        ini["profile_loaded"] = True
+
+    def persist_initiative(self, session: dict[str, Any], *, draft: bool = False) -> None:
+        if not initiatives.is_initiative(session):
+            return
+        ini = initiatives.state(session)
+        user_id = int(session["user_id"])
+        if ini["profile_confirmed"] and not initiatives.profile_missing(session):
+            self.store.set_meta(
+                f"initiative_profile:{user_id}",
+                json.dumps({"profile": ini["profile"], "source": ini.get("profile_source") or {}}, ensure_ascii=False),
+            )
+        if draft:
+            self.store.set_meta(f"initiative_draft:{user_id}", json.dumps(session, ensure_ascii=False))
+
+    def resume_initiative_draft(self, session: dict[str, Any]) -> dict[str, Any]:
+        saved = self.initiative_draft(int(session["user_id"]))
+        if saved is None:
+            session["current_screen"] = "initiative_profile"
+            session["revision"] = int(session["revision"]) + 1
+            return session
+        saved = normalize_session(saved)
+        saved["dialog_id"] = session["dialog_id"]
+        saved["active_message_id"] = session.get("active_message_id")
+        saved["revision"] = max(int(saved["revision"]), int(session["revision"])) + 1
+        initiatives.state(saved)["draft_checked"] = True
+        initiatives.submit_action(saved, initiatives.RESUME)
+        return saved
+
+    def clear_submitted_draft(self, session: dict[str, Any]) -> None:
+        if not initiatives.is_initiative(session):
+            return
+        draft = self.initiative_draft(int(session["user_id"]))
+        if draft and draft.get("request_id") == session.get("request_id"):
+            self.store.set_meta(f"initiative_draft:{int(session['user_id'])}", "")
+
     def render_current(
         self,
         session: dict[str, Any],
@@ -1182,6 +1280,9 @@ class Runtime:
         link_button: dict[str, str] | None = None,
         text_override: str | None = None,
     ) -> None:
+        normalize_session(session)
+        self.prepare_initiative(session)
+        self.persist_initiative(session)
         history = ""
         if session.get("current_screen") in {"type", "done"} and not session.get("edit_mode"):
             history = self.history_block(session)
@@ -1482,7 +1583,10 @@ class Runtime:
             self.render_current(session)
             return
 
-        if session.get("current_screen") in {"document", "edit_attachments_input"} and files:
+        if (
+            session.get("current_screen") in {"document", "edit_attachments_input"}
+            or view(session).get("accepts_files")
+        ) and files:
             result = submit_attachment_message(
                 session,
                 [int(item["id"]) for item in files],
@@ -1616,6 +1720,7 @@ class Runtime:
 
         if transition["status"] == "task_ready":
             task_id = self.create_task(session)
+            self.clear_submitted_draft(session)
             mark_task_created(session, task_id)
             self.store.put_session(key, session)
             self.render_current(
@@ -1626,6 +1731,11 @@ class Runtime:
                 },
             )
             return
+
+        if transition["status"] == "draft_saved":
+            self.persist_initiative(session, draft=True)
+        elif transition["status"] == "draft_resume_requested":
+            session = self.resume_initiative_draft(session)
 
         if transition["status"] == "restart_requested":
             session = self.restart_session(dialog_id, user_id)
