@@ -1,3 +1,5 @@
+const OWNER_EVENT_SHEET = 'OWNER_EVENTS';
+const OWNER_EVENT_HEADERS = ['seq', 'entity', 'entity_id', 'owner_id', 'previous_owner_id', 'event_ts', 'received_at'];
 const QUEUE_SHEET = 'QUEUE';
 const OPERATION_SHEET = 'TRANSFER_LOG';
 const ITEM_SHEET = 'TRANSFER_ITEMS';
@@ -103,6 +105,8 @@ function doPost(e) {
     const lock = LockService.getScriptLock();
     lock.waitLock(20000);
     try {
+      if (body.action === 'owner_event') return json_(ownerEvent_(body));
+      if (body.action === 'owner_events') return json_(ownerEvents_(body));
       if (body.action === 'enqueue') return json_(enqueue_(body));
       if (body.action === 'claim') return json_(claim_(body));
       if (body.action === 'progress') return json_(progress_(body));
@@ -120,6 +124,46 @@ function doPost(e) {
     console.error(error && error.stack ? error.stack : error);
     return json_({ok: false, error: 'internal_error'});
   }
+}
+
+function ownerEvent_(body) {
+  const entity = String(body.entity || '').toLowerCase();
+  const entityId = Number(body.entity_id);
+  const ownerId = Number(body.owner_id || 0);
+  if (!['contact', 'company', 'lead'].includes(entity) || !Number.isSafeInteger(entityId) || entityId <= 0)
+    return {ok: false, error: 'invalid_owner_event_entity'};
+  if (!Number.isSafeInteger(ownerId) || ownerId < 0) return {ok: false, error: 'invalid_owner_event_owner'};
+  const props = PropertiesService.getScriptProperties();
+  const cacheKey = 'OWNER_EVENT_LAST_' + entity + '_' + entityId;
+  const previous = Number(props.getProperty(cacheKey) || 0);
+  if (ownerId > 0 && previous === ownerId) return {ok: true, queued: false, reason: 'owner_unchanged'};
+  const sheet = ensureSheet_(workbook_(), OWNER_EVENT_SHEET, OWNER_EVENT_HEADERS);
+  const seq = sheet.getLastRow();
+  const stamp = Number(body.event_ts || 0) || Date.now() / 1000;
+  const receivedAt = iso_();
+  // Append every owner transition. Do not coalesce two managers into the last
+  // event, and do not consume the cached owner before a successful write.
+  sheet.getRange(seq + 1, 1, 1, OWNER_EVENT_HEADERS.length).setValues([
+    [seq, entity, entityId, ownerId, previous || '', stamp, receivedAt]
+  ]);
+  if (ownerId > 0) props.setProperty(cacheKey, String(ownerId));
+  return {ok: true, queued: true, seq: seq};
+}
+
+function ownerEvents_(body) {
+  const after = Math.max(0, Number(body.after || 0));
+  const limit = Math.min(500, Math.max(1, Number(body.limit || 500)));
+  if (!Number.isSafeInteger(after) || !Number.isSafeInteger(limit)) return {ok: false, error: 'invalid_owner_event_cursor'};
+  const sheet = ensureSheet_(workbook_(), OWNER_EVENT_SHEET, OWNER_EVENT_HEADERS);
+  const total = sheet.getLastRow() - 1;
+  if (after > total) return {ok: false, error: 'owner_event_journal_reset'};
+  const count = Math.min(limit, total - after);
+  const rows = count ? sheet.getRange(after + 2, 1, count, OWNER_EVENT_HEADERS.length).getValues() : [];
+  return {
+    ok: true,
+    events: rows.map(row => ({seq: Number(row[0]), entity: String(row[1]), entity_id: Number(row[2]), owner_id: Number(row[3]), previous_owner_id: Number(row[4]) || null, event_ts: Number(row[5]), received_at: String(row[6])})),
+    has_more: after + count < total
+  };
 }
 
 function enqueue_(body) {
@@ -407,6 +451,7 @@ function setupQueue() {
   const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
   if (!spreadsheet) throw new Error('Open this function from the bound spreadsheet project');
   PropertiesService.getScriptProperties().setProperty('SPREADSHEET_ID', spreadsheet.getId());
+  ensureSheet_(spreadsheet, OWNER_EVENT_SHEET, OWNER_EVENT_HEADERS);
   ensureSheet_(spreadsheet, QUEUE_SHEET, HEADERS);
   ensureSheet_(spreadsheet, OPERATION_SHEET, OP_HEADERS);
   ensureSheet_(spreadsheet, ITEM_SHEET, ITEM_HEADERS);

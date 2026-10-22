@@ -56,24 +56,25 @@ export default function handler(request, response) {
       }
 
       BX24.init(function () {
-        BX24.callMethod(
-          "event.unbind",
-          { event: "ONCRMCONTACTUPDATE", handler: eventHandlerUrl },
-          function () {
-            BX24.callMethod(
-              "event.bind",
-              { event: "ONCRMCONTACTUPDATE", handler: eventHandlerUrl },
-              function (result) {
-                if (result.error()) {
-                  finishWithError(result.error() + ": " + result.error_description());
-                  return;
-                }
-                status.textContent = "Обработчик ONCRMCONTACTUPDATE зарегистрирован.";
-                BX24.installFinish();
-              }
-            );
+        const events = ["ONCRMCONTACTADD", "ONCRMCONTACTUPDATE", "ONCRMCOMPANYADD", "ONCRMCOMPANYUPDATE", "ONCRMLEADADD", "ONCRMLEADUPDATE"];
+        function bindNext(index) {
+          if (index >= events.length) {
+            status.textContent = "Зарегистрированы события создания и изменения контактов, компаний и лидов.";
+            BX24.installFinish();
+            return;
           }
-        );
+          const event = events[index];
+          BX24.callMethod("event.unbind", {event: event, handler: eventHandlerUrl}, function () {
+            BX24.callMethod("event.bind", {event: event, handler: eventHandlerUrl}, function (result) {
+              if (result.error()) {
+                finishWithError(event + ": " + result.error() + ": " + result.error_description());
+                return;
+              }
+              bindNext(index + 1);
+            });
+          });
+        }
+        bindNext(0);
       });
     </script>
   </body>

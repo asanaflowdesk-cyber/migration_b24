@@ -1,38 +1,40 @@
-# Bitrix founder-package queue
+# Очередь синхронизации и журнал первого назначения
 
-The bound Google Apps Script stores only contact IDs and processing state in the
-`QUEUE` sheet. It does not store names, company data, leads, or credentials.
+Google Apps Script хранит обычную очередь контактов в `QUEUE` и неизменяемый
+порядок смены ответственных контактов, компаний и лидов в `OWNER_EVENTS`.
+Листы `TRANSFER_LOG` и `TRANSFER_ITEMS` используются для журналов переноса.
 
-## Script properties
+## Настройка
 
-Set these in Apps Script **Project Settings → Script properties**:
+В Script properties задать `QUEUE_API_KEY` — секрет длиной не менее 32 символов.
+Открыть привязанный к таблице проект и выполнить `setupQueue`: он сохранит ID
+таблицы, проверит старые заголовки и добавит `OWNER_EVENTS`, не очищая данные.
 
-- `QUEUE_API_KEY`: a random secret of at least 32 characters.
+Опубликовать проект как Web app от имени владельца, доступ Anyone. В Vercel и
+GitHub secrets задать `GOOGLE_QUEUE_URL` с `/exec` URL и `GOOGLE_QUEUE_KEY`, равный
+`QUEUE_API_KEY`. При обновлении выбрать новую версию существующей публикации,
+чтобы URL не изменился. Саму таблицу публиковать не требуется.
 
-Run `setupQueue` once from the editor and approve spreadsheet access. It records
-the bound spreadsheet ID and validates the headers.
+Worker 31A работает постоянно. Он читает новые события с сохранённого курсора,
+затем очередь контактов и выполняет сверку пакетов. Повторно полученное событие
+не создаёт другое первое закрепление. Новая версия контакта не теряется при
+завершении старой обработки.
 
-Deploy as **Web app**, execute as the script owner, access **Anyone**. Copy the
-`/exec` URL. Do not publish the spreadsheet itself.
+## OWNER_EVENTS
 
-## Vercel variables
+Столбцы: `seq`, `entity`, `entity_id`, `owner_id`, `previous_owner_id`,
+`event_ts`, `received_at`. Каждая смена владельца добавляет строку. Последующее
+назначение другого сотрудника не затирает первую строку. `previous_owner_id`
+восстанавливается из последнего успешно записанного владельца этой карточки.
+Неизвестный `owner_id=0` означает, что карточку надо проверить сверкой;
+такое событие не используется для произвольного выбора сотрудника.
 
-- `GOOGLE_QUEUE_URL`: the Apps Script `/exec` URL.
-- `GOOGLE_QUEUE_KEY`: the same `QUEUE_API_KEY`.
+Не удалять и не сортировать строки журнала вручную: `seq` связан с курсором
+worker. Сброс журнала определяется как ошибка, а не как разрешение заново
+выбрать менеджера. Учётные данные Б24 в таблицу не записываются.
 
-Redeploy Vercel after adding the variables.
+Методы `owner_event` и `owner_events` обслуживают журнал. Старые `enqueue`,
+`claim`, `progress`, `complete`, `remember_owners` и журналы переноса сохранены.
 
-## GitHub Actions secrets
-
-- `GOOGLE_QUEUE_URL`: the same Apps Script `/exec` URL.
-- `GOOGLE_QUEUE_KEY`: the same `QUEUE_API_KEY`.
-
-Workflow 31A is normally dispatched by Vercel only for the first queued event.
-The scheduled run every ten minutes recovers a missed dispatch or expired claim.
-One run claims up to 500 contact IDs, loads CRM once for that batch, processes
-each independent package, acknowledges successful versions, and then drains any
-events that arrived while it was running.
-
-Failed items enter `RETRY` for ten minutes. A new Bitrix event for the same
-contact makes it immediately pending. A completion for an older version cannot
-erase a newer event.
+Полный порядок включения новой логики — в
+`processes/company_owner_sync/README.md`.

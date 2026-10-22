@@ -36,15 +36,19 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function fetchChangedContact(body, contactId) {
+async function fetchChangedEntity(body, entity, entityId) {
   const endpoint = String(valueAt(body, ["auth", "client_endpoint"], "auth[client_endpoint]") || "").trim();
   const token = String(valueAt(body, ["auth", "access_token"], "auth[access_token]") || "").trim();
-  if (!endpoint.startsWith("https://") || !token) return null;
+  const fallback = String(process.env.TARGET_BITRIX_WEBHOOK_URL || "").trim();
+  const authenticated = endpoint.startsWith("https://") && Boolean(token);
+  if (!authenticated && !fallback.startsWith("https://")) return null;
   try {
-    const response = await fetch(`${endpoint.replace(/\/$/, "")}/crm.contact.get.json`, {
+    const base = authenticated ? endpoint : fallback;
+    const response = await fetch(`${base.replace(/\/$/, "")}/crm.${entity}.get.json`, {
       method: "POST",
       headers: {"Content-Type": "application/x-www-form-urlencoded"},
-      body: new URLSearchParams({id: contactId, auth: token}),
+      body: new URLSearchParams(authenticated ? {id: entityId, auth: token} : {id: entityId}),
+      signal: AbortSignal.timeout(5000),
     });
     const data = await response.json().catch(() => ({}));
     if (!response.ok || !data || typeof data.result !== "object") return null;
@@ -62,6 +66,7 @@ async function queueRequest(action, payload = {}) {
     method: "POST",
     headers: {"Content-Type": "application/json"},
     body: JSON.stringify({key: queueKey, action, ...payload}),
+    signal: AbortSignal.timeout(8000),
   });
   const data = await result.json().catch(() => ({}));
   if (!result.ok || !data.ok) throw new Error(`google_queue_${action}_failed`);
@@ -149,19 +154,31 @@ export default async function handler(request, response) {
   const actualDomain = normalizeDomain(valueAt(body, ["auth", "domain"], "auth[domain]"));
   const expectedDomain = normalizeDomain(process.env.BITRIX_ALLOWED_DOMAIN);
 
-  if (event !== "ONCRMCONTACTUPDATE") return response.status(202).json({accepted: false, reason: "event_ignored"});
+  const entity = {
+    ONCRMCONTACTADD: "contact", ONCRMCONTACTUPDATE: "contact",
+    ONCRMCOMPANYADD: "company", ONCRMCOMPANYUPDATE: "company",
+    ONCRMLEADADD: "lead", ONCRMLEADUPDATE: "lead",
+  }[event];
+  if (!entity) return response.status(202).json({accepted: false, reason: "event_ignored"});
   if (!contactId) return response.status(400).json({error: "missing_contact_id"});
   if (!expectedDomain || actualDomain !== expectedDomain) return response.status(403).json({error: "unexpected_bitrix_domain"});
 
-  const changedContact = await fetchChangedContact(body, contactId);
+  const changedContact = await fetchChangedEntity(body, entity, contactId);
+  const ownerId = numericId(valueAt(body, ["data", "FIELDS", "ASSIGNED_BY_ID"], "data[FIELDS][ASSIGNED_BY_ID]")) || numericId(changedContact?.ASSIGNED_BY_ID);
 
   let queued;
   try {
-    queued = await queueRequest("enqueue", {
-      contact_id: contactId,
-      event_ts: String(body.ts || ""),
-      owner_id: numericId(changedContact?.ASSIGNED_BY_ID),
+    queued = await queueRequest("owner_event", {
+      entity: entity, entity_id: contactId,
+      event_ts: String(body.ts || ""), owner_id: ownerId,
     });
+    if (entity === "contact") {
+      queued = await queueRequest("enqueue", {
+        contact_id: contactId,
+        event_ts: String(body.ts || ""),
+        owner_id: ownerId,
+      });
+    }
   } catch (error) {
     console.error("Queue enqueue failed", error instanceof Error ? error.message : "unknown");
     return response.status(502).json({error: "queue_enqueue_failed"});
@@ -173,7 +190,9 @@ export default async function handler(request, response) {
     dispatched: false,
     processing: "persistent_worker",
     reason: String(queued.reason || "queued"),
-    contact_id: contactId,
+    contact_id: entity === "contact" ? contactId : undefined,
+    entity: entity,
+    entity_id: contactId,
     queue_version: Number(queued.version || 0),
   });
 }

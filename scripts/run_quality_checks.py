@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 TEST_SUITES = [
     ("company_owner_sync", ROOT / "processes" / "company_owner_sync"),
     ("company_data_update", ROOT / "processes" / "company_data_update"),
+    ("company_director_enrichment", ROOT / "processes" / "company_director_enrichment"),
     ("eqazyna_leads", ROOT / "processes" / "eqazyna_leads"),
     ("eqazyna_status_sync", ROOT / "processes" / "eqazyna_status_sync"),
     ("excluded_user_reassignment", ROOT / "processes" / "excluded_user_reassignment"),
@@ -25,7 +26,7 @@ TEST_SUITES = [
 def run_suite(name: str, cwd: Path) -> None:
     env = os.environ.copy()
     paths = [str(ROOT)]
-    if name in {"company_owner_sync", "eqazyna_status_sync", "excluded_user_reassignment"}:
+    if name in {"company_owner_sync", "company_director_enrichment", "eqazyna_status_sync", "excluded_user_reassignment"}:
         paths.extend(
             [
                 str(cwd),
@@ -52,10 +53,12 @@ def run_suite(name: str, cwd: Path) -> None:
 def check_windows_runner_python_contract() -> None:
     """Keep Windows self-hosted jobs on the workstation's existing Python.
 
-    These jobs must not install/bootstrap Python through GitHub Actions or
-    PowerShell. They create only a job-local .venv via scripts/prepare-python.cmd.
+    These jobs use the workstation Python, either through prepare-python.cmd
+    or through the persistent worker's managed environment. They must not
+    install/bootstrap a different Python through GitHub Actions or PowerShell.
     """
     failures: list[str] = []
+    expected = r"C:\Users\Alyona.Sachyova\AppData\Local\Programs\Python\Python312\python.exe"
     workflows = ROOT / ".github" / "workflows"
     for path in sorted(workflows.glob("*.yml")):
         text = path.read_text(encoding="utf-8")
@@ -69,12 +72,21 @@ def check_windows_runner_python_contract() -> None:
         for needle, label in forbidden.items():
             if needle in text:
                 failures.append(f"{path.relative_to(ROOT)}: forbidden {label}")
-        if "prepare-python.cmd" not in text:
+        worker_control = re.search(
+            r'"%PYTHON_EXE%"\s+-u\s+"[^"\r\n]*\\processes\\'
+            r'(?:company_owner_sync|flowdesk_chatbot)\\worker_control\.py"',
+            text,
+        )
+        persistent_chatbot_tests = (
+            r"\.flowdesk-chatbot\venv\Scripts\python.exe" in text
+            and r"-m unittest discover -v -s processes\flowdesk_chatbot" in text
+        )
+        managed_runtime = expected in text and (worker_control or persistent_chatbot_tests)
+        if "prepare-python.cmd" not in text and not managed_runtime:
             failures.append(f"{path.relative_to(ROOT)}: prepare-python.cmd is missing")
 
     prepare = ROOT / "scripts" / "prepare-python.cmd"
     prepare_text = prepare.read_text(encoding="utf-8-sig")
-    expected = r"C:\Users\Alyona.Sachyova\AppData\Local\Programs\Python\Python312\python.exe"
     if expected not in prepare_text:
         failures.append("scripts/prepare-python.cmd: workstation Python 3.12 path changed")
     if "powershell" in prepare_text.lower() or "bootstrap-python" in prepare_text.lower():
@@ -97,6 +109,12 @@ def main() -> int:
         return 1
     for name, cwd in TEST_SUITES:
         run_suite(name, cwd)
+    subprocess.run(
+        [sys.executable, "-m", "unittest", "discover", "-q", "-s",
+         str(ROOT / "processes" / "flowdesk_chatbot"), "-p", "test_*.py"],
+        cwd=ROOT,
+        check=True,
+    )
     print("\nAll quality checks passed.", flush=True)
     return 0
 
