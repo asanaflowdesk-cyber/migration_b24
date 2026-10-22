@@ -142,3 +142,37 @@ def test_webhook_has_no_contact_card_role_gate():
     text = (root / "integrations/bitrix_owner_sync_webhook/api/bitrix/event.js").read_text(encoding="utf-8")
     assert "ordinary_contact" not in text
     assert "isFounderContact" not in text
+
+
+def test_technical_contact_owner_does_not_undo_bitrix_distribution(tmp_path):
+    client = BatchClient()
+    client.source_owner = 4
+    original = dict(client.owners)
+
+    result = process_package_fast(
+        client, tmp_path, package(), source_contact_id=100,
+        operation_id="op-technical", claim_id="claim-technical", attempt=1,
+    )
+
+    assert result["success"] is True
+    assert result["status"] == "WAITING_BITRIX"
+    assert result["retryable"] is False
+    assert client.owners == original
+    assert client.batch_calls == 0
+
+
+def test_real_founder_owner_resumes_sync_after_technical_handoff(tmp_path):
+    client = BatchClient()
+    client.source_owner = 4
+    process_package_fast(
+        client, tmp_path, package(), 100, "op-wait", "claim", 1,
+    )
+    client.source_owner = 13
+
+    result = process_package_fast(
+        client, tmp_path, package(), 100, "op-resume", "claim", 1,
+    )
+
+    assert result["success"] is True
+    assert result["status"] == "DONE"
+    assert set(client.owners.values()) == {13}

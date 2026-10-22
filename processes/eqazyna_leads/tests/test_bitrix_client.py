@@ -195,3 +195,135 @@ def test_ensure_contact_company_link_keeps_existing_primary_and_adds_secondary()
             "IS_PRIMARY": "N",
         },
     }
+
+
+def test_global_founder_search_accepts_founder_director_and_case_insensitive_marker():
+    for extra in (
+        {"POST": "Учредитель"},
+        {"POST": "Генеральный директор"},
+        {"POST": "Руководитель"},
+        {"COMMENTS": "[[eqazyna_director:123456789012]]"},
+    ):
+        session = FakeSession([[
+            {"ID": "1", "POST": "Менеджер", "ASSIGNED_BY_ID": "99"},
+            {"ID": "2", "ASSIGNED_BY_ID": "13", **extra},
+        ]])
+        client = BitrixClient(
+            "https://box.example.invalid/rest/1/token", polite_delay_seconds=0, session=session,
+        )
+
+        contact = client.find_director_contact_global("Иванов", "Иван", "Иванович")
+
+        assert contact["ID"] == "2"
+        assert contact["ASSIGNED_BY_ID"] == "13"
+
+
+def test_missing_fio_uses_only_marked_company_founder_contact():
+    session = FakeSession([[
+        {"ID": "1", "POST": "Бухгалтер", "ASSIGNED_BY_ID": "99"},
+        {"ID": "2", "POST": "Учредитель", "NAME": "Иван", "ASSIGNED_BY_ID": "13"},
+    ]])
+    client = BitrixClient(
+        "https://box.example.invalid/rest/1/token", polite_delay_seconds=0, session=session,
+    )
+
+    contact = client.find_company_director_contact("601")
+
+    assert contact["ID"] == "2"
+    assert session.calls[0][1]["filter"] == {"COMPANY_ID": 601}
+
+
+def test_missing_fio_does_not_guess_between_conflicting_founders():
+    import pytest
+    from eqazyna_bitrix.bitrix_client import BitrixError
+
+    session = FakeSession([[
+        {"ID": "1", "POST": "Учредитель", "NAME": "Иван", "ASSIGNED_BY_ID": "13"},
+        {"ID": "2", "POST": "Директор", "NAME": "Петр", "ASSIGNED_BY_ID": "88"},
+    ]])
+    client = BitrixClient(
+        "https://box.example.invalid/rest/1/token", polite_delay_seconds=0, session=session,
+    )
+
+    with pytest.raises(BitrixError, match="несколько контактов"):
+        client.find_company_director_contact("601")
+
+
+def test_global_founder_search_prefers_real_manager_over_technical_contact():
+    session = FakeSession([[
+        {"ID": "1", "POST": "Учредитель", "ASSIGNED_BY_ID": "4"},
+        {"ID": "2", "POST": "Учредитель", "ASSIGNED_BY_ID": "13"},
+    ]])
+    client = BitrixClient(
+        "https://box.example.invalid/rest/1/token", polite_delay_seconds=0, session=session,
+    )
+
+    assert client.find_director_contact_global("Иванов", "Иван")["ASSIGNED_BY_ID"] == "13"
+
+
+def _director(item_id, owner, second_name="Иванович"):
+    return {
+        "ID": str(item_id), "ASSIGNED_BY_ID": str(owner), "POST": "Учредитель",
+        "LAST_NAME": "Иванов", "NAME": "Иван", "SECOND_NAME": second_name,
+    }
+
+
+def test_global_duplicate_uses_lead_linked_contact_instead_of_old_rop():
+    session = FakeSession([
+        [_director(10, 72), _director(20, 13)],
+        [],
+        [{"ID": "99", "CONTACT_ID": "20", "ASSIGNED_BY_ID": "13"}],
+    ])
+    client = BitrixClient(
+        "https://box.example.invalid/rest/1/token", polite_delay_seconds=0, session=session,
+    )
+
+    contact = client.find_director_contact_global("Иванов", "Иван", "Иванович")
+
+    assert contact["ID"] == "20"
+    assert contact["ASSIGNED_BY_ID"] == "13"
+
+
+def test_global_duplicate_with_two_linked_owners_is_not_arbitrarily_assigned():
+    import pytest
+    from eqazyna_bitrix.bitrix_client import BitrixError
+
+    session = FakeSession([
+        [_director(10, 72), _director(20, 13)],
+        [{"ID": "98", "CONTACT_ID": "10"}],
+        [{"ID": "99", "CONTACT_ID": "20"}],
+    ])
+    client = BitrixClient(
+        "https://box.example.invalid/rest/1/token", polite_delay_seconds=0, session=session,
+    )
+
+    with pytest.raises(BitrixError, match="разные ответственные"):
+        client.find_director_contact_global("Иванов", "Иван", "Иванович")
+
+
+def test_incomplete_fio_does_not_merge_people_with_different_patronymics():
+    import pytest
+    from eqazyna_bitrix.bitrix_client import BitrixError
+
+    session = FakeSession([[_director(10, 72), _director(20, 13, "Петрович")]])
+    client = BitrixClient(
+        "https://box.example.invalid/rest/1/token", polite_delay_seconds=0, session=session,
+    )
+
+    with pytest.raises(BitrixError, match="ФИО"):
+        client.find_director_contact_global("Иванов", "Иван")
+
+
+def test_company_specific_duplicate_uses_lead_linked_founder_owner():
+    session = FakeSession([
+        [_director(10, 72), _director(20, 13)],
+        [],
+        [{"ID": "99", "CONTACT_ID": "20"}],
+    ])
+    client = BitrixClient(
+        "https://box.example.invalid/rest/1/token", polite_delay_seconds=0, session=session,
+    )
+
+    contact = client.find_director_contact("601", "Иванов", "Иван", "Иванович")
+
+    assert contact["ID"] == "20"

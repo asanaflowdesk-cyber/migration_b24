@@ -55,17 +55,6 @@ class FakeClient:
         pass
 
 
-class FakeDistributionSource:
-    def __init__(self, *args, **kwargs):
-        pass
-
-    def load(self):
-        return SimpleNamespace(
-            users=(SimpleNamespace(user_id=11, full_name="Test Manager"),),
-            company_assignments={},
-        )
-
-
 class FakeLeadPipeline:
     instances = []
 
@@ -90,7 +79,12 @@ def test_main_processes_each_application_once(monkeypatch, tmp_path):
     monkeypatch.setattr(main_module, "EqazynaScraper", FakeScraper)
     monkeypatch.setattr(main_module, "EgovClient", FakeEgov)
     monkeypatch.setattr(main_module, "BitrixClient", FakeClient)
-    monkeypatch.setattr(main_module, "GoogleSheetDistributionSource", FakeDistributionSource)
+    from eqazyna_bitrix.distribution import GoogleSheetDistributionSource
+
+    def forbidden_sheet_load(self):
+        raise AssertionError("New-lead assignment must not read Google Sheets")
+
+    monkeypatch.setattr(GoogleSheetDistributionSource, "load", forbidden_sheet_load)
     monkeypatch.setattr(main_module, "LeadPipeline", FakeLeadPipeline)
     monkeypatch.setattr(main_module, "write_xlsx", lambda results, path: path)
     monkeypatch.setattr(
@@ -133,3 +127,6 @@ def test_main_processes_each_application_once(monkeypatch, tmp_path):
     assert len(FakeLeadPipeline.instances) == 1
     assert FakeLeadPipeline.instances[0].validated is True
     assert FakeLeadPipeline.instances[0].calls == 1
+
+    assert FakeLeadPipeline.instances[0].config.distribution is None
+    assert FakeLeadPipeline.instances[0].config.assigned_by_id == "4"

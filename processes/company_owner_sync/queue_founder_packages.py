@@ -11,12 +11,15 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
+from eqazyna_bitrix.models import TECHNICAL_USER_ID
+
 import requests
 
 from eqazyna_bitrix.bitrix_client import BitrixClient
 from eqazyna_bitrix.settings import Settings
 from fast_package_reconciler import process_package_fast
 from authority_state import remember_authority_sources
+from first_assignment import complete_packages, prepare_first_assignments
 from sync_founder_packages import build_packages, is_founder_contact, load_snapshot, normalized_id, select_source_package
 
 
@@ -41,6 +44,8 @@ def queue_call(url: str, key: str, action: str, **payload: Any) -> dict[str, Any
             data = response.json()
             if not isinstance(data, dict) or not data.get("ok"):
                 error = str(data.get("error") or "") if isinstance(data, dict) else "invalid_response"
+                if action == "owner_events" and error == "unknown_action":
+                    return {"ok": True, "events": [], "legacy_queue": True}
                 if error in {"internal_error", "busy"} and attempt < len(QUEUE_RETRY_DELAYS):
                     time.sleep(QUEUE_RETRY_DELAYS[attempt])
                     continue
@@ -192,6 +197,10 @@ def add_direct_contact_leads(
             and normalized_id(lead.get("CONTACT_ID")) in contact_ids
             and lead_id not in nested_lead_ids
         ]
+        if package.get("direct_contact_leads"):
+            merged = {int(lead["id"]): lead for lead in package["direct_contact_leads"]}
+            merged.update({int(lead["id"]): lead for lead in direct_leads})
+            direct_leads = list(merged.values())
         item = dict(package)
         item["direct_contact_leads"] = direct_leads
         enriched.append(item)
@@ -268,13 +277,15 @@ def process_claim(
 
     print(f"[PROCESSING] snapshot: start; queued={len(items)}", flush=True)
     snapshot = _load_snapshot_fast(client)
-    packages, _ = build_packages(
+    packages, raw_skipped = build_packages(
         snapshot["companies"],
         snapshot["leads"],
         snapshot["contacts"],
         snapshot["requisites"],
     )
     packages = add_direct_contact_leads(packages, snapshot["leads"])
+    packages = complete_packages(packages, snapshot, raw_skipped)
+    packages, _first_conflicts = prepare_first_assignments(packages, output_dir, apply=True)
     print(
         "[PROCESSING] snapshot: ready; "
         f"companies={len(snapshot['companies'])}; leads={len(snapshot['leads'])}; "
@@ -331,6 +342,11 @@ def process_claim(
                 contact_id, version, False, "failed", "source_contact_package_not_resolved", "MANUAL_REVIEW", operation_id
             )
         else:
+            if packages_by_contact[contact_id].get("first_assignment_conflict"):
+                results_by_key[(contact_id, version)] = _result_payload(
+                    contact_id, version, False, "failed", packages_by_contact[contact_id]["first_assignment_conflict"], "MANUAL_REVIEW", operation_id
+                )
+                continue
             package_contacts = {
                 normalized_id(contact.get("id"))
                 for contact in packages_by_contact[contact_id].get("contacts", [])
@@ -357,7 +373,7 @@ def process_claim(
     # must not let recovery revert to a previous duplicate's recorded source.
     remember_authority_sources(output_dir, [
         {"status": "ACCEPTED", "fio": job["package"].get("fio"), "contact_id": job["contact_id"]}
-        for job in valid_jobs
+        for job in valid_jobs if not job["package"].get("locked_owner_id")
     ])
     duplicate_events = max(len(raw_jobs) - len(valid_jobs), 0)
     overlap_count = sum(
@@ -368,8 +384,8 @@ def process_claim(
 
     suppression_rows: list[dict[str, int]] = []
     for job in valid_jobs:
-        target = normalized_id(contacts_by_id.get(int(job["contact_id"]), {}).get("ASSIGNED_BY_ID"))
-        if not target:
+        target = normalized_id(job["package"].get("locked_owner_id")) or normalized_id(contacts_by_id.get(int(job["contact_id"]), {}).get("ASSIGNED_BY_ID"))
+        if not target or target == TECHNICAL_USER_ID:
             continue
         for entity, entity_id in job["owned_entity_keys"]:
             if entity == "contact" and entity_id != int(job["contact_id"]):

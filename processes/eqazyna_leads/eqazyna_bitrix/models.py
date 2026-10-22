@@ -5,7 +5,11 @@ from datetime import datetime, timezone
 from typing import Any
 
 
+TECHNICAL_USER_ID = 4
+
+
 MANAGER_NAMES = {
+    4: "Технический пользователь — распределение в Б24",
     22: "Гаухар Джунисалиева",
     23: "Айнура Жумакан",
     16: "Андрей Крижевский",

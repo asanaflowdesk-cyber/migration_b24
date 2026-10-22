@@ -15,6 +15,8 @@ else:
 
 import requests
 
+from .models import TECHNICAL_USER_ID
+
 
 class BitrixError(RuntimeError):
     pass
@@ -36,6 +38,13 @@ def _safe_error(value: Any) -> str:
 def _read_only(method: str) -> bool:
     lowered = method.casefold()
     return lowered != "batch" and lowered.endswith((".get", ".list", ".fields", ".getlist", ".current"))
+
+
+def _is_director_contact(row: dict[str, Any]) -> bool:
+    return any(
+        word in str(row.get("POST") or "").casefold()
+        for word in ("руковод", "учред", "директор")
+    ) or "eqazyna_director:" in str(row.get("COMMENTS") or "").casefold()
 
 
 @dataclass(slots=True)
@@ -645,6 +654,77 @@ class BitrixClient:
 
     # ---------- contacts ----------
 
+    def _select_director_contact(
+        self,
+        rows: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """Resolve duplicates using existing lead links, never an arbitrary ID.
+
+        A technical owner is not a manager binding. Different complete names
+        or competing lead-linked managers require a reported conflict.
+        """
+        if not rows:
+            return None
+        identities = {
+            tuple(
+                " ".join(str(row.get(key) or "").casefold().replace("ё", "е").split())
+                for key in ("LAST_NAME", "NAME", "SECOND_NAME")
+            )
+            for row in rows
+        }
+        if len(identities) > 1:
+            raise BitrixError("Найдено несколько контактов руководителя с разными ФИО")
+        owned = [
+            row for row in rows
+            if str(row.get("ASSIGNED_BY_ID") or "").strip().isdigit()
+            and int(str(row["ASSIGNED_BY_ID"]).strip()) > 0
+        ]
+        managers = [
+            row for row in owned
+            if int(str(row["ASSIGNED_BY_ID"]).strip()) != TECHNICAL_USER_ID
+        ]
+        if not managers:
+            return owned[0] if owned else rows[0]
+        owners = {int(str(row["ASSIGNED_BY_ID"]).strip()) for row in managers}
+        if len(owners) == 1:
+            return managers[0]
+
+        linked = []
+        for row in managers:
+            contact_id = str(row.get("ID") or "").strip()
+            if not contact_id.isdigit():
+                raise BitrixError("Контакт руководителя не содержит корректного ID")
+            lead = self.find_latest_lead_for_contact(contact_id)
+            if lead and str(lead.get("CONTACT_ID") or "").strip() == contact_id:
+                linked.append(row)
+        linked_owners = {int(str(row["ASSIGNED_BY_ID"]).strip()) for row in linked}
+        if len(linked_owners) == 1:
+            return linked[0]
+        raise BitrixError(
+            "У контактов учредителя разные ответственные; "
+            "однозначный источник по связанным лидам не найден"
+        )
+
+    def find_company_director_contact(self, company_id: str | int) -> dict[str, Any] | None:
+        """Recover an existing founder binding when eGov did not return a FIO.
+
+        Never guess between different people or conflicting owners. Such a
+        company is reported as an error instead of being reset to user 4.
+        """
+        rows = self.list_all(
+            "crm.contact.list",
+            {
+                "order": {"ID": "ASC"},
+                "filter": {"COMPANY_ID": int(company_id)},
+                "select": [
+                    "ID", "LAST_NAME", "NAME", "SECOND_NAME", "POST",
+                    "COMPANY_ID", "ASSIGNED_BY_ID", "COMMENTS",
+                ],
+            },
+        )
+        directors = [row for row in rows if _is_director_contact(row)]
+        return self._select_director_contact(directors)
+
     def find_director_contact(
         self,
         company_id: str | int,
@@ -659,7 +739,7 @@ class BitrixClient:
         }
         if second_name:
             filter_fields["SECOND_NAME"] = second_name
-        result = self.call(
+        result = self.list_all(
             "crm.contact.list",
             {
                 "order": {"ID": "ASC"},
@@ -678,7 +758,7 @@ class BitrixClient:
                 ],
             },
         )
-        return result[0] if isinstance(result, list) and result else None
+        return self._select_director_contact(result)
 
     def find_director_contact_global(
         self,
@@ -688,9 +768,9 @@ class BitrixClient:
     ) -> dict[str, Any] | None:
         """Find the same director across all companies.
 
-        Only contacts explicitly marked as a director are eligible. If several
-        company-specific contact cards exist for the same FIO, the oldest one
-        with a populated ASSIGNED_BY_ID is the historical assignment source.
+        Only contacts explicitly marked as a director are eligible. Existing
+        lead links resolve duplicate cards with different managers; unresolved
+        conflicts are reported instead of picking an old card by ID.
         """
         filter_fields: dict[str, Any] = {
             "LAST_NAME": last_name,
@@ -698,7 +778,7 @@ class BitrixClient:
         }
         if second_name:
             filter_fields["SECOND_NAME"] = second_name
-        result = self.call(
+        result = self.list_all(
             "crm.contact.list",
             {
                 "order": {"ID": "ASC"},
@@ -717,21 +797,12 @@ class BitrixClient:
                 ],
             },
         )
-        if not isinstance(result, list):
-            return None
         directors = [
             row
             for row in result
-            if "руковод" in str(row.get("POST") or "").casefold()
-            or "EQAZYNA_DIRECTOR:" in str(row.get("COMMENTS") or "")
+            if _is_director_contact(row)
         ]
-        if not directors:
-            return None
-        for row in directors:
-            raw_owner = str(row.get("ASSIGNED_BY_ID") or "").strip()
-            if raw_owner.isdigit() and int(raw_owner) > 0:
-                return row
-        return directors[0]
+        return self._select_director_contact(directors)
 
     def ensure_contact_company_link(
         self,

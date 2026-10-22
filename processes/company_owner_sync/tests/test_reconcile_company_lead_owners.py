@@ -182,3 +182,17 @@ def test_dry_run_does_not_write():
         ("company", "planned"),
         ("lead", "planned"),
     }
+
+
+def test_manual_reconcile_waits_for_bitrix_when_contact_owner_is_technical():
+    source = package()
+    source["authority_contact_ids"] = [100]
+    client = Client([contact(100, 4)], company_owner=13, lead_owner=13)
+
+    rows, error = reconcile_package(client, source, apply=True)
+
+    assert error == ""
+    assert rows == []
+    assert client.updated == []
+    assert client.companies[10]["ASSIGNED_BY_ID"] == "13"
+    assert client.leads[20]["ASSIGNED_BY_ID"] == "13"

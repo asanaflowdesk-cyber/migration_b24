@@ -8,12 +8,16 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
+
 from collections.abc import Callable
+
+from eqazyna_bitrix.models import TECHNICAL_USER_ID
 
 from eqazyna_bitrix.bitrix_client import BitrixClient
 from eqazyna_bitrix.settings import Settings
 from fast_package_reconciler import batch_execute, bulk_owners
 from authority_state import load_authority_sources
+from first_assignment import complete_packages, prepare_first_assignments
 from sync_founder_packages import (
     build_packages,
     load,
@@ -96,6 +100,18 @@ def resolve_authority_packages(
     }
 
     for package in packages:
+        if package.get("first_assignment_conflict"):
+            skipped.append({"type": package["first_assignment_conflict"], "fio": package.get("fio", "")})
+            continue
+        if package.get("locked_owner_id"):
+            item = copy.deepcopy(package)
+            item["owner_id"] = int(package["locked_owner_id"])
+            item["authority_contact_ids"] = []
+            item["sync_package_contacts"] = True
+            resolved.append(item)
+            continue
+        if package.get("technical_packet_only"):
+            continue
         authority: list[dict[str, Any]] = []
         for item in package.get("contacts", []):
             contact_id = normalized_id(item.get("id"))
@@ -248,6 +264,10 @@ def add_direct_contact_leads(
             and normalized_id(lead.get("CONTACT_ID")) in contact_ids
             and lead_id not in company_lead_ids
         ]
+        if package.get("direct_contact_leads"):
+            merged = {int(lead["id"]): lead for lead in package["direct_contact_leads"]}
+            merged.update({int(lead["id"]): lead for lead in direct_leads})
+            direct_leads = list(merged.values())
         item = copy.deepcopy(package)
         item["direct_contact_leads"] = direct_leads
         result.append(item)
@@ -338,9 +358,20 @@ def reconcile_package(
     if not items:
         return [], ""
 
-    target, source_contact_id, source_error = live_authority_owner(client, authority_ids)
-    if source_error or not target or not source_contact_id:
+    fixed_owner = normalized_id(package.get("locked_owner_id"))
+
+    def read_target():
+        if fixed_owner:
+            return fixed_owner, int(package.get("source_contact_id") or 0), ""
+        return live_authority_owner(client, authority_ids)
+
+    target, source_contact_id, source_error = read_target()
+    if source_error or not target or (not source_contact_id and not fixed_owner):
         return [], source_error or "director_owner_unresolved"
+    if target == TECHNICAL_USER_ID:
+        # ID 4 hands the package to native Bitrix24 distribution. A lead may
+        # already have a real manager while its contact is still being updated.
+        return [], ""
 
     owners, owner_errors = bulk_owners(client, items)
     rows = _rows_from_live(package, items, owners, owner_errors, target, source_contact_id)
@@ -348,9 +379,11 @@ def reconcile_package(
         return rows, "target_read_failed" if owner_errors else ""
 
     for _round in range(MAX_STABILIZE_ROUNDS):
-        target, source_contact_id, source_error = live_authority_owner(client, authority_ids)
-        if source_error or not target or not source_contact_id:
+        target, source_contact_id, source_error = read_target()
+        if source_error or not target or (not source_contact_id and not fixed_owner):
             return rows, source_error or "director_owner_unresolved"
+        if target == TECHNICAL_USER_ID:
+            return [], ""
 
         owners, owner_errors = bulk_owners(client, items)
         rows = _rows_from_live(package, items, owners, owner_errors, target, source_contact_id)
@@ -376,8 +409,8 @@ def reconcile_package(
                     row["status"] = "error"
                     row["error"] = update_errors[f"u{index}"]
 
-        target_after, source_after, source_error = live_authority_owner(client, authority_ids)
-        if source_error or not target_after or not source_after:
+        target_after, source_after, source_error = read_target()
+        if source_error or not target_after or (not source_after and not fixed_owner):
             return rows, source_error or "director_owner_unresolved_after_write"
         if target_after != target:
             # The manager changed the director while this package was running.
@@ -420,6 +453,9 @@ def run(client: BitrixClient, output_dir: Path, apply: bool) -> dict[str, Any]:
         snapshot["requisites"],
     )
     state_dir = Path(os.getenv("OWNER_SYNC_OUTPUT_DIR", str(Path.home() / ".company-owner-sync" / "output")))
+    raw_packages = add_direct_contact_leads(raw_packages, snapshot["leads"])
+    raw_packages = complete_packages(raw_packages, snapshot, raw_skipped)
+    raw_packages, _first_conflicts = prepare_first_assignments(raw_packages, state_dir, apply=apply)
     packages, authority_skipped = resolve_authority_packages(raw_packages, snapshot["contacts"], snapshot["leads"], load_authority_sources(state_dir))
     packages = add_direct_contact_leads(packages, snapshot["leads"])
     skipped = raw_skipped + authority_skipped

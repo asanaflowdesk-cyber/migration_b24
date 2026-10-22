@@ -180,3 +180,40 @@ def test_failed_event_suppression_does_not_write_duplicate_contacts(monkeypatch,
     monkeypatch.setattr(queue_founder_packages, "queue_call", fail)
     assert repair_package_residuals(crm, tmp_path)["status"] == "PARTIAL"
     assert crm.writes == []
+
+
+def test_technical_packet_with_unknown_first_owner_does_not_guess(tmp_path):
+    crm = CRM()
+    crm.contacts[837]["ASSIGNED_BY_ID"] = "4"
+    before = deepcopy((crm.contacts, crm.companies, crm.leads))
+
+    summary = repair_package_residuals(crm, tmp_path)
+
+    assert summary["status"] == "PARTIAL"
+    assert summary["residual_packages"] == 0
+    assert crm.writes == []
+    assert (crm.contacts, crm.companies, crm.leads) == before
+
+
+def test_technical_owner_event_does_not_suppress_or_overwrite_robot_decisions(monkeypatch, tmp_path):
+    import queue_founder_packages
+
+    crm = CRM()
+    crm.contacts[837]["ASSIGNED_BY_ID"] = "4"
+    actions = []
+    monkeypatch.setattr(
+        queue_founder_packages, "best_effort_queue_call",
+        lambda url, key, action, **kwargs: actions.append(action),
+    )
+
+    results, failures = process_claim(
+        crm, tmp_path,
+        {"claim_id": "technical", "items": [{"contact_id": 837, "version": 1}]},
+        queue_url="queue", queue_key="key",
+    )
+
+    assert failures == 1
+    assert results[0]["success"] is False
+    assert results[0]["error"] == "first_assignment_order_unknown"
+    assert "remember_owners" not in actions
+    assert crm.writes == []

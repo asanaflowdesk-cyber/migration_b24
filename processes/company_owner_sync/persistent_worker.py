@@ -9,7 +9,7 @@ from pathlib import Path
 from eqazyna_bitrix.bitrix_client import BitrixClient
 from eqazyna_bitrix.settings import Settings
 from queue_founder_packages import process_queue
-from package_recovery import repair_package_residuals
+from package_recovery import repair_package_residuals, receive_owner_events
 
 
 LOG = logging.getLogger("company_owner_sync_worker")
@@ -58,6 +58,7 @@ def run() -> None:
 
     while True:
         try:
+            event_count = receive_owner_events(output_dir, queue_url, queue_key)
             summary = process_queue(
                 client,
                 queue_url,
@@ -66,7 +67,7 @@ def run() -> None:
                 max_batches,
             )
 
-            if summary.get("drained") and time.monotonic() >= next_recovery:
+            if event_count or (summary.get("drained") and time.monotonic() >= next_recovery):
                 # Recovery errors must not prevent subsequent owner events.
                 next_recovery = time.monotonic() + recovery_seconds
                 try:

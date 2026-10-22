@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import random
 import re
 from datetime import datetime
 from dataclasses import dataclass
@@ -9,21 +8,14 @@ from typing import Any
 from common.naming import short_organization_name
 
 from .bitrix_client import BitrixClient, BitrixError
-from .distribution import (
-    AssignmentUser,
-    DistributionError,
-    DistributionSnapshot,
-    branch_key,
-    is_branch_head,
-    normalise_bin,
-)
+from .distribution import DistributionSnapshot
 from .formatter import (
     build_company_summary,
     build_lead_comment,
     build_lead_title,
     build_timeline_comment,
 )
-from .models import Application, CompanyEnrichment, ProcessResult
+from .models import TECHNICAL_USER_ID, Application, CompanyEnrichment, ProcessResult
 
 
 DEFAULT_LEAD_GENERATION_FIELD = "UF_CRM_1785917145255"
@@ -45,11 +37,10 @@ class LeadPipelineConfig:
     One e-Qazyna application number is represented by one lead. One BIN is
     represented by one company, one company requisite and, when a valid
     director name is available, one linked director contact. The responsible
-    assignment is taken from the live Google Sheets rules: an explicit BIN
-    binding wins and an active director owner is retained. For Astana only,
-    each regular manager receives at most one new founder per run and overflow
-    goes to the Astana branch head. Outside Astana the current user list is
-    balanced without requiring a ROP. Every genuinely new application starts
+    assignment follows the current founder/director contact owner. Without
+    that binding, the bundle goes to technical user ID 4 for Bitrix24 robots.
+    Sheets, geography, workload and the former manager pool do not participate
+    in assignment. Every genuinely new application starts
     in NEW. The only exception is a latest related failed lead with the reason
     «Уже работает с Евразией»: the new lead is created in JUNK with that reason.
     No other historical stage or failure reason is inherited.
@@ -58,7 +49,9 @@ class LeadPipelineConfig:
     # Kept for backwards compatibility with older callers. New applications
     # are forced to NEW by business rule; this value no longer overrides it.
     lead_status_id: str = DEFAULT_NEW_LEAD_STATUS_ID
-    assigned_by_id: str | None = None
+    # Legacy assignment settings remain accepted by existing callers but no
+    # longer change the founder-owner / technical-user routing rule.
+    assigned_by_id: str | None = "4"
     overwrite_assigned_by_on_update: bool = False
     lead_generation_field: str = DEFAULT_LEAD_GENERATION_FIELD
     lead_generation_value: str = DEFAULT_LEAD_GENERATION_VALUE
@@ -75,8 +68,7 @@ class LeadPipelineConfig:
     random_seed: int | None = None
     distribution: DistributionSnapshot | None = None
     astana_department_id: int = 46
-    # Active Astana sales users live in the two child departments. The parent
-    # DepartmentID=46 remains the region marker, but its head is not a sales ROP.
+    # Deprecated geography settings, retained for caller compatibility.
     astana_sales_department_ids: tuple[int, ...] = (65, 66)
 
 
@@ -108,39 +100,12 @@ class LeadPipeline:
             "RQ_DIRECTOR",
             "RQ_OKED",
         }
-        self._manager_ids = tuple(
-            dict.fromkeys(
-                int(value)
-                for value in config.manager_ids
-                if str(value).strip().isdigit() and int(value) > 0
-            )
-        )
-        self._manager_loads: dict[int, int] = {}
-        self._distribution = config.distribution
-        self._astana_sales_department_ids = {
-            int(value)
-            for value in config.astana_sales_department_ids
-            if str(value).strip().isdigit() and int(value) > 0
-        }
-        self._astana_department_ids = {
-            int(config.astana_department_id),
-            *self._astana_sales_department_ids,
-        }
-        self._assignment_users: dict[int, AssignmentUser] = {
-            user.user_id: user for user in (config.distribution.users if config.distribution else ())
-        }
-        self._users_by_department: dict[int, list[int]] = {}
-        for user in self._assignment_users.values():
-            self._users_by_department.setdefault(user.department_id, []).append(user.user_id)
-        self._department_heads: dict[int, int] = {}
-        self._user_cache: dict[int, dict[str, Any] | None] = {}
-        self._founder_assignments: dict[str, int] = {}
-        self._new_founders_by_manager: dict[int, set[str]] = {}
         # Entities created earlier in the same run must be reused even in dry_run.
         # This keeps the preview identical to apply and prevents one director
         # from receiving different managers across several applications.
         self._run_companies_by_bin: dict[str, dict[str, Any]] = {}
         self._run_contacts_by_key: dict[str, dict[str, Any]] = {}
+        self._planned_contacts_by_person: dict[str, dict[str, Any]] = {}
         self._run_requisites_by_bin: dict[str, dict[str, Any]] = {}
         self._failed_status_ids: set[str] = {DEFAULT_EXISTING_CLIENT_FAILURE_STATUS_ID}
         self._terminal_status_ids: set[str] = {DEFAULT_EXISTING_CLIENT_FAILURE_STATUS_ID, "CONVERTED"}
@@ -150,11 +115,6 @@ class LeadPipeline:
         self._existing_client_failure_reason_values: set[str] = {
             self._normalise_label(config.existing_client_failure_reason)
         }
-        self._random = (
-            random.Random(config.random_seed)
-            if config.random_seed is not None
-            else random.SystemRandom()
-        )
 
     # ---------- preflight ----------
 
@@ -219,95 +179,6 @@ class LeadPipeline:
             )
 
         self._load_lead_status_catalog()
-        if self._distribution is not None:
-            self._validate_distribution()
-        else:
-            self._load_manager_workloads()
-
-    def _validate_distribution(self) -> None:
-        if not self._assignment_users:
-            raise DistributionError("Список участников распределения пуст")
-        for user in self._assignment_users.values():
-            record = self._get_active_user(user.user_id)
-            raw_departments = record.get("UF_DEPARTMENT")
-            if raw_departments not in (None, "", []):
-                values = raw_departments if isinstance(raw_departments, list) else [raw_departments]
-                actual = {
-                    int(str(value))
-                    for value in values
-                    if str(value).strip().isdigit()
-                }
-                if actual and user.department_id not in actual:
-                    raise DistributionError(
-                        f"Пользователь {user.user_id} указан в DepartmentID={user.department_id}, "
-                        f"но в Bitrix24 состоит в {sorted(actual)}"
-                    )
-
-        fixed_ids = set(self._distribution.company_assignments.values())
-        for manager_id in sorted(fixed_ids):
-            self._get_active_user(manager_id)
-
-        active_astana_departments = set(self._active_astana_scope_department_ids())
-        for department_id in sorted(self._users_by_department):
-            members = [
-                user.user_id
-                for user in self._assignment_users.values()
-                if user.department_id == department_id
-            ]
-            heads = [
-                user.user_id
-                for user in self._assignment_users.values()
-                if user.department_id == department_id and is_branch_head(user.role)
-            ]
-            if department_id not in active_astana_departments:
-                # Outside Astana no overflow-to-ROP rule is used. A branch may
-                # legitimately contain several managers and no ROP.
-                continue
-            if len(heads) == 1:
-                self._department_heads[department_id] = heads[0]
-            elif len(heads) > 1:
-                raise DistributionError(
-                    f"Для DepartmentID={department_id} в user_list указано несколько РОПов: "
-                    + ", ".join(map(str, sorted(heads)))
-                )
-            elif len(members) == 1:
-                # Explicit business exception: when the table contains one
-                # person for the department, that person receives the flow.
-                self._department_heads[department_id] = members[0]
-            else:
-                raise DistributionError(
-                    f"Для Астаны DepartmentID={department_id} в user_list не указан РОП, "
-                    f"а в user_list указано {len(members)} сотрудников"
-                )
-
-        manager_ids = sorted(self._assignment_users)
-        try:
-            self._manager_loads = {
-                manager_id: self.client.count_open_leads_for_manager(
-                    manager_id,
-                    self._terminal_status_ids,
-                )
-                for manager_id in manager_ids
-            }
-        except Exception as exc:  # noqa: BLE001 - safe deterministic fallback
-            self._manager_loads = {manager_id: 0 for manager_id in manager_ids}
-            self.validation_warnings.append(
-                "Не удалось прочитать текущую нагрузку из Bitrix24; "
-                f"будет использована только нагрузка текущего запуска: {exc}"
-            )
-
-    def _get_active_user(self, user_id: int) -> dict[str, Any]:
-        record = self._get_user_record(user_id)
-        if not record:
-            raise DistributionError(f"Пользователь Bitrix24 ID={user_id} не найден")
-        if str(record.get("ACTIVE") or "Y").strip().upper() == "N":
-            raise DistributionError(f"Пользователь Bitrix24 ID={user_id} неактивен")
-        return record
-
-    def _get_user_record(self, user_id: int) -> dict[str, Any] | None:
-        if user_id not in self._user_cache:
-            self._user_cache[user_id] = self.client.get_user(user_id)
-        return self._user_cache[user_id]
 
     def _load_lead_status_catalog(self) -> None:
         try:
@@ -411,27 +282,6 @@ class LeadPipeline:
                 "Лиды с текстовой исторической причиной будут распознаны, но записать причину в enum без ID нельзя."
             )
 
-    def _load_manager_workloads(self) -> None:
-        if not self._manager_ids:
-            self.validation_warnings.append(
-                "Список менеджеров распределения пуст; Bitrix24 назначит ответственного по умолчанию."
-            )
-            return
-        loads: dict[int, int] = {}
-        try:
-            for manager_id in self._manager_ids:
-                loads[manager_id] = self.client.count_open_leads_for_manager(
-                    manager_id,
-                    self._terminal_status_ids,
-                )
-        except Exception as exc:  # noqa: BLE001 - distribution still remains possible
-            loads = {manager_id: 0 for manager_id in self._manager_ids}
-            self.validation_warnings.append(
-                "Не удалось получить текущую загрузку менеджеров; "
-                f"первичное распределение будет случайным между всеми: {exc}"
-            )
-        self._manager_loads = loads
-
     def _validate_lead_generation_field(self) -> None:
         fields = self._get_lead_fields_meta()
         field_meta = fields.get(self.config.lead_generation_field)
@@ -514,7 +364,6 @@ class LeadPipeline:
         company = EntityOutcome(None, "company_not_processed")
         contact = EntityOutcome(None, "contact_not_processed")
         requisite = EntityOutcome(None, "requisite_not_processed")
-        reserved_manager_id: int | None = None
 
         doc_number = str(app.doc_number or "").strip()
         if not doc_number:
@@ -575,31 +424,13 @@ class LeadPipeline:
             )
             inherited_assigned_by_id, assignment_reason = self._resolve_assignment(
                 assignment_contact,
-                app,
-                enrichment,
-                existing_bin_owner_id=self._existing_bin_owner_id(
-                    existing_company,
-                    existing_contact,
-                ),
             )
-            reserved_manager_id = inherited_assigned_by_id
 
             lead_status_id, status_reason, failure_reason, status_reference_lead = (
                 self._resolve_status(
                     contact_reference_lead,
                     company_reference_lead,
                 )
-            )
-            preserve_existing_package_owner = (
-                self._distribution is not None and existing_company is not None
-            )
-            force_entity_assignment = (
-                not preserve_existing_package_owner
-                and assignment_reason not in {
-                    "director_contact_owner",
-                    "active_director_owner",
-                    "existing_bin_current_owner",
-                }
             )
 
             try:
@@ -608,7 +439,7 @@ class LeadPipeline:
                     enrichment,
                     existing_company=existing_company,
                     preferred_assigned_by_id=inherited_assigned_by_id,
-                    force_assigned_by=force_entity_assignment,
+                    force_assigned_by=True,
                 )
                 if company.record:
                     self._run_companies_by_bin[app.bin] = company.record
@@ -623,24 +454,16 @@ class LeadPipeline:
                     app,
                     enrichment,
                     company.entity_id,
-                    existing_contact=existing_contact,
-                    # For an existing contact the parser may use its factual
-                    # owner for the new lead, but must not rewrite the contact
-                    # itself. A newly created contact still receives the same
-                    # owner as its lead.
-                    preferred_assigned_by_id=(
-                        None
-                        if (
-                            preserve_existing_package_owner
-                            and existing_contact is not None
-                        )
-                        else inherited_assigned_by_id
-                    ),
-                    force_assigned_by=force_entity_assignment,
+                    existing_contact=existing_contact or assignment_contact,
+                    preferred_assigned_by_id=inherited_assigned_by_id,
+                    force_assigned_by=True,
                 )
                 contact_key = self._director_cache_key(app, enrichment)
                 if contact.record and contact_key:
                     self._run_contacts_by_key[contact_key] = contact.record
+                    if contact.record.get("_EQAZYNA_PLANNED"):
+                        person_key = contact_key.split("|", 1)[1]
+                        self._planned_contacts_by_person[person_key] = contact.record
                 if contact.warning:
                     warnings.append(contact.warning)
             except Exception as exc:  # noqa: BLE001 - lead must still be created
@@ -694,8 +517,6 @@ class LeadPipeline:
             lead_result.address_action = requisite.address_action
             return lead_result
         except Exception as exc:  # noqa: BLE001 - report error per application
-            if reserved_manager_id is not None:
-                self._release_manager_load(reserved_manager_id)
             return ProcessResult(
                 app,
                 enrichment,
@@ -758,12 +579,15 @@ class LeadPipeline:
         company: dict[str, Any] | None,
     ) -> dict[str, Any] | None:
         cache_key = self._director_cache_key(app, enrichment)
-        if cache_key and cache_key in self._run_contacts_by_key:
-            return self._run_contacts_by_key[cache_key]
+        planned = self._run_contacts_by_key.get(cache_key or "")
+        if planned and planned.get("_EQAZYNA_PLANNED"):
+            return planned
         company_id = str((company or {}).get("ID") or "")
         person = self._split_director_name(enrichment.director)
-        if not company_id.isdigit() or person is None:
+        if not company_id.isdigit():
             return None
+        if person is None:
+            return self.client.find_company_director_contact(company_id)
         last_name, name, second_name = person
         return self.client.find_director_contact(
             company_id,
@@ -788,42 +612,25 @@ class LeadPipeline:
         enrichment: CompanyEnrichment,
         existing_contact: dict[str, Any] | None,
     ) -> dict[str, Any] | None:
-        """Return the historical director card used only for assignment.
+        """Use the company contact, then the same director across all companies.
 
-        A director may control several companies. The company-specific contact
-        is preferred when it already has an approved owner. Otherwise we look
-        for the same director FIO globally and inherit that historical owner.
-        The global card is not re-linked or edited; it is only an assignment
-        reference for the new company/contact/lead bundle. In sheet-driven
-        mode an existing BIN is handled separately and keeps its factual owner
-        without requiring that owner to be present in user_list.
+        The real contact owner wins regardless of old manager pools or Sheets.
+        A newly encountered name without an existing binding goes to ID 4.
         """
-        if self._distribution is not None:
-            # For a new BIN an owner absent from user_list is meaningful: it
-            # triggers routing to that branch's ROP, so it must not be erased
-            # by the old hard-coded approved-manager filter. Existing BINs are
-            # resolved before that fallback and keep the factual owner.
-            if self._record_assigned_by_id(existing_contact or {}) is not None:
-                return existing_contact
-            person = self._split_director_name(enrichment.director)
-            finder = getattr(self.client, "find_director_contact_global", None)
-            if person is not None and callable(finder):
-                global_contact = finder(*person)
-                if self._record_assigned_by_id(global_contact or {}) is not None:
-                    return global_contact
-            return existing_contact
-        if self._approved_record_assigned_by_id(existing_contact or {}) is not None:
+        owner_id = self._record_assigned_by_id(existing_contact or {})
+        if owner_id is not None and owner_id != TECHNICAL_USER_ID:
             return existing_contact
         person = self._split_director_name(enrichment.director)
-        if person is None:
-            return existing_contact
         finder = getattr(self.client, "find_director_contact_global", None)
-        if not callable(finder):
-            return existing_contact
-        last_name, name, second_name = person
-        global_contact = finder(last_name, name, second_name)
-        if self._approved_record_assigned_by_id(global_contact or {}) is not None:
-            return global_contact
+        if person is not None and callable(finder):
+            global_contact = finder(*person)
+            if self._record_assigned_by_id(global_contact or {}) is not None:
+                return global_contact
+        if person is not None:
+            person_key = "|".join(self._normalise_label(value) for value in person)
+            planned = self._planned_contacts_by_person.get(person_key)
+            if planned:
+                return planned
         return existing_contact
 
     def _find_contact_reference_lead(
@@ -868,275 +675,12 @@ class LeadPipeline:
     def _resolve_assignment(
         self,
         contact: dict[str, Any] | None,
-        app: Application | None = None,
-        enrichment: CompanyEnrichment | None = None,
-        *,
-        existing_bin_owner_id: int | None = None,
-    ) -> tuple[int | None, str | None]:
-        """Resolve the lead owner from one unambiguous source.
-
-        In sheet-driven mode an existing BIN keeps its factual contact owner,
-        or its company owner when the contact has none. New BINs continue to
-        use the configured distribution rules. In legacy mode the approved
-        director-contact owner remains the only historical assignment source.
-        """
-        if self._distribution is not None:
-            if app is None or enrichment is None:
-                raise DistributionError("Для нового распределения не переданы данные заявки")
-            return self._resolve_sheet_assignment(
-                contact,
-                app,
-                enrichment,
-                existing_bin_owner_id=existing_bin_owner_id,
-            )
-
-        manager_id = self._approved_record_assigned_by_id(contact or {})
-        if manager_id is not None:
-            self._reserve_manager_load(manager_id)
-            return manager_id, "director_contact_owner"
-
-        if self._manager_ids:
-            return self._select_least_loaded_manager(), "least_loaded_random"
-
-        configured = self._configured_assigned_by_id()
-        if configured:
-            return configured, "configured_default_no_manager_pool"
-        return None, None
-
-    def _resolve_sheet_assignment(
-        self,
-        contact: dict[str, Any] | None,
-        app: Application,
-        enrichment: CompanyEnrichment,
-        *,
-        existing_bin_owner_id: int | None = None,
     ) -> tuple[int, str]:
-        fixed = self._distribution.company_assignments.get(normalise_bin(app.bin))
-        if fixed is not None:
-            # Company_fix is an explicit manual decision. It overrides branch,
-            # historical ownership and the one-new-founder capacity.
-            self._founder_assignments.setdefault(self._founder_key(app, enrichment), fixed)
-            return fixed, "company_fix"
-
-        # An existing BIN is not redistributed. Its factual owner is valid for
-        # the new lead even when that employee is absent from user_list. The
-        # sheet pool and ROP fallbacks are exclusively for newly encountered
-        # BINs. Do not bind this historical ID to other, new BINs of the same
-        # founder within the run.
-        if existing_bin_owner_id is not None:
-            return existing_bin_owner_id, "existing_bin_current_owner"
-
+        """All new leads use the founder owner or Bitrix24 technical user 4."""
         owner_id = self._record_assigned_by_id(contact or {})
-        founder_key = self._founder_key(app, enrichment)
-
-        # A director/contact owner is the founder binding and therefore wins
-        # even when the company's address contains Astana.
         if owner_id is not None:
-            if owner_id in self._assignment_users:
-                self._founder_assignments[founder_key] = owner_id
-                return owner_id, "active_director_owner"
-            owner_departments = self._owner_department_ids(owner_id)
-            for department_id in owner_departments:
-                if (
-                    department_id in self._users_by_department
-                    or department_id in self._astana_department_ids
-                ):
-                    selected, reason = self._department_fallback(department_id)
-                    self._founder_assignments[founder_key] = selected
-                    return selected, reason
-            raise DistributionError(
-                f"Ответственного учредителя ID={owner_id} нет в user_list, "
-                "а его подразделение нельзя сопоставить с актуальным РОПом"
-            )
-
-        if founder_key in self._founder_assignments:
-            return self._founder_assignments[founder_key], "same_founder_in_run"
-
-        address = " ".join(
-            value
-            for value in (
-                enrichment.legal_address,
-                enrichment.region,
-                enrichment.city,
-            )
-            if value
-        )
-        is_astana = branch_key(address) == "astana"
-        if is_astana:
-            scope_users = self._astana_scope_users()
-            scope_label = (
-                "подразделения Астаны DepartmentID="
-                + ",".join(map(str, self._active_astana_scope_department_ids()))
-            )
-        else:
-            # Outside Astana the existing behaviour remains global: choose
-            # between all current managers from user_list by current load.
-            scope_users = sorted(self._assignment_users)
-            scope_label = "весь user_list"
-
-        if not scope_users:
-            raise DistributionError(
-                f"В user_list нет участников для {scope_label} (БИН {app.bin})"
-            )
-
-        if len(scope_users) == 1:
-            selected = scope_users[0]
-            self._founder_assignments[founder_key] = selected
-            self._manager_loads[selected] = self._manager_loads.get(selected, 0) + 1
-            return selected, "single_scope_user_no_limit"
-
-        regular_users = [
-            user_id
-            for user_id in scope_users
-            if not is_branch_head(self._assignment_users[user_id].role)
-        ]
-        if not is_astana:
-            # The one-founder limit and overflow to a ROP are Astana-specific.
-            # Other branches participate through their current managers as-is.
-            if not regular_users:
-                raise DistributionError(
-                    "В user_list нет менеджеров для распределения вне Астаны"
-                )
-            selected = self._select_sheet_least_loaded(regular_users)
-            self._founder_assignments[founder_key] = selected
-            return selected, "non_astana_least_loaded_no_rop_limit"
-
-        available = [
-            user_id
-            for user_id in regular_users
-            if not self._new_founders_by_manager.get(user_id)
-        ]
-        if available:
-            selected = self._select_sheet_least_loaded(available)
-            self._founder_assignments[founder_key] = selected
-            self._new_founders_by_manager.setdefault(selected, set()).add(founder_key)
-            return selected, (
-                "astana_new_founder_least_loaded"
-                if is_astana
-                else "new_founder_least_loaded"
-            )
-
-        heads = [
-            user_id
-            for user_id in scope_users
-            if is_branch_head(self._assignment_users[user_id].role)
-        ]
-        if not heads:
-            raise DistributionError(
-                f"Для {scope_label} исчерпан лимит менеджеров, но в user_list не указан РОП"
-            )
-        selected = self._select_sheet_least_loaded(heads)
-        self._founder_assignments[founder_key] = selected
-        return selected, (
-            "astana_overflow_to_rop" if is_astana else "overflow_to_rop"
-        )
-
-    def _existing_bin_owner_id(
-        self,
-        company: dict[str, Any] | None,
-        contact: dict[str, Any] | None,
-    ) -> int | None:
-        """Return the factual owner for an already known BIN.
-
-        The company-specific director contact is the strongest binding. If it
-        has no owner, preserve the current company owner for the new lead.
-        This helper deliberately ignores global same-FIO contacts: they may
-        belong to another BIN and therefore remain subject to normal routing.
-        """
-        if company is None:
-            return None
-        return (
-            self._record_assigned_by_id(contact or {})
-            or self._record_assigned_by_id(company)
-        )
-
-    def _owner_department_ids(self, owner_id: int) -> list[int]:
-        record = self._get_user_record(owner_id)
-        if not record:
-            return []
-        raw = record.get("UF_DEPARTMENT")
-        department_ids = raw if isinstance(raw, list) else [raw]
-        return [
-            int(str(value))
-            for value in department_ids
-            if str(value or "").strip().isdigit() and int(str(value)) > 0
-        ]
-
-    def _department_fallback(self, department_id: int) -> tuple[int, str]:
-        members = sorted(set(self._users_by_department.get(department_id, [])))
-        is_astana_department = department_id in self._astana_department_ids
-        if is_astana_department and (
-            department_id == self.config.astana_department_id or not members
-        ):
-            # A former employee can still belong to parent DepartmentID=46,
-            # while all active sales participants live in child departments
-            # 65 and 66. Fall back to the whole Astana scope in that case.
-            members = self._astana_scope_users()
-        if len(members) == 1:
-            selected = members[0]
-            reason = "missing_owner_to_single_department_user"
-        elif not is_astana_department:
-            regular_members = [
-                user_id
-                for user_id in members
-                if not is_branch_head(self._assignment_users[user_id].role)
-            ]
-            if not regular_members:
-                raise DistributionError(
-                    f"Для DepartmentID={department_id} в user_list нет менеджеров"
-                )
-            selected = self._select_sheet_least_loaded(regular_members)
-            return selected, "missing_owner_to_department_least_loaded"
-        else:
-            heads = [
-                user_id
-                for user_id in members
-                if is_branch_head(self._assignment_users[user_id].role)
-            ]
-            if not heads:
-                raise DistributionError(
-                    f"Для Астаны DepartmentID={department_id} не указан РОП в user_list"
-                )
-            selected = self._select_sheet_least_loaded(heads)
-            return selected, "missing_owner_to_department_head"
-        self._manager_loads[selected] = self._manager_loads.get(selected, 0) + 1
-        return selected, reason
-
-    def _astana_scope_users(self) -> list[int]:
-        return sorted(
-            {
-                user_id
-                for department_id in self._active_astana_scope_department_ids()
-                for user_id in self._users_by_department.get(department_id, [])
-            }
-        )
-
-    def _active_astana_scope_department_ids(self) -> list[int]:
-        child_departments = sorted(
-            department_id
-            for department_id in self._astana_sales_department_ids
-            if self._users_by_department.get(department_id)
-        )
-        return child_departments or [self.config.astana_department_id]
-
-    def _select_sheet_least_loaded(self, user_ids: list[int]) -> int:
-        minimum = min(self._manager_loads.get(user_id, 0) for user_id in user_ids)
-        candidates = sorted(
-            user_id
-            for user_id in user_ids
-            if self._manager_loads.get(user_id, 0) == minimum
-        )
-        selected = int(self._random.choice(candidates))
-        self._manager_loads[selected] = self._manager_loads.get(selected, 0) + 1
-        return selected
-
-    def _founder_key(self, app: Application, enrichment: CompanyEnrichment) -> str:
-        person = self._split_director_name(enrichment.director)
-        if person:
-            return "fio:" + "|".join(self._normalise_label(value) for value in person)
-        # Without a reliable FIO, do not merge unrelated companies into one
-        # founder merely because the source has an empty director field.
-        return "bin:" + normalise_bin(app.bin)
+            return owner_id, "director_contact_owner"
+        return TECHNICAL_USER_ID, "technical_user_for_bitrix_distribution"
 
     def _resolve_status(
         self,
@@ -1215,35 +759,6 @@ class LeadPipeline:
         raw_id = str(lead.get("ID") or "").strip()
         return timestamp, int(raw_id) if raw_id.isdigit() else 0
 
-    def _select_least_loaded_manager(self) -> int:
-        if not self._manager_loads:
-            self._manager_loads = {manager_id: 0 for manager_id in self._manager_ids}
-        minimum = min(self._manager_loads.values())
-        least_loaded = sorted(
-            manager_id
-            for manager_id, load in self._manager_loads.items()
-            if load == minimum
-        )
-        selected = int(self._random.choice(least_loaded))
-        self._reserve_manager_load(selected)
-        return selected
-
-    def _reserve_manager_load(self, manager_id: int) -> None:
-        if manager_id in self._manager_ids:
-            self._manager_loads[manager_id] = self._manager_loads.get(manager_id, 0) + 1
-
-    def _release_manager_load(self, manager_id: int) -> None:
-        if manager_id in self._manager_loads and self._manager_loads[manager_id] > 0:
-            self._manager_loads[manager_id] -= 1
-
-    def _approved_record_assigned_by_id(self, record: dict[str, Any]) -> int | None:
-        manager_id = self._record_assigned_by_id(record)
-        if manager_id is None:
-            return None
-        if self._manager_ids and manager_id not in self._manager_ids:
-            return None
-        return manager_id
-
     @staticmethod
     def _flatten_scalar_values(value: Any) -> list[str]:
         if isinstance(value, (list, tuple, set)):
@@ -1279,11 +794,9 @@ class LeadPipeline:
     ) -> EntityOutcome:
         company = existing_company
         desired = self._company_fields(app, enrichment, company)
-        # Existing company ownership is never changed by the e-Qazyna loader.
-        # Ownership reconciliation is a separate controlled operation based on
-        # the earliest lead linked to the company. The parser may only set the
-        # owner while creating a brand-new company.
-        if company is None and preferred_assigned_by_id:
+        # The imported bundle must have one owner, including a company that
+        # already exists. The company owner is never an assignment source.
+        if preferred_assigned_by_id and (company is None or force_assigned_by):
             desired["ASSIGNED_BY_ID"] = preferred_assigned_by_id
 
         if company:
@@ -1493,6 +1006,24 @@ class LeadPipeline:
         force_assigned_by: bool = False,
     ) -> EntityOutcome:
         person = self._split_director_name(enrichment.director)
+        if person is None and existing_contact:
+            # The company already identifies the contact. Do not lose this
+            # binding just because the enrichment service returned no name.
+            contact_id = str(existing_contact.get("ID") or "")
+            if not contact_id:
+                raise BitrixError("Контакт руководителя компании не содержит ID")
+            changed = self._only_changed_fields(
+                existing_contact,
+                {"ASSIGNED_BY_ID": preferred_assigned_by_id},
+            )
+            if changed and not self.config.dry_run:
+                self.client.update_contact(contact_id, changed)
+            return EntityOutcome(
+                contact_id,
+                ("dry_run_update_contact" if self.config.dry_run else "updated_contact")
+                if changed else "contact_unchanged",
+                {**existing_contact, **changed},
+            )
         if person is None:
             return EntityOutcome(
                 None,
@@ -1514,11 +1045,19 @@ class LeadPipeline:
                 enrichment,
                 "0",
                 person,
-                None,
+                existing_contact,
             )
-            desired["COMPANY_ID"] = company_id
+            if not str((existing_contact or {}).get("COMPANY_ID") or "").isdigit():
+                desired["COMPANY_ID"] = company_id
             if preferred_assigned_by_id:
                 desired["ASSIGNED_BY_ID"] = preferred_assigned_by_id
+            if existing_contact:
+                changed = self._only_changed_fields(existing_contact, desired)
+                return EntityOutcome(
+                    str(existing_contact["ID"]),
+                    "dry_run_update_contact" if changed else "contact_unchanged",
+                    {**existing_contact, **desired},
+                )
             contact_key = self._director_cache_key(app, enrichment) or app.bin
             contact_id = f"DRY_RUN_CONTACT:{contact_key}"
             record = {"ID": contact_id, "_EQAZYNA_PLANNED": True, **desired}
@@ -1852,23 +1391,14 @@ class LeadPipeline:
         except Exception as exc:  # noqa: BLE001 - lead write remains successful
             return f"Лид сохранён, но комментарий таймлайна не добавлен: {exc}"
 
-    def _configured_assigned_by_id(self) -> int | None:
-        if self.config.assigned_by_id in (None, ""):
-            return None
-        try:
-            return int(self.config.assigned_by_id)
-        except (TypeError, ValueError) as exc:
-            raise BitrixError(
-                f"BITRIX_ASSIGNED_BY_ID должен быть числовым ID, получено: {self.config.assigned_by_id!r}"
-            ) from exc
-
     @staticmethod
     def _record_assigned_by_id(record: dict[str, Any]) -> int | None:
         value = record.get("ASSIGNED_BY_ID")
         if value in (None, ""):
             return None
         try:
-            return int(value)
+            owner_id = int(str(value).strip())
+            return owner_id if owner_id > 0 else None
         except (TypeError, ValueError):
             return None
 

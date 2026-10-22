@@ -3,6 +3,8 @@ from __future__ import annotations
 import copy
 from pathlib import Path
 from typing import Any
+
+from eqazyna_bitrix.models import TECHNICAL_USER_ID
 from urllib.parse import urlencode
 
 from package_reconciler import package_items, utc_now, write_operation
@@ -120,16 +122,19 @@ def apply_rows_fast(
     rows: list[dict[str, Any]],
     source_contact_id: int,
     target_owner_id: int,
+    *,
+    fixed_target: bool = False,
 ) -> str:
     """Update one package using preflight/update/postflight batches.
 
-    The source founder remains the authority for the target owner. If a human
+    A saved first-assignment lock is immutable and overrides later owners.
+    Otherwise the source founder remains the authority. If a human
     changes an individual target after our baseline, that row is deferred rather
     than overwritten or turned into a manual-review error. The next queued event
     or retry resolves it with fresh state.
     """
     for group in _chunks(rows):
-        owner_before, source_error = _source_owner(client, source_contact_id)
+        owner_before, source_error = (target_owner_id, "") if fixed_target else _source_owner(client, source_contact_id)
         if source_error or owner_before != target_owner_id:
             return source_error or "source_owner_changed_during_operation"
 
@@ -144,7 +149,7 @@ def apply_rows_fast(
             actual = current_owners.get(key)
             if actual == target_owner_id:
                 row["status"] = "already_correct"
-            elif actual != row["current"]:
+            elif actual != row["current"] and not fixed_target:
                 row["status"] = "deferred"
                 row["deferred_owner"] = actual
             else:
@@ -178,7 +183,7 @@ def apply_rows_fast(
                 row["status"] = "deferred"
                 row["deferred_owner"] = verified_owners.get(key)
 
-        owner_after, source_error = _source_owner(client, source_contact_id)
+        owner_after, source_error = (target_owner_id, "") if fixed_target else _source_owner(client, source_contact_id)
         if source_error or owner_after != target_owner_id:
             return source_error or "source_owner_changed_during_write"
     return ""
@@ -232,9 +237,16 @@ def process_package_fast(
     owned_entity_keys: set[tuple[str, int]] | None = None,
 ) -> dict[str, Any]:
     package = copy.deepcopy(package)
-    owner_id, source_error = _source_owner(client, source_contact_id)
+    fixed_owner = normalized_id(package.get("locked_owner_id"))
+    owner_id, source_error = (fixed_owner, "") if fixed_owner else _source_owner(client, source_contact_id)
     if source_error or not owner_id:
         return {"success": False, "retryable": False, "reason": source_error or "source_contact_without_owner", "status": "MANUAL_REVIEW", "operation": {}, "items": []}
+    if owner_id == TECHNICAL_USER_ID:
+        return {
+            "success": True, "retryable": False,
+            "reason": "waiting_for_bitrix_distribution", "status": "WAITING_BITRIX",
+            "operation": {}, "items": [],
+        }
 
     target_owner_id = owner_id
     package["source_contact_id"] = source_contact_id
@@ -301,7 +313,7 @@ def process_package_fast(
 
     stop_reason = ""
     if not baseline_errors and planned_rows:
-        stop_reason = apply_rows_fast(client, planned_rows, source_contact_id, target_owner_id)
+        stop_reason = apply_rows_fast(client, planned_rows, source_contact_id, target_owner_id, fixed_target=bool(fixed_owner))
 
     final_owners, final_errors = bulk_owners(client, items)
     journal = _journal_rows(items, final_owners, final_errors, target_owner_id)
@@ -321,7 +333,7 @@ def process_package_fast(
             "source_contact_id": source_contact_id,
             "status": "planned",
         } for item in remaining_items]
-        stop_reason = apply_rows_fast(client, retry_rows, source_contact_id, target_owner_id)
+        stop_reason = apply_rows_fast(client, retry_rows, source_contact_id, target_owner_id, fixed_target=bool(fixed_owner))
         final_owners, final_errors = bulk_owners(client, items)
         journal = _journal_rows(items, final_owners, final_errors, target_owner_id)
 

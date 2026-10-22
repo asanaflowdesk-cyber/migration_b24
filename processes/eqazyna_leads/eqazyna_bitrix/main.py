@@ -8,10 +8,7 @@ from pathlib import Path
 from typing import Iterable
 
 from .bitrix_client import BitrixClient
-from .distribution import (
-    DEFAULT_DISTRIBUTION_SPREADSHEET_ID,
-    GoogleSheetDistributionSource,
-)
+from .distribution import DEFAULT_DISTRIBUTION_SPREADSHEET_ID
 from .egov_client import EgovClient
 from .exporter import write_xlsx
 from .lead_pipeline import LeadPipeline, LeadPipelineConfig
@@ -77,8 +74,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--assigned-by-id",
-        default=os.getenv("BITRIX_ASSIGNED_BY_ID") or None,
-        help="Fallback responsible user ID only when the manager pool is empty",
+        default="4",
+        help="Deprecated, ignored: unbound bundles always go to technical user ID 4",
     )
     parser.add_argument(
         "--manager-ids",
@@ -86,7 +83,7 @@ def parse_args() -> argparse.Namespace:
             "BITRIX_MANAGER_IDS",
             "",
         ),
-        help="Deprecated compatibility option; production distribution is read from Google Sheets",
+        help="Deprecated, ignored: managers are selected by Bitrix24 robots",
     )
     parser.add_argument(
         "--distribution-sheet-id",
@@ -94,7 +91,7 @@ def parse_args() -> argparse.Namespace:
             "DISTRIBUTION_SHEET_ID",
             DEFAULT_DISTRIBUTION_SPREADSHEET_ID,
         ),
-        help="Google Sheets workbook containing user_list and Company_fix",
+        help="Deprecated, ignored: new-lead assignment no longer reads Google Sheets",
     )
     parser.add_argument(
         "--distribution-users-sheet",
@@ -107,12 +104,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--distribution-timeout",
         type=int,
-        default=int(os.getenv("DISTRIBUTION_SHEET_TIMEOUT", "30")),
+        default=30,
+        help="Deprecated, ignored",
     )
     parser.add_argument(
         "--astana-department-id",
         type=int,
-        default=int(os.getenv("ASTANA_DEPARTMENT_ID", "46")),
+        default=46,
+        help="Deprecated, ignored",
     )
     parser.add_argument(
         "--failure-reason-field",
@@ -123,7 +122,7 @@ def parse_args() -> argparse.Namespace:
         "--overwrite-assigned-by-on-update",
         action="store_true",
         default=env_bool("BITRIX_OVERWRITE_ASSIGNED_BY_ON_UPDATE", False),
-        help="Also overwrite responsible user on existing leads (off by default)",
+        help="Deprecated, ignored: duplicate applications are always skipped",
     )
     parser.add_argument(
         "--lead-generation-field",
@@ -203,20 +202,6 @@ def _build_enrichment_map(
     return result
 
 
-def _parse_manager_ids(raw: str | None) -> tuple[int, ...]:
-    values: list[int] = []
-    for token in str(raw or "").split(","):
-        token = token.strip()
-        if not token:
-            continue
-        if not token.isdigit() or int(token) <= 0:
-            raise SystemExit(f"--manager-ids contains an invalid user ID: {token!r}")
-        manager_id = int(token)
-        if manager_id not in values:
-            values.append(manager_id)
-    return tuple(values)
-
-
 def _parse_min_created_date(raw: str | None):
     if not raw:
         return None
@@ -289,24 +274,10 @@ def main() -> int:
             polite_delay_seconds=settings.bitrix_polite_delay_seconds,
             verify_ssl=settings.bitrix_tls_verify,
         )
-        distribution = GoogleSheetDistributionSource(
-            args.distribution_sheet_id,
-            users_sheet=args.distribution_users_sheet,
-            assignments_sheet=args.distribution_fixes_sheet,
-            timeout=args.distribution_timeout,
-        ).load()
-        MANAGER_NAMES.update(
-            {
-                user.user_id: user.full_name
-                for user in distribution.users
-                if user.full_name
-            }
-        )
         lead_pipeline = LeadPipeline(
             client,
             LeadPipelineConfig(
                 lead_status_id="NEW",
-                assigned_by_id=args.assigned_by_id,
                 overwrite_assigned_by_on_update=args.overwrite_assigned_by_on_update,
                 lead_generation_field=args.lead_generation_field,
                 lead_generation_value=args.lead_generation_value,
@@ -317,20 +288,11 @@ def main() -> int:
                 source_description=args.source_description,
                 dry_run=args.dry_run,
                 validate_custom_field=not args.skip_field_validation,
-                manager_ids=_parse_manager_ids(
-                    getattr(
-                        args,
-                        "manager_ids",
-                        "",
-                    )
-                ),
                 failure_reason_field=getattr(
                     args,
                     "failure_reason_field",
                     "UF_CRM_1785508658316",
                 ),
-                distribution=distribution,
-                astana_department_id=args.astana_department_id,
             ),
         )
         print(
@@ -345,9 +307,8 @@ def main() -> int:
         if resolved_preset is not None:
             print(f"    Resolved company requisite preset: {resolved_preset}")
         print(
-            "    Google Sheets distribution: "
-            f"users={len(distribution.users)}, company_fix={len(distribution.company_assignments)}, "
-            f"workbook={args.distribution_sheet_id}"
+            "    Assignment: current founder/director contact owner; "
+            "without a binding -> technical user ID 4 -> Bitrix24 robots"
         )
         print(
             "    Failure reason field: "

@@ -50,7 +50,7 @@ def package_items(package: dict[str, Any], source_contact_id: int) -> list[dict[
 
     for contact in package.get("contacts", []):
         item_id = normalized_id(contact.get("id"))
-        if item_id and item_id != source_contact_id:
+        if item_id and (item_id != source_contact_id or package.get("locked_owner_id")):
             rows.append({"entity": "contact", "id": item_id, "title": str(contact.get("title") or "").strip(), "initial_owner_id": normalized_id(contact.get("owner_id"))})
     for company in package.get("companies", []):
         company_id = normalized_id(company.get("id"))
