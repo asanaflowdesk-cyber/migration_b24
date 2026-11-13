@@ -5,7 +5,7 @@ from copy import deepcopy
 from typing import Any
 from uuid import uuid4
 
-from processes.flowdesk_chatbot import initiatives
+from processes.flowdesk_chatbot import initiatives, constructor_engine
 from processes.flowdesk_chatbot.config import (
     DETAIL_FIELDS,
     DETAIL_QUESTIONS,
@@ -193,6 +193,7 @@ def normalize_session(
 
     if (
         data.get("request_type") == "Предложение / Идея"
+        and not constructor_engine.is_custom(session)
         and session["current_screen"] not in {"type", "done"}
         and not initiatives.is_initiative(session)
     ):
@@ -460,6 +461,15 @@ def _start_text() -> str:
 
 def view(session: dict[str, Any]) -> dict[str, Any]:
     normalize_session(session)
+    if constructor_engine.is_custom(session):
+        return constructor_engine.render(session)
+    if session.get("delivery_locked") and not session.get("task_id"):
+        buttons = [_button("Проверить наличие задачи", "__check_delivery__", "secondary"),
+                   _button("Новое обращение", ACTION_NEW_REQUEST, "base")]
+        if session.get("delivery_status") == "failed":
+            buttons.insert(0, _button("Повторить передачу", "__retry_delivery__", "primary"))
+        return {"screen": session["current_screen"], "text": "Ответы сохранены.\n" + str(session.get("delivery_error") or "Ожидает передачи"),
+                "buttons": buttons, "accepts_text": False, "terminal": False, "revision": session["revision"]}
     if session["current_screen"].startswith("initiative_"):
         return initiatives.view(session)
     screen = session["current_screen"]
@@ -664,6 +674,9 @@ def view(session: dict[str, Any]) -> dict[str, Any]:
     ):
         buttons.append(_button("← Назад", ACTION_BACK, "primary"))
 
+    if screen == "type" and session.get("pending_delivery") and not session.get("edit_mode"):
+        buttons.append(_button("Проверить незавершённую отправку", "__pending_delivery__", "base"))
+
     return {
         "screen": screen,
         "text": text,
@@ -717,6 +730,16 @@ def _validate_detail(field_name: str, value: str) -> tuple[bool, str, str]:
 
 def submit_action(session: dict[str, Any], action: str) -> dict[str, Any]:
     normalize_session(session)
+    if constructor_engine.is_custom(session):
+        return constructor_engine.action(session, action)
+    if action == "__pending_delivery__":
+        return {"status": "pending_delivery_requested"}
+    if session.get("delivery_locked") and not session.get("task_id"):
+        if action == "__check_delivery__":
+            return {"status": "delivery_check_requested"}
+        if action == "__retry_delivery__" and session.get("delivery_status") == "failed":
+            return {"status": "task_ready"}
+        return {"status": "restart_requested" if action == ACTION_NEW_REQUEST else "ignored"}
     if session["current_screen"].startswith("initiative_"):
         return initiatives.submit_action(session, action)
     screen = session["current_screen"]
@@ -905,6 +928,10 @@ def submit_action(session: dict[str, Any], action: str) -> dict[str, Any]:
 
 def submit_text(session: dict[str, Any], text: str) -> dict[str, Any]:
     normalize_session(session)
+    if constructor_engine.is_custom(session):
+        return constructor_engine.text(session, text)
+    if session.get("delivery_locked"):
+        return {"status": "buttons_expected"}
     if session["current_screen"].startswith("initiative_"):
         return initiatives.submit_text(session, text)
     value = str(text or "").strip()
@@ -973,6 +1000,10 @@ def submit_attachment_message(
     text: str = "",
 ) -> dict[str, Any]:
     normalize_session(session)
+    if constructor_engine.is_custom(session):
+        files = [{"id": int(i), "name": file_names[pos] if pos < len(file_names) else ""}
+                 for pos, i in enumerate(file_ids)]
+        return constructor_engine.attachments(session, files, text)
     if session["current_screen"].startswith("initiative_"):
         return initiatives.submit_materials(session, file_ids, file_names, text)
     screen = session["current_screen"]
@@ -1046,6 +1077,9 @@ def finish_instruction(session: dict[str, Any]) -> None:
 
 
 def mark_task_created(session: dict[str, Any], task_id: int | str) -> None:
+    if constructor_engine.is_custom(session):
+        constructor_engine.created(session, task_id)
+        return
     session["task_id"] = str(task_id)
     session["current_screen"] = "done"
     session["history"] = []
@@ -1121,6 +1155,8 @@ def summary_text(session: dict[str, Any]) -> str:
 
 
 def task_title(session: dict[str, Any]) -> str:
+    if constructor_engine.is_custom(session):
+        return constructor_engine.title(session)
     if initiatives.is_initiative(session):
         title = initiatives.state(session)["answers"].get("title", {}).get("text") or "Инициатива"
         return f"Предложение / Идея | {title}"[:250]
@@ -1146,6 +1182,8 @@ def _details_text(session: dict[str, Any]) -> str:
 
 
 def task_registry_fields(session: dict[str, Any]) -> dict[str, str]:
+    if constructor_engine.is_custom(session):
+        return constructor_engine.registry_fields(session)
     data = session["data"]
     mapping = {
         "UF_FLOWDESK_REQUEST_TYPE": data.get("request_type"),
@@ -1169,6 +1207,8 @@ def task_registry_fields(session: dict[str, Any]) -> dict[str, str]:
 
 
 def task_description(session: dict[str, Any]) -> str:
+    if constructor_engine.is_custom(session):
+        return constructor_engine.description(session)
     if initiatives.is_initiative(session):
         return initiatives.summary(session, markup=False)
     data = session["data"]

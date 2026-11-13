@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="deskflow-csrf" content="__DESKFLOW_CSRF__">
+  <title>Управление DeskFlow</title>
+  <link rel="stylesheet" href="?r=%2Fassets%2Fapp.css">
+</head>
+<body>
+  <header>
+    <div class="brand"><strong>Управление DeskFlow</strong></div>
+    <nav id="navigation" hidden>
+      <button data-tab="builder" class="selected">Сценарий</button>
+      <button data-tab="testing">Проверка диалога</button>
+      <button data-tab="mapping">Поля задачи</button>
+      <button data-tab="journal">Обращения</button>
+      <button data-tab="versions">Версии</button>
+      <button data-tab="settings">Общие настройки</button>
+      <button id="access-tab" data-tab="access" hidden>Доступ</button>
+    </nav>
+    <div id="identity"></div>
+  </header>
+
+  <div id="notice" role="status" aria-live="polite"></div>
+  <section id="blocked" hidden><h1>Страница недоступна</h1></section>
+  <main id="workspace" hidden>
+    <div class="toolbar">
+        <div><h1>Сценарий</h1><p id="version-status"></p></div>
+        <div class="actions">
+          <span id="dirty"></span>
+          <button id="validate">Проверить схему</button>
+          <button id="save">Сохранить черновик</button>
+          <button id="publish" class="primary">Сохранить и применить</button>
+        </div>
+      </div>
+      <div id="errors" hidden></div>
+      <section id="builder" class="tab active">
+      <div class="builder-grid">
+        <aside class="tree-panel">
+          <input id="node-search" placeholder="Найти окно" aria-label="Поиск окна">
+          <div id="tree"></div>
+        </aside>
+        <section class="map-panel">
+          <div class="map-tools">
+            <select id="map-section" aria-label="Раздел схемы"></select>
+            <button id="map-focus">К выбранному</button>
+            <button id="map-minus" aria-label="Уменьшить">−</button><span id="map-zoom"></span>
+            <button id="map-plus" aria-label="Увеличить">+</button>
+          </div>
+          <div id="graph-viewport" aria-label="Схема диалога">
+            <div id="graph-spacer"></div><canvas id="graph-lines" aria-hidden="true"></canvas><div id="graph-scene"></div>
+          </div>
+        </section>
+        <section class="editor-panel">
+          <div class="panel-heading">
+            <h2 id="editor-heading">Настройки окна</h2>
+            <div class="actions">
+              <button id="new-node">Добавить окно</button>
+              <button id="add-node">Вставить перед окном</button>
+              <button id="copy-node">Дублировать</button>
+              <button id="delete-node" class="danger">Удалить</button>
+            </div>
+          </div>
+          <section class="links-panel" aria-label="Переходы из окна">
+            <div id="connections"></div>
+          </section>
+          <div id="editor"></div>
+        </section>
+      </div>
+    </section>
+    <section id="testing" class="tab">
+      <div class="preview-layout">
+        <aside class="preview-panel">
+          <div class="panel-heading"><h2>Предпросмотр</h2><button id="start-preview">С начала</button></div>
+          <p class="muted">Проверка диалога в черновике</p>
+          <div id="preview"></div>
+          <div id="preview-input" hidden>
+            <label>Ответ сотрудника <input id="preview-text" type="text"></label>
+            <button id="preview-send">Отправить</button>
+          </div>
+          <label id="preview-file-label" hidden>Пример вложения <input id="preview-file" type="file"></label>
+        </aside>
+        <div class="card"><h2>Будущая задача</h2><p>Поля появятся после пробной отправки в диалоге.</p><div id="preview-task"></div></div>
+      </div>
+    </section>
+    <section id="mapping" class="tab">
+      <div class="toolbar"><h1>Поля задачи Б24</h1><button id="add-mapping">Добавить поле</button></div>
+      <p>В одно поле можно вставить несколько ответов и добавить свой текст.</p><div id="mapping-content"></div>
+    </section>
+    <section id="journal" class="tab">
+      <h1>Обращения</h1>
+      <form id="journal-filter" class="filters"><input id="journal-query" placeholder="ID обращения, сотрудник, текст" aria-label="Поиск обращений">
+        <select id="journal-status" aria-label="Статус"><option value="">Все статусы</option><option value="in_progress">Заполняется</option><option value="draft">Черновик</option><option value="interrupted">Прервано</option><option value="information">Завершено без задачи</option><option value="cancelled">Отменено</option><option value="pending">Передаётся</option><option value="needs_check">Требует проверки</option><option value="failed">Ошибка передачи</option><option value="created">Задача создана</option></select><button>Найти</button>
+      </form>
+      <div id="journal-content"></div><div class="actions"><button id="journal-back">Назад</button><button id="journal-next">Далее</button></div>
+    </section>
+    <section id="versions" class="tab"><h1>Версии сценария</h1><p>Применённая версия действует для новых обращений.</p><div id="versions-content"></div></section>
+    <section id="settings" class="tab">
+      <div class="toolbar">
+        <h1>Общие настройки</h1>
+      </div>
+      <div id="settings-content"></div>
+    </section>
+    <section id="access" class="tab">
+      <div class="toolbar"><h1>Доступ к редактору</h1></div>
+      <div class="access-layout">
+        <div class="card">
+          <h2>Выдать доступ</h2>
+          <p>Возьми числовой ID из ссылки на профиль сотрудника в Б24.</p>
+          <form id="grant-access" class="access-form">
+            <label>ID сотрудника <input id="grant-user" type="text" inputmode="numeric" maxlength="10" pattern="[1-9][0-9]{0,9}" required></label>
+            <button class="primary">Выдать</button>
+          </form>
+        </div>
+        <div class="card"><h2>Кто видит редактор</h2><div id="access-list"></div></div>
+      </div>
+    </section>
+  </main>
+  <dialog id="delete-dialog">
+    <h2>Удалить окно</h2>
+    <label>Куда перенаправить стрелки <select id="delete-replacement"></select></label>
+    <div class="actions">
+      <button id="delete-abort">Отмена</button>
+      <button id="delete-confirm" class="danger">Удалить</button>
+    </div>
+  </dialog>
+  <dialog id="request-dialog"><div class="panel-heading"><h2>Обращение</h2><button id="request-close">Закрыть</button></div><div id="request-detail"></div></dialog>
+  <script src="?r=%2Fassets%2Fgraph.js"></script>
+  <script src="?r=%2Fassets%2Fapp.js"></script>
+</body>
+</html>

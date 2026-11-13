@@ -134,9 +134,12 @@ class BitrixClient:
         params = dict(params or {})
         url = base + method + (".json" if json_suffix else "")
         last: Exception | None = None
+        creating_task = method.casefold() == "tasks.task.add"
         for attempt in range(self.retries + 1):
             try:
-                response = self.session.post(url, json=params, timeout=self.timeout)
+                response = self.session.post(url, json=params, timeout=self.timeout, allow_redirects=False)
+                if 300 <= response.status_code < 400:
+                    raise requests.HTTPError(f"Unexpected redirect from {method}")
                 try:
                     data = response.json()
                 except Exception as exc:
@@ -149,7 +152,7 @@ class BitrixClient:
                     )
                 if "error" in data:
                     code, desc = self._error_parts(data)
-                    if code in {"QUERY_LIMIT_EXCEEDED", "OPERATION_TIME_LIMIT", "OVERLOAD_LIMIT"} and attempt < self.retries:
+                    if not creating_task and code in {"QUERY_LIMIT_EXCEEDED", "OPERATION_TIME_LIMIT", "OVERLOAD_LIMIT"} and attempt < self.retries:
                         wait = min(60.0, 2.0 ** attempt)
                         LOG.warning("%s throttled: %s. retry in %.1fs", method, code, wait)
                         time.sleep(wait)

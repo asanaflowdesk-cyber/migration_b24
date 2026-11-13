@@ -92,16 +92,20 @@ class SessionStore:
     def put_session(self, session_key: str, payload: dict[str, Any]) -> None:
         raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         with self._connection() as conn:
-            conn.execute(
-                """
-                INSERT INTO sessions(session_key, payload, updated_at)
-                VALUES(?, ?, CURRENT_TIMESTAMP)
-                ON CONFLICT(session_key) DO UPDATE SET
-                    payload = excluded.payload,
-                    updated_at = CURRENT_TIMESTAMP
-                """,
-                (session_key, raw),
-            )
+            self._put_session(conn, session_key, raw)
+
+    @staticmethod
+    def _put_session(conn, session_key, raw):
+        conn.execute(
+            """
+            INSERT INTO sessions(session_key, payload, updated_at)
+            VALUES(?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(session_key) DO UPDATE SET
+                payload = excluded.payload,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (session_key, raw),
+        )
 
     def delete_session(self, session_key: str) -> None:
         with self._connection() as conn:

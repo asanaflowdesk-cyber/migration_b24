@@ -1,0 +1,25 @@
+[Unit]
+Description=DeskFlow Bitrix24 worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=deskflow
+Group=deskflow
+WorkingDirectory=/opt/deskflow
+EnvironmentFile=/etc/deskflow/worker.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/deskflow/.venv/bin/python -u -m processes.flowdesk_chatbot.bitrix_worker
+Restart=on-failure
+RestartSec=5
+StateDirectory=deskflow
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

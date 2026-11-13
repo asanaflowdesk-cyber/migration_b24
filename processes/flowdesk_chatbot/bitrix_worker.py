@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import secrets
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -16,8 +17,9 @@ import requests
 
 from common.bitrix import BitrixClient, BitrixError, sanitize_error
 from processes.flowdesk_chatbot.avatar_asset import SERVICE_CHAT_AVATAR_B64
-from processes.flowdesk_chatbot import initiatives
+from processes.flowdesk_chatbot import constructor_engine as graph, initiatives
 from processes.flowdesk_chatbot.initiator_profile import fetch_profile
+from processes.flowdesk_chatbot.internal_admin import start_editor
 from processes.flowdesk_chatbot.engine import (
     mark_task_created,
     new_session,
@@ -32,7 +34,8 @@ from processes.flowdesk_chatbot.engine import (
     view,
 )
 from processes.flowdesk_chatbot.polling import poll_interval_seconds
-from processes.flowdesk_chatbot.storage import SessionStore
+from processes.flowdesk_chatbot.field_templates import render_template
+from processes.flowdesk_chatbot.flow_store import FlowStore, step_label, worker_lock
 
 LOG = logging.getLogger("flowdesk_chatbot")
 
@@ -61,7 +64,7 @@ class Runtime:
             "FLOWDESK_CHATBOT_DB",
             "processes/flowdesk_chatbot/flowdesk_state.sqlite3",
         )
-        self.store = SessionStore(self.db_path)
+        self.store = FlowStore(self.db_path)
         self.bot_name = os.getenv("FLOWDESK_BOT_NAME", "DeskFlow")
         self.bot_token = self._load_or_create_bot_token()
         suffix = self.bot_token[:8].lower().replace("-", "_")
@@ -74,7 +77,10 @@ class Runtime:
         self.portal_base = (
             f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else ""
         )
+        if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+            raise ValueError("Укажите конечный HTTPS-адрес входящего вебхука Б24")
         self.task_user_fields: set[str] = set()
+        self.task_field_catalog: dict[str, str] = {}
         self.service_chat_avatar_url = os.getenv(
             "FLOWDESK_SERVICE_CHAT_AVATAR_URL",
             "https://bitrix.theeurasia.kz/picture/K2blnYG5Z7Cm0teajIEf",
@@ -162,39 +168,8 @@ class Runtime:
         if not isinstance(bot, dict) or not bot.get("id"):
             raise RuntimeError(f"Bot.register не вернул bot.id: {result!r}")
 
-        # Re-registering the same code returns the existing bot and does not
-        # change its immutable type. Migrate old test bot once so it can see
-        # every ordinary message in its per-user service chat.
-        current_type = str(bot.get("type") or "")
-        if current_type and current_type != desired_type:
-            old_bot_id = int(bot["id"])
-            LOG.warning(
-                "Migrating DeskFlow bot type %s -> %s (old botId=%s)",
-                current_type,
-                desired_type,
-                old_bot_id,
-            )
-            self.call(
-                "imbot.v2.Bot.unregister",
-                {
-                    "botId": old_bot_id,
-                    "botToken": self.bot_token,
-                },
-            )
-            result = self.call(
-                "imbot.v2.Bot.register",
-                {"fields": fields},
-            )
-            if not isinstance(result, dict):
-                raise RuntimeError(
-                    f"Bot.register после миграции вернул неожиданный ответ: {result!r}"
-                )
-            bot = result.get("bot")
-            if not isinstance(bot, dict) or not bot.get("id"):
-                raise RuntimeError(
-                    f"Bot.register после миграции не вернул bot.id: {result!r}"
-                )
-            self.store.set_meta("event_offset", "0")
+        if bot.get("type") and bot["type"] != desired_type:
+            raise RuntimeError("Код DeskFlow уже занят ботом другого типа. Укажите код персонального бота.")
 
         self.bot_id = int(bot["id"])
         self.store.set_meta("bot_id", self.bot_id)
@@ -230,6 +205,7 @@ class Runtime:
                 sanitize_error(exc),
             )
             self.task_user_fields = set()
+            self.task_field_catalog = {}
             return
 
         if isinstance(result, list):
@@ -250,6 +226,17 @@ class Runtime:
             if isinstance(row, dict)
         }
 
+        catalog = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            name = str(row.get("FIELD_NAME") or row.get("fieldName") or "")
+            kind = str(row.get("USER_TYPE_ID") or row.get("userTypeId") or "").lower()
+            if name.startswith("UF_") and kind == "string" and row.get("MULTIPLE", row.get("multiple", "N")) in ("N", 0, False):
+                label = row.get("EDIT_FORM_LABEL") or row.get("editFormLabel") or row.get("LABEL")
+                if isinstance(label, dict):
+                    label = label.get("ru") or label.get("en")
+                catalog[name] = TASK_USER_FIELDS.get(name, {}).get("label") or (label if isinstance(label, str) else name)
         for field_name, spec in TASK_USER_FIELDS.items():
             if field_name in existing:
                 continue
@@ -290,9 +277,11 @@ class Runtime:
                 )
                 continue
             existing.add(field_name)
+            catalog[field_name] = spec["label"]
             LOG.info("Created task user field %s", field_name)
 
         self.task_user_fields = existing
+        self.task_field_catalog = catalog
 
     @staticmethod
     def session_key(dialog_id: str, user_id: int) -> str:
@@ -573,21 +562,49 @@ class Runtime:
     def launcher_message_meta_key(user_id: int) -> str:
         return f"launcher_message:{int(user_id)}"
 
+    @staticmethod
+    def private_launcher_meta_key(user_id: int) -> str:
+        return f"private_launcher_message:{int(user_id)}"
+
     def service_chat_link(self, dialog_id: str) -> str:
         path = f"/online/?IM_DIALOG={dialog_id}"
         return f"{self.portal_base}{path}" if self.portal_base else path
 
-    def launcher_message_fields(self) -> dict[str, Any]:
-        return {
-            "message": (
+    def add_private_editor_button(self, fields: dict[str, Any], user_id: int | None) -> None:
+        editor = getattr(self, "internal_editor", None)
+        if not editor or not user_id:
+            return
+        try:
+            role = editor.store.role(user_id)
+        except sqlite3.Error:
+            LOG.warning("DeskFlow editor access is temporarily unavailable")
+            return
+        if role:
+            fields["keyboard"]["BUTTONS"].append({
+                "TEXT": "Управление DeskFlow",
+                "LINK": editor.entry_url,
+                "BLOCK": "N",
+                "DISPLAY": "LINE",
+                "BG_COLOR_TOKEN": "base",
+            })
+
+    def published_setting(self, group, key, fallback, user_id=None):
+        editor = getattr(self, "internal_editor", None)
+        _, doc = editor.store.active() if editor else (None, None)
+        value = doc["settings"].get(group, {}).get(key, fallback) if doc else fallback
+        return render_template(value, {"system.user_id": user_id or ""}, chat=True)
+
+    def launcher_message_fields(self, private_user_id: int | None = None) -> dict[str, Any]:
+        fields = {
+            "message": self.published_setting("messages", "launcher", (
                 "[b]DeskFlow готов к работе 🙂[/b]\n"
                 "Нажми кнопку ниже — я проверю служебный чат и подготовлю его к работе."
-            ),
+            ), private_user_id),
             "keyboard": {
                 "BOT_ID": self.bot_id,
                 "BUTTONS": [
                     {
-                        "TEXT": "Открыть служебный чат",
+                        "TEXT": self.published_setting("labels", "launcher_open", "Открыть служебный чат", private_user_id)[:250],
                         "COMMAND": f"/{self.command_name}",
                         "COMMAND_PARAMS": "launcher",
                         "BLOCK": "N",
@@ -598,15 +615,17 @@ class Runtime:
                 ],
             },
         }
+        self.add_private_editor_button(fields, private_user_id)
+        return fields
 
     def launcher_ready_fields(self, service_dialog_id: str) -> dict[str, Any]:
         return {
-            "message": "[b]Готово 🙂[/b]\nСлужебный чат проверен и готов к работе.",
+            "message": self.published_setting("messages", "launcher_ready", "[b]Готово 🙂[/b]\nСлужебный чат проверен и готов к работе."),
             "keyboard": {
                 "BOT_ID": self.bot_id,
                 "BUTTONS": [
                     {
-                        "TEXT": "Перейти в служебный чат",
+                        "TEXT": self.published_setting("labels", "launcher_ready", "Перейти в служебный чат")[:250],
                         "ACTION": "DIALOG",
                         "ACTION_VALUE": service_dialog_id,
                         "BLOCK": "N",
@@ -622,7 +641,15 @@ class Runtime:
         """Keep one reusable on-demand launcher in the personal bot dialog."""
         meta_key = self.launcher_message_meta_key(user_id)
         existing_text = self.store.get_meta(meta_key).strip()
-        fields = self.launcher_message_fields()
+        private_key = self.private_launcher_meta_key(user_id)
+        verified_message = self.store.get_meta(private_key).strip()
+        is_private = dialog_id == str(user_id)
+        fields = self.launcher_message_fields(user_id if is_private else None)
+        if is_private and len(fields["keyboard"]["BUTTONS"]) > 1:
+            # An older launcher ID alone does not prove which chat owns it.
+            existing_text = verified_message
+        elif not is_private and existing_text == verified_message:
+            existing_text = ""
 
         if existing_text:
             try:
@@ -661,13 +688,41 @@ class Runtime:
             )
 
         message_id = int(result["id"])
-        self.store.set_meta(meta_key, message_id)
+        if is_private:
+            self.store.set_meta(private_key, message_id)
+        if is_private or not verified_message:
+            self.store.set_meta(meta_key, message_id)
         LOG.info(
             "Launcher button message created for user=%s message=%s",
             user_id,
             message_id,
         )
         return message_id
+
+    def refresh_editor_access(self) -> None:
+        editor = getattr(self, "internal_editor", None)
+        if not editor or time.monotonic() < self.next_editor_access_check:
+            return
+        self.next_editor_access_check = time.monotonic() + 2
+        try:
+            changes = editor.store.access_changes(self.last_editor_access_change)
+        except sqlite3.Error:
+            LOG.warning("DeskFlow editor access changes are temporarily unavailable")
+            return
+        for seq, user_id in changes:
+            self.last_editor_access_change = seq
+            message_id = self.store.get_meta(self.private_launcher_meta_key(user_id)).strip()
+            if not message_id.isdigit():
+                continue
+            try:
+                self.call("imbot.v2.Chat.Message.update", {
+                    "botId": self.bot_id,
+                    "botToken": self.bot_token,
+                    "messageId": int(message_id),
+                    "fields": self.launcher_message_fields(user_id),
+                })
+            except Exception as exc:
+                LOG.warning("Private DeskFlow launcher could not be updated: %s", sanitize_error(exc))
 
     def refresh_known_launchers(self) -> None:
         """Convert saved launchers to the on-demand command without creating chats."""
@@ -687,6 +742,8 @@ class Runtime:
             except (IndexError, TypeError, ValueError):
                 continue
 
+            known_private = self.store.get_meta(self.private_launcher_meta_key(user_id)).strip()
+            private_user_id = user_id if known_private == str(message_id) else None
             try:
                 result = self.call(
                     "imbot.v2.Chat.Message.update",
@@ -694,7 +751,7 @@ class Runtime:
                         "botId": self.bot_id,
                         "botToken": self.bot_token,
                         "messageId": message_id,
-                        "fields": self.launcher_message_fields(),
+                        "fields": self.launcher_message_fields(private_user_id),
                     },
                 )
                 if not isinstance(result, dict):
@@ -733,6 +790,13 @@ class Runtime:
                 f"dialog_id={dialog_id!r}"
             )
 
+        fields = self.launcher_ready_fields(service_dialog_id)
+        user_id = int((data.get("user") or {}).get("id") or 0)
+        if user_id and dialog_id == str(user_id):
+            known_private = self.store.get_meta(self.private_launcher_meta_key(user_id)).strip()
+            if known_private == str(message_id):
+                self.add_private_editor_button(fields, user_id)
+
         result = self.call(
             "imbot.v2.Command.answer",
             {
@@ -741,7 +805,7 @@ class Runtime:
                 "commandId": command_id,
                 "messageId": message_id,
                 "dialogId": dialog_id,
-                "fields": self.launcher_ready_fields(service_dialog_id),
+                "fields": fields,
             },
         )
         if not isinstance(result, dict) or result.get("result") is not True:
@@ -810,6 +874,21 @@ class Runtime:
             elif style in {"primary", "alert"}:
                 button["TEXT_COLOR"] = "#FFFFFF"
 
+            for source, target in (("bg_color", "BG_COLOR"), ("text_color", "TEXT_COLOR"), ("off_bg_color", "OFF_BG_COLOR"),
+                                   ("off_text_color", "OFF_TEXT_COLOR"), ("width", "WIDTH"), ("display", "DISPLAY")):
+                if item.get(source) not in (None, ""):
+                    button[target] = item[source]
+            if "BG_COLOR" in button:
+                button.pop("BG_COLOR_TOKEN", None)
+            if item.get("link"):
+                editor = getattr(self, "internal_editor", None)
+                resources = getattr(getattr(editor, "application", None), "resources", None)
+                if resources is None:
+                    button.update(DISABLED="Y")
+                else:
+                    button["LINK"] = resources.issue(session, item["option_id"])
+                button.pop("COMMAND", None)
+                button.pop("COMMAND_PARAMS", None)
             buttons.append(button)
 
         return {
@@ -1281,10 +1360,14 @@ class Runtime:
         text_override: str | None = None,
     ) -> None:
         normalize_session(session)
+        self.sync_delivery(session)
+        self.prepare_graph_profile(session)
         self.prepare_initiative(session)
         self.persist_initiative(session)
         history = ""
-        if session.get("current_screen") in {"type", "done"} and not session.get("edit_mode"):
+        state = session.get("constructor")
+        home = state and state["node"] == state["document"]["start"]
+        if (not state or state["document"]["settings"].get("show_history", True)) and (home or session.get("current_screen") in {"type", "done"}) and not session.get("edit_mode"):
             history = self.history_block(session)
 
         current = view(session)
@@ -1356,7 +1439,10 @@ class Runtime:
             session["active_message_id"] = int(message_id)
 
         key = self.session_key(session["dialog_id"], int(session["user_id"]))
-        self.store.put_session(key, session)
+        if isinstance(self.store, FlowStore):
+            self.store.shown(key, session, text)
+        else:
+            self.store.put_session(key, session)
 
     def find_existing_task(self, xml_id: str) -> str:
         result = self.call(
@@ -1368,29 +1454,41 @@ class Runtime:
         )
 
         if isinstance(result, dict):
-            rows = result.get("tasks") or result.get("items") or []
-        elif isinstance(result, list):
-            rows = result
+            rows = result.get("tasks", result.get("items"))
         else:
-            rows = []
-
+            rows = result
+        if not isinstance(rows, list):
+            raise ValueError("Б24 не подтвердил результат поиска задачи")
+        ids = set()
         for row in rows:
-            if not isinstance(row, dict):
-                continue
-            row_xml = str(row.get("xmlId") or row.get("XML_ID") or "")
-            if row_xml == xml_id:
-                return str(row.get("id") or row.get("ID") or "")
-        return ""
+            if not isinstance(row, dict) or str(row.get("xmlId") or row.get("XML_ID") or "") != xml_id:
+                raise ValueError("Б24 вернул несвязанные данные поиска задачи")
+            task = str(row.get("id") or row.get("ID") or "")
+            if not task.isascii() or not task.isdigit() or int(task) < 1:
+                raise ValueError("Б24 не подтвердил номер задачи")
+            ids.add(task)
+        if len(ids) > 1:
+            raise ValueError("Найдено несколько задач для одного обращения")
+        return next(iter(ids), "")
 
     def create_task(self, session: dict[str, Any]) -> str:
+        existing = self.find_existing_task(f"FLOWDESK_CHAT_{session['request_id']}")
+        if existing:
+            return existing
+        task = self.add_task(self.task_fields(session))
+        self.send_attachment_comment(session, task)
+        return task
+
+    def task_fields(self, session):
         user_id = int(session["user_id"])
         responsible_id = int(os.getenv("FLOWDESK_DEFAULT_RESPONSIBLE_ID", str(user_id)))
         project_id = int(os.getenv("FLOWDESK_PROJECT_ID", "0"))
         xml_id = f"FLOWDESK_CHAT_{session['request_id']}"
-
-        existing = self.find_existing_task(xml_id)
-        if existing:
-            return existing
+        state = session.get("constructor")
+        if state:
+            output = state["document"]["settings"].get("output", {})
+            responsible_id = output.get("responsible_id", responsible_id)
+            project_id = output.get("project_id", project_id)
 
         fields: dict[str, Any] = {
             "TITLE": task_title(session),
@@ -1402,9 +1500,20 @@ class Runtime:
         if project_id > 0:
             fields["GROUP_ID"] = project_id
 
-        for field_name, value in task_registry_fields(session).items():
-            if field_name in self.task_user_fields:
+        registry = task_registry_fields(session)
+        if state:
+            mapping = graph.task_mapping(session)
+            requested = {key for key, value in registry.items() if value} | {key for key in mapping if key.startswith("UF_")}
+            missing = requested - self.task_field_catalog.keys()
+            if missing:
+                raise ValueError("Поля задачи недоступны для записи: " + ", ".join(sorted(missing)))
+        for field_name, value in registry.items():
+            if field_name in self.task_user_fields and value:
                 fields[field_name] = value
+        if state:
+            fields.update(mapping)
+            for key in ("TITLE", "DESCRIPTION"):
+                fields[key] = fields[key].replace("[", "［").replace("]", "］")
 
         file_ids = [
             int(file_id)
@@ -1416,17 +1525,65 @@ class Runtime:
                 f"n{file_id}" for file_id in file_ids
             ]
 
+        return fields
+
+    def add_task(self, fields):
         result = self.call("tasks.task.add", {"fields": fields})
-        if not isinstance(result, dict):
-            raise RuntimeError(f"tasks.task.add вернул неожиданный ответ: {result!r}")
-
-        task = result.get("task")
-        if not isinstance(task, dict) or not task.get("id"):
-            raise RuntimeError(f"tasks.task.add не вернул task.id: {result!r}")
-
-        task_id = str(task["id"])
-        self.send_attachment_comment(session, task_id)
+        task = result.get("task") if isinstance(result, dict) else None
+        task_id = str(task.get("id") or "") if isinstance(task, dict) else ""
+        if not task_id.isascii() or not task_id.isdigit() or int(task_id) <= 0:
+            raise RuntimeError("Б24 не подтвердил номер задачи")
         return task_id
+
+    def sync_delivery(self, session):
+        if not isinstance(self.store, FlowStore):
+            return
+        state, task, error = self.store.delivery(session["request_id"])
+        if task and not session.get("task_id"):
+            self.clear_submitted_draft(session)
+            mark_task_created(session, task)
+        if state:
+            session.update(delivery_locked=True, delivery_status="failed" if state in {"lookup", "rejected"} else state, delivery_error=error)
+
+    def deliver_task(self, session, event=None, *, check_only=False):
+        if not isinstance(self.store, FlowStore):
+            return self.create_task(session)
+        rid = session["request_id"]
+        session["delivery_locked"] = True
+        session["revision"] += 1
+        key = self.session_key(session["dialog_id"], session["user_id"])
+        state, task, confirmation = self.store.begin_delivery(key, session, event)
+        if task:
+            return task
+        ambiguous = state in {"sending", "unknown"}
+        try:
+            task = self.find_existing_task(f"FLOWDESK_CHAT_{rid}")
+        except Exception:
+            self.store.delivery_result(rid, "unknown" if ambiguous else "rejected", error="Б24 пока не подтвердил результат поиска задачи.")
+            return ""
+        if task:
+            self.store.delivery_result(rid, "created", task=task)
+            return task
+        if ambiguous or check_only:
+            self.store.delivery_result(rid, "unknown" if ambiguous else "rejected", error="Задача пока не найдена. Ответы сохранены.")
+            return ""
+        try:
+            fields = self.task_fields(confirmation)
+        except ValueError as exc:
+            self.store.delivery_result(rid, "rejected", error=str(exc))
+            return ""
+        if not self.store.claim_delivery(rid):
+            return ""
+        try:
+            task = self.add_task(fields)
+        except Exception as exc:
+            rejected = isinstance(exc, BitrixError) and exc.code.upper() in {"ACCESS_DENIED", "ERROR_ACCESS_DENIED", "ERROR_REQUIRED_PARAMETER", "ERROR_ARGUMENT"}
+            message = "Б24 отклонил параметры задачи. Проверьте настройки и повторите отправку." if rejected else "Б24 не подтвердил создание. Проверьте наличие задачи. Ответы сохранены."
+            self.store.delivery_result(rid, "rejected" if rejected else "unknown", error=message)
+            return ""
+        self.store.delivery_result(rid, "created", task=task)
+        self.send_attachment_comment(confirmation, task)
+        return task
 
     def send_attachment_comment(
         self,
@@ -1485,9 +1642,105 @@ class Runtime:
         active_message_id = previous.get("active_message_id") if previous else None
 
         session = new_session(user_id=user_id, dialog_id=dialog_id)
+        if previous:
+            session["revision"] = int(previous.get("revision") or 0) + 1
+            if isinstance(self.store, FlowStore):
+                self.store.abandon(previous)
+        editor = getattr(self, "internal_editor", None)
+        version, document = editor.store.active() if editor else (None, None)
+        if document:
+            session = graph.start(session, document, version)
+            if isinstance(self.store, FlowStore):
+                graph.state(session)["drafts"] = self.store.drafts(user_id)
+                graph.state(session)["legacy_draft"] = bool(self.initiative_draft(user_id))
+        if isinstance(self.store, FlowStore):
+            pending = bool(self.store.pending_for_user(user_id))
+            session["pending_delivery"] = pending
+            if document:
+                graph.state(session)["pending_delivery"] = pending
         session["active_message_id"] = active_message_id
         self.store.put_session(key, session)
         return session
+
+    def refresh_idle(self, session):
+        editor = getattr(self, "internal_editor", None)
+        if not editor:
+            return session
+        state = session.get("constructor")
+        idle = (state["node"] == state["document"]["start"] and not state["trail"] and state["status"] == "in_progress"
+                if state else session.get("current_screen") == "type" and not session.get("edit_mode") and not session["data"].get("request_type"))
+        if idle and not session.get("delivery_locked") and editor.store.active_version() != (state.get("version") if state else None):
+            return self.restart_session(session["dialog_id"], session["user_id"])
+        return session
+
+    def prepare_graph_profile(self, session):
+        state = session.get("constructor")
+        if not state or state.get("profile_loaded") or not graph.node(session).get("bind", "").startswith("profile."):
+            return
+        state["profile_loaded"] = True
+        try:
+            profile = fetch_profile(self.call, session["user_id"])
+            cached = json.loads(self.store.get_meta(f"initiative_profile:{session['user_id']}") or "{}")
+        except Exception as exc:
+            LOG.warning("Could not prefill DeskFlow profile (%s)", type(exc).__name__)
+            return
+        cached = cached if isinstance(cached, dict) else {}
+        source, values = cached.get("source", {}), cached.get("profile", {})
+        source = source if isinstance(source, dict) else {}
+        values = values if isinstance(values, dict) else {}
+        state["profile_source"] = profile
+        state["answers"].update({"profile." + key: values.get(key, value) if source.get(key) == value else value for key, value in profile.items()})
+        graph.settle(session)
+
+    def write_transition(self, key, session, event):
+        if isinstance(self.store, FlowStore):
+            self.store.put_session(key, session, event)
+        else:
+            self.store.put_session(key, session)
+        state = session.get("constructor")
+        if state and state.get("profile_source"):
+            values = {key: state["answers"].get("profile." + key) for key in initiatives.PROFILE_LABELS}
+            if all(values.values()):
+                self.store.set_meta(f"initiative_profile:{session['user_id']}", json.dumps({"profile": values, "source": state["profile_source"]}, ensure_ascii=False))
+
+    def resume_request(self, session, transition):
+        status = transition["status"]
+        uid = session["user_id"]
+        if status == "legacy_draft_requested" or status == "draft_resume_requested" and not graph.is_custom(session):
+            saved = self.resume_initiative_draft(session) if self.initiative_draft(uid) else None
+        elif not isinstance(self.store, FlowStore):
+            saved = None
+        elif status == "pending_delivery_requested":
+            saved = self.store.pending_for_user(uid)
+        else:
+            saved = self.store.request_for_user(transition["request_id"], uid, "draft")
+            if saved and graph.is_custom(saved):
+                graph.state(saved)["status"] = "in_progress"
+        if saved:
+            if isinstance(self.store, FlowStore) and saved["request_id"] != session["request_id"]:
+                self.store.abandon(session)
+            saved.update(dialog_id=session["dialog_id"], active_message_id=session.get("active_message_id"),
+                         revision=max(saved["revision"], session["revision"]) + 1)
+        return saved
+
+    def receive_graph_files(self, session, files, text):
+        if len(files) > 30:
+            return {"status": "validation_error", "message": "Прикрепите до 30 файлов за один раз."}
+        checked = []
+        try:
+            for item in files:
+                fid = int(item["id"])
+                info = self.call("disk.file.get", {"id": fid})
+                if not isinstance(info, dict) or int(info.get("ID", info.get("id", 0))) != fid or str(info.get("DELETED_TYPE", "0")) != "0":
+                    raise ValueError()
+                name = info.get("NAME", info.get("name"))
+                size = int(info.get("SIZE", info.get("size")))
+                if not isinstance(name, str) or not name or size < 0:
+                    raise ValueError()
+                checked.append({"id": fid, "name": name, "size": size})
+        except Exception:
+            return {"status": "validation_error", "message": "Б24 не подтвердил доступ к одному из файлов. Проверьте вложения и отправьте ещё раз."}
+        return graph.attachments(session, checked, text)
 
     @staticmethod
     def message_files(message: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1554,8 +1807,10 @@ class Runtime:
                 text,
             )
 
-            session = self.restart_session(service_dialog_id, user_id)
-            self.render_current(session)
+            session = self.store.get_session(self.session_key(service_dialog_id, user_id)) if isinstance(self.store, FlowStore) else None
+            if session is None or session.get("current_screen") in {"done", "instruction"}:
+                session = self.restart_session(service_dialog_id, user_id)
+            self.render_current(self.refresh_idle(session))
             return
 
         # Free-form flow input is accepted only inside the managed service chat.
@@ -1578,53 +1833,33 @@ class Runtime:
             self.render_current(session)
             return
 
-        if session.get("current_screen") == "done":
+        refreshed = self.refresh_idle(session)
+        if refreshed is not session:
+            self.render_current(refreshed)
+            return
+        self.sync_delivery(session)
+        self.prepare_graph_profile(session)
+        event_key = f"message:{message_id}" if message_id else None
+        if event_key and isinstance(self.store, FlowStore) and self.store.seen(session["request_id"], event_key):
+            self.render_current(session)
+            return
+        step = step_label(session)
+        accepts_files = session.get("current_screen") in {"document", "edit_attachments_input"} or view(session).get("accepts_files")
+        if files and accepts_files and not session.get("delivery_locked"):
+            result = (self.receive_graph_files(session, files, text) if graph.is_custom(session)
+                      else submit_attachment_message(session, [int(item["id"]) for item in files], [str(item.get("name") or "") for item in files], text))
+        elif files:
+            result = {"status": "validation_error", "message": "На этом экране вложения не принимаются."}
+        else:
+            result = submit_text(session, text)
+        self.prepare_graph_profile(session)
+        detail = {"text": text[:20000], "files": [{"id": item["id"], "name": str(item.get("name") or "")[:250]} for item in files[:30]],
+                  "result": result["status"], "next": step_label(session)}
+        self.write_transition(key, session, (event_key, "files" if files else "text", step, detail) if event_key else None)
+        if not files or not isinstance(self.store, FlowStore):
             self.delete_chat_message(message_id)
-            self.render_current(session)
-            return
-
-        if (
-            session.get("current_screen") in {"document", "edit_attachments_input"}
-            or view(session).get("accepts_files")
-        ) and files:
-            result = submit_attachment_message(
-                session,
-                [int(item["id"]) for item in files],
-                [str(item.get("name") or "") for item in files],
-                text,
-            )
-            self.delete_chat_message(message_id)
-            self.store.put_session(key, session)
-            self.render_current(session)
-            return
-
-        result = submit_text(session, text)
-        status = result["status"]
-
-        # The bot owns this group chat, so user input is removed immediately
-        # after being consumed. The only visible item is the live DeskFlow screen.
-        self.delete_chat_message(message_id)
-
-        if status == "buttons_expected":
-            self.render_current(session)
-            return
-
-        if status == "empty":
-            self.render_current(session)
-            return
-
-        if status == "validation_error":
-            current = view(session)
-            message = str(result.get("message") or "").strip()
-            text_override = current["text"]
-            if message:
-                text_override += "\n\n" + message
-            self.store.put_session(key, session)
-            self.render_current(session, text_override=text_override)
-            return
-
-        self.store.put_session(key, session)
-        self.render_current(session)
+        override = view(session)["text"] + "\n\n" + result["message"] if result["status"] == "validation_error" else None
+        self.render_current(session, text_override=override)
 
     def handle_command(self, data: dict[str, Any]) -> None:
         command = data.get("command") or {}
@@ -1655,7 +1890,7 @@ class Runtime:
                     user_id=user_id,
                     dialog_id=service_dialog_id,
                 )
-            self.render_current(session)
+            self.render_current(self.refresh_idle(session))
 
             # Command.answer is mandatory for a keyboard COMMAND. It releases
             # Bitrix's loading state and returns the native DIALOG button for
@@ -1664,13 +1899,7 @@ class Runtime:
             return
 
         service_dialog_id = self.get_service_chat(user_id)
-        if not service_dialog_id or dialog_id != service_dialog_id:
-            service_dialog_id = self.ensure_service_chat(
-                user_id,
-                str(user.get("name") or ""),
-            )
-            session = self.restart_session(service_dialog_id, user_id)
-            self.render_current(session)
+        if not service_dialog_id or dialog_id != service_dialog_id or command.get("context", "keyboard") != "keyboard":
             return
 
         key = self.session_key(dialog_id, user_id)
@@ -1686,6 +1915,11 @@ class Runtime:
             self.render_current(session)
             return
 
+        refreshed = self.refresh_idle(session)
+        if refreshed is not session:
+            self.render_current(refreshed)
+            return
+        self.sync_delivery(session)
         raw_params = str(command.get("params") or "")
         try:
             revision_text, index_text = raw_params.split(":", 1)
@@ -1700,7 +1934,10 @@ class Runtime:
 
         current = view(session)
 
-        if revision != int(session["revision"]):
+        origin_message = data.get("message") or {}
+        origin = int(origin_message.get("id") or 0)
+        bot_message = origin_message.get("authorId") in (None, self.bot_id, str(self.bot_id))
+        if revision != int(session["revision"]) or bot_message and origin and session.get("active_message_id") and origin != int(session["active_message_id"]):
             # Old keyboards stay visible in chat history, but can never mutate state.
             self.render_current(
                 session,
@@ -1715,35 +1952,51 @@ class Runtime:
             )
             return
 
-        action = current["buttons"][index]["action"]
+        button = current["buttons"][index]
+        action = button["action"]
+        step = step_label(session)
         transition = submit_action(session, action)
+        self.prepare_graph_profile(session)
+        status = transition["status"]
+        detail = {"button": button["label"], "action": action, "result": status, "next": step_label(session)}
+        event = (f"button:{revision}:{index}", "button", step, detail)
 
-        if transition["status"] == "task_ready":
-            task_id = self.create_task(session)
-            self.clear_submitted_draft(session)
-            mark_task_created(session, task_id)
-            self.store.put_session(key, session)
-            self.render_current(
-                session,
-                link_button={
-                    "text": "Открыть обращение",
-                    "link": self.task_link(user_id, task_id),
-                },
-            )
-            return
-
-        if transition["status"] == "draft_saved":
-            self.persist_initiative(session, draft=True)
-        elif transition["status"] == "draft_resume_requested":
-            session = self.resume_initiative_draft(session)
-
-        if transition["status"] == "restart_requested":
-            session = self.restart_session(dialog_id, user_id)
+        if status in {"task_ready", "delivery_check_requested"}:
+            task_id = self.deliver_task(session, event, check_only=status == "delivery_check_requested")
+            if task_id:
+                self.clear_submitted_draft(session)
+                mark_task_created(session, task_id)
+                self.store.put_session(key, session)
             self.render_current(session)
             return
 
-        self.store.put_session(key, session)
-        self.render_current(session)
+        if status == "draft_saved":
+            if graph.is_custom(session) and isinstance(self.store, FlowStore):
+                state = graph.state(session)
+                limit = state["document"]["settings"].get("max_drafts", 10)
+                drafts = [draft for draft in self.store.drafts(user_id) if draft["id"] != session["request_id"]]
+                if len(drafts) >= limit:
+                    state["status"] = "in_progress"
+                    transition = {"status": "validation_error", "message": "Продолжите один из сохранённых черновиков, чтобы освободить место."}
+                    detail["result"] = transition["status"]
+            else:
+                self.persist_initiative(session, draft=True)
+        elif status in {"draft_resume_requested", "legacy_draft_requested", "pending_delivery_requested"}:
+            self.write_transition(key, session, event)
+            saved = self.resume_request(session, transition)
+            if saved is None:
+                self.render_current(session, text_override=current["text"] + "\n\nОбращение уже недоступно.")
+                return
+            session = saved
+            event = (f"resume:{session['revision']}", "resume", step_label(session), {})
+        elif status == "restart_requested":
+            self.write_transition(key, session, event)
+            self.render_current(self.restart_session(dialog_id, user_id))
+            return
+
+        self.write_transition(key, session, event)
+        override = view(session)["text"] + "\n\n" + transition["message"] if transition["status"] == "validation_error" else None
+        self.render_current(session, text_override=override)
 
     def handle_join(self, data: dict[str, Any]) -> None:
         user = data.get("user") or {}
@@ -1834,8 +2087,13 @@ class Runtime:
         return False
 
     def run(self) -> None:
+        self.store.recover_deliveries()
+        self.internal_editor = start_editor(self.portal_base, self.db_path, self.store, lambda: self.task_field_catalog, self.task_fields)
         self.register()
+        self.last_editor_access_change = self.internal_editor.store.latest_change() if self.internal_editor else 0
+        self.next_editor_access_check = 0.0
         self.refresh_known_launchers()
+        next_housekeeping = 0.0
         print(f"DeskFlow bot registered: ID={self.bot_id}")
         print(
             "Polling: 08:00-22:00 Kazakhstan every "
@@ -1856,6 +2114,11 @@ class Runtime:
 
         while True:
             try:
+                self.refresh_editor_access()
+                if time.monotonic() >= next_housekeeping:
+                    _, document = self.internal_editor.store.active() if self.internal_editor else (None, None)
+                    self.store.mark_idle(document["settings"].get("idle_hours", 24) if document else 24)
+                    next_housekeeping = time.monotonic() + 60
                 params: dict[str, Any] = {
                     "botId": self.bot_id,
                     "botToken": self.bot_token,
@@ -1922,7 +2185,9 @@ def main() -> int:
         return 2
 
     try:
-        Runtime().run()
+        path = os.getenv("FLOWDESK_CHATBOT_DB", "processes/flowdesk_chatbot/flowdesk_state.sqlite3")
+        with worker_lock(path):
+            Runtime().run()
         return 0
     except Exception as exc:
         print(f"ERROR: {sanitize_error(exc)}", file=sys.stderr)
