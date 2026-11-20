@@ -64,11 +64,13 @@ jobs:
     defaults:
       run:
         shell: cmd
-        working-directory: processes/eqazyna_leads
+        working-directory: eqazyna-src/processes/eqazyna_leads
 
     steps:
       - name: Получить код репозитория
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          path: eqazyna-src
 
       - name: Найти Python и создать локальное окружение
         run: call ..\..\scripts\prepare-python.cmd
@@ -82,7 +84,7 @@ jobs:
 
       - name: Проверить код парсера
         env:
-          PYTHONPATH: ${{ github.workspace }};${{ github.workspace }}\processes\eqazyna_leads
+          PYTHONPATH: ${{ github.workspace }}\eqazyna-src;${{ github.workspace }}\eqazyna-src\processes\eqazyna_leads
         run: |
           chcp 65001 >nul
           ".venv\Scripts\python.exe" -m pytest -q -p no:cacheprovider tests
@@ -98,7 +100,7 @@ jobs:
       - name: Проверить или загрузить лиды
         env:
           PYTHONUNBUFFERED: "1"
-          PYTHONPATH: ${{ github.workspace }};${{ github.workspace }}\processes\eqazyna_leads
+          PYTHONPATH: ${{ github.workspace }}\eqazyna-src;${{ github.workspace }}\eqazyna-src\processes\eqazyna_leads
           TARGET_BITRIX_WEBHOOK_URL: ${{ secrets.TARGET_BITRIX_WEBHOOK_URL }}
           EGOV_API_KEY: ${{ secrets.EGOV_API_KEY }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
@@ -157,6 +159,6 @@ jobs:
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: 30-eqazyna-leads-${{ github.run_number }}
-          path: processes/eqazyna_leads/output/
+          path: eqazyna-src/processes/eqazyna_leads/output/
           if-no-files-found: warn
           retention-days: 7
