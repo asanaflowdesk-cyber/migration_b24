@@ -85,7 +85,7 @@ jobs:
           PYTHONPATH: ${{ github.workspace }};${{ github.workspace }}\processes\eqazyna_leads
         run: |
           chcp 65001 >nul
-          ".venv\Scripts\python.exe" -m pytest -q tests
+          ".venv\Scripts\python.exe" -m pytest -q -p no:cacheprovider tests
           if errorlevel 1 exit /b 1
           ".venv\Scripts\python.exe" -m eqazyna_bitrix.main --help >nul
 
