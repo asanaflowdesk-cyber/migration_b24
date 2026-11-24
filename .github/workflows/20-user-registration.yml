@@ -1,3 +1,4 @@
+
 name: 20 | Пользователи — регистрация из Google Sheets
 
 on:
@@ -25,10 +26,14 @@ jobs:
     defaults:
       run:
         shell: cmd
-        working-directory: processes/user_registration
+        working-directory: user-registration-src/processes/user_registration
 
     steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: Получить код репозитория
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          path: user-registration-src
+          clean: false
 
       - name: Найти Python и создать локальное окружение
         run: call ..\..\scripts\prepare-python.cmd
@@ -45,7 +50,7 @@ jobs:
       - name: Проверить или зарегистрировать пользователей
         env:
           PYTHONUNBUFFERED: "1"
-          PYTHONPATH: ${{ github.workspace }}
+          PYTHONPATH: ${{ github.workspace }}\user-registration-src
           TARGET_BITRIX_WEBHOOK_URL: ${{ secrets.TARGET_BITRIX_WEBHOOK_URL }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           GOOGLE_SHEETS_SPREADSHEET_ID: "1WuRHHyQm5lHxDlW81m4P0oZJ6X_SDYj1bN-NOx8aM2k"
@@ -59,6 +64,6 @@ jobs:
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: 20-user-registration-${{ github.run_number }}
-          path: processes/user_registration/output/
+          path: user-registration-src/processes/user_registration/output/
           if-no-files-found: warn
           retention-days: 7
