@@ -54,11 +54,14 @@ jobs:
     defaults:
       run:
         shell: cmd
-        working-directory: processes/eqazyna_status_sync
+        working-directory: eqazyna-status-sync-src/processes/eqazyna_status_sync
 
     steps:
       - name: Получить код репозитория
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: eqazyna-status-sync-src
+          clean: false
 
       - name: Найти Python и создать локальное окружение
         run: call ..\..\scripts\prepare-python.cmd
@@ -72,10 +75,10 @@ jobs:
 
       - name: Проверить код
         env:
-          PYTHONPATH: ${{ github.workspace }};${{ github.workspace }}\processes\eqazyna_leads;${{ github.workspace }}\processes\eqazyna_status_sync
+          PYTHONPATH: ${{ github.workspace }}\eqazyna-status-sync-src;${{ github.workspace }}\eqazyna-status-sync-src\processes\eqazyna_leads;${{ github.workspace }}\eqazyna-status-sync-src\processes\eqazyna_status_sync
         run: |
           chcp 65001 >nul
-          ".venv\Scripts\python.exe" -m pytest -q tests
+          ".venv\Scripts\python.exe" -m pytest -q -p no:cacheprovider tests
           if errorlevel 1 exit /b 1
           ".venv\Scripts\python.exe" sync_eqazyna_statuses.py --help >nul
 
@@ -87,7 +90,7 @@ jobs:
 
       - name: Сверить статусы заявок и стадии лидов
         env:
-          PYTHONPATH: ${{ github.workspace }};${{ github.workspace }}\processes\eqazyna_leads;${{ github.workspace }}\processes\eqazyna_status_sync
+          PYTHONPATH: ${{ github.workspace }}\eqazyna-status-sync-src;${{ github.workspace }}\eqazyna-status-sync-src\processes\eqazyna_leads;${{ github.workspace }}\eqazyna-status-sync-src\processes\eqazyna_status_sync
           TARGET_BITRIX_WEBHOOK_URL: ${{ secrets.TARGET_BITRIX_WEBHOOK_URL }}
           BITRIX_VERIFY_SSL: ${{ vars.BITRIX_VERIFY_SSL || 'true' }}
           BITRIX_CA_BUNDLE: ${{ vars.BITRIX_CA_BUNDLE }}
@@ -121,6 +124,6 @@ jobs:
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: 34-eqazyna-status-sync-${{ github.run_number }}
-          path: processes/eqazyna_status_sync/output/
+          path: eqazyna-status-sync-src/processes/eqazyna_status_sync/output/
           if-no-files-found: warn
           retention-days: 3
