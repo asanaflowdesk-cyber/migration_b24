@@ -1,6 +1,14 @@
 from __future__ import annotations
 
+import json
+from types import SimpleNamespace
+from urllib.parse import parse_qs, urlsplit
+
+import requests
+
+import sync_eqazyna_statuses as status_sync
 from eqazyna_bitrix.models import Application
+from eqazyna_bitrix.scraper import EqazynaScraper
 from sync_eqazyna_statuses import (
     DEFAULT_FAILURE_REASON_FIELD,
     StatusSyncError,
@@ -312,6 +320,53 @@ def test_portal_failure_is_warning_not_fatal_sync_error():
     assert summary.errors == 0
     assert summary.changes_applied == 0
     assert rows[0].action == "portal_warning"
+    assert client.updated == []
+
+
+def test_status_sync_uses_real_scraper_to_apply_exact_registry_result(monkeypatch):
+    session = requests.Session()
+    html = """
+    <h1>Реестр заявок</h1>
+    <table>
+      <tr><td>01.11.2026</td><td>147408-NEA</td><td>123456789012</td><td>Test</td>
+          <td>Заявка на разведку ТПИ</td><td>Аннулировано</td></tr>
+      <tr><td>02.11.2026</td><td>47408-NEA</td><td>123456789012</td><td>Test</td>
+          <td>Заявка на разведку ТПИ</td><td>Отозвано</td></tr>
+      <tr><td>03.11.2026</td><td>47408-NEA</td><td>123456789012</td><td>Test</td>
+          <td>Заявка на добычу ТПИ</td><td>Выдана лицензия</td></tr>
+    </table>
+    """
+
+    def get(url, **kwargs):
+        query = parse_qs(urlsplit(url).query)
+        assert query["flDocNum"] == ["47408-NEA"]
+        assert query["flDocType"] == ["ТпиЗаявкаНаРазведку"]
+        assert "flStatus" not in query
+        return SimpleNamespace(text=html, encoding="utf-8", raise_for_status=lambda: None)
+
+    monkeypatch.setattr(session, "get", get)
+    scraper = EqazynaScraper(session=session, polite_delay_seconds=0)
+    client = FakeClient([lead(1, "47408-NEA")])
+
+    summary, rows = run_sync(client, scraper)
+
+    assert summary.applications_found == 1
+    assert summary.changes_applied == 1
+    assert rows[0].eqazyna_status == "Отозвано"
+    assert client.updated == [("1", {"STATUS_ID": "JUNK", DEFAULT_FAILURE_REASON_FIELD: "67"})]
+
+
+def test_main_fails_and_saves_report_when_all_portal_lookups_fail(monkeypatch, tmp_path):
+    client = FakeClient([lead(1, "47408-NEA")])
+    monkeypatch.setenv("TARGET_BITRIX_WEBHOOK_URL", "https://example.test/")
+    monkeypatch.setattr(status_sync, "BitrixClient", lambda **_: client)
+    monkeypatch.setattr(status_sync, "EqazynaScraper", lambda **_: RaisingScraper())
+
+    assert status_sync.main(["--output-dir", str(tmp_path)]) == 2
+
+    report = json.loads((tmp_path / "eqazyna_status_sync_summary.json").read_text(encoding="utf-8"))
+    assert report["portal_lookup_warnings"] == 1
+    assert report["applications_found"] == 0
     assert client.updated == []
 
 

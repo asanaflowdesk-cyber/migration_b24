@@ -167,7 +167,14 @@ class EqazynaScraper:
         self.session = requests.Session()
         self._configure_session(self.session)
 
-    def build_url(self, page: int, doc_type: str | None, statuses: Iterable[str]) -> str:
+    def build_url(
+        self,
+        page: int,
+        doc_type: str | None,
+        statuses: Iterable[str],
+        *,
+        doc_number: str | None = None,
+    ) -> str:
         params: list[tuple[str, str]] = [
             ("oq", ""),
             ("flMineralUserXin", ""),
@@ -179,7 +186,7 @@ class EqazynaScraper:
             if filter_status:
                 params.append(("flStatus", filter_status))
 
-        params.append(("flDocNum", ""))
+        params.append(("flDocNum", (doc_number or "").strip()))
 
         doc_type = doc_type.strip() if doc_type else None
         if doc_type:
@@ -192,8 +199,15 @@ class EqazynaScraper:
 
         return f"{BASE_URL}?{urlencode(params, doseq=True)}"
 
-    def fetch_page(self, page: int, doc_type: str | None, statuses: Iterable[str]) -> tuple[str, str]:
-        url = self.build_url(page, doc_type, statuses)
+    def fetch_page(
+        self,
+        page: int,
+        doc_type: str | None,
+        statuses: Iterable[str],
+        *,
+        doc_number: str | None = None,
+    ) -> tuple[str, str]:
+        url = self.build_url(page, doc_type, statuses, doc_number=doc_number)
         last_error: Exception | None = None
         connect_timeout = min(15, self.timeout)
         request_timeout = (connect_timeout, self.timeout)
@@ -231,6 +245,38 @@ class EqazynaScraper:
                     time.sleep(sleep_for)
 
         raise last_error or RuntimeError(f"e-Qazyna page {page} failed")
+
+    def fetch_application_by_number(
+        self,
+        doc_number: str,
+        doc_type: str | None = "Заявка на разведку ТПИ",
+    ) -> Application | None:
+        """Read a document from the public registry across all application statuses."""
+        number = clean_text(doc_number)
+        if not number:
+            raise ValueError("doc_number is required")
+
+        document_type = clean_text(doc_type) if doc_type else None
+        html, url = self.fetch_page(1, document_type, (), doc_number=number)
+        time.sleep(self.polite_delay_seconds)
+        rows = parse_applications(html, url, doc_types=[document_type] if document_type else None)
+        wanted = number.casefold()
+        matches = [
+            row for row in rows
+            if clean_text(row.doc_number).casefold() == wanted
+            and (not document_type or clean_text(row.doc_type) == document_type)
+        ]
+
+        def created_sort_key(row: Application) -> tuple[datetime, str]:
+            raw = clean_text(row.created_at_raw)
+            for fmt, length in (("%d.%m.%Y %H:%M:%S", 19), ("%d.%m.%Y", 10)):
+                try:
+                    return datetime.strptime(raw[:length], fmt), raw
+                except ValueError:
+                    continue
+            return datetime.min, raw
+
+        return max(matches, key=created_sort_key, default=None)
 
     @staticmethod
     def parse_page_list(value: str | None) -> list[int] | None:

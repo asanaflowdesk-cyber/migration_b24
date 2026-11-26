@@ -406,7 +406,7 @@ def sync_statuses(
             try:
                 application = scraper.fetch_application_by_number(doc_number, doc_type)
                 status_cache[doc_number] = application.status if application else None
-            except Exception as exc:  # noqa: BLE001 - journal every failed lookup
+            except (OSError, RuntimeError) as exc:
                 message = f"e-Qazyna lookup failed: {exc}"
                 fetch_error_cache[doc_number] = message
                 summary.portal_lookup_warnings += 1
@@ -693,6 +693,13 @@ def main(argv: list[str] | None = None) -> int:
     write_outputs(Path(args.output_dir), summary, rows)
     print(json.dumps(asdict(summary), ensure_ascii=False, indent=2), flush=True)
     if summary.portal_lookup_warnings:
+        if summary.portal_lookup_warnings == summary.leads_with_application_number:
+            print(
+                f"ERROR: e-Qazyna lookup failed for all {summary.portal_lookup_warnings} "
+                "eligible lead(s). See output journal.",
+                file=sys.stderr,
+            )
+            return 2
         print(
             f"WARN: e-Qazyna lookups failed after retries for "
             f"{summary.portal_lookup_warnings} active lead(s); they were skipped and logged.",
