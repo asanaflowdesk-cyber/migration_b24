@@ -50,7 +50,7 @@ env:
 jobs:
   eqazyna-status-sync:
     runs-on: [self-hosted, Windows, X64]
-    timeout-minutes: 120
+    timeout-minutes: 240
     defaults:
       run:
         shell: cmd
